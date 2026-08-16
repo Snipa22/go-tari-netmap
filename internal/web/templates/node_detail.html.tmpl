@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>go-tari-netmap — {{.Node.Address}}</title>
+</head>
+<body>
+  <p><a href="/">&larr; back to dashboard</a></p>
+  <h1>{{.Node.Address}}</h1>
+  <ul>
+    <li>Discovery source: {{.Node.DiscoverySource}}</li>
+    <li>Tags: {{.Node.Tags}}</li>
+    <li>Label: {{if .Node.Label}}{{.Node.Label}}{{else}}—{{end}}</li>
+    <li>First seen: {{.Node.FirstSeen}}</li>
+    <li>Last seen: {{.Node.LastSeen}}</li>
+  </ul>
+
+  <h2>Recent history</h2>
+  <table border="1" cellpadding="4">
+    <thead>
+      <tr>
+        <th>Timestamp</th>
+        <th>Reachable</th>
+        <th>Height</th>
+        <th>Latency (ms)</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .History}}
+      <tr>
+        <td>{{.Timestamp}}</td>
+        <td>{{.Reachable}}</td>
+        <td>{{if .Height}}{{.Height}}{{else}}—{{end}}</td>
+        <td>{{if .LatencyMS}}{{.LatencyMS}}{{else}}—{{end}}</td>
+      </tr>
+      {{else}}
+      <tr><td colspan="4">No health checks recorded yet.</td></tr>
+      {{end}}
+    </tbody>
+  </table>
+</body>
+</html>

@@ -4,9 +4,62 @@
   <meta charset="utf-8">
   <title>go-tari-netmap</title>
   <script src="https://unpkg.com/htmx.org@2"></script>
+  <script src="https://unpkg.com/htmx.org@2/dist/ext/json-enc.js"></script>
 </head>
 <body>
-  <h1>go-tari-netmap — scaffold</h1>
-  <p>The dashboard is not yet implemented. This page is a scaffold placeholder.</p>
+  <h1>go-tari-netmap</h1>
+  <p>Tari network peer-topology + node-health mapping for mining-pool operators picking peers.</p>
+
+  <section>
+    <h2>Summary</h2>
+    <ul>
+      <li>Total nodes: {{.Counts.Total}}</li>
+      <li>p2p_discovered: {{.Counts.P2P}}</li>
+      <li>registry_submitted: {{.Counts.Registry}}</li>
+      <li>both: {{.Counts.Both}}</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Submit a node</h2>
+    <form hx-ext="json-enc" hx-post="/api/nodes" hx-target="#submit-result" hx-swap="innerHTML">
+      <label>Host <input type="text" name="host" required></label>
+      <label>Port <input type="number" name="port" min="1" max="65535" required></label>
+      <label>Label (optional) <input type="text" name="label"></label>
+      <label>Owner tag (optional) <input type="text" name="owner_tag"></label>
+      <button type="submit">Submit</button>
+    </form>
+    <pre id="submit-result"></pre>
+  </section>
+
+  <section>
+    <h2>Nodes</h2>
+    <table border="1" cellpadding="4">
+      <thead>
+        <tr>
+          <th>Address</th>
+          <th>Discovery source</th>
+          <th>Tags</th>
+          <th>Last seen</th>
+          <th>Reachable</th>
+          <th>Height</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{range .Nodes}}
+        <tr>
+          <td><a href="/nodes/{{.ID}}">{{.Address}}</a></td>
+          <td>{{.DiscoverySource}}</td>
+          <td>{{.Tags}}</td>
+          <td>{{.LastSeen}}</td>
+          <td>{{if .LatestHealth}}{{.LatestHealth.Reachable}}{{else}}—{{end}}</td>
+          <td>{{if .LatestHealth}}{{if .LatestHealth.Height}}{{.LatestHealth.Height}}{{else}}—{{end}}{{else}}—{{end}}</td>
+        </tr>
+        {{else}}
+        <tr><td colspan="6">No nodes known yet.</td></tr>
+        {{end}}
+      </tbody>
+    </table>
+  </section>
 </body>
 </html>
