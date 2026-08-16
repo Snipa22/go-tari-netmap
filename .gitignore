@@ -1,0 +1,15 @@
+# Binaries
+/netmap
+*.exe
+
+# Local tooling/build artifacts
+.gotmp/
+
+# Editor / OS cruft
+.DS_Store
+.idea/
+.vscode/
+
+# Local env files
+.env
+.env.local
