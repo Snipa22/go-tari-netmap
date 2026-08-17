@@ -17,6 +17,18 @@ const (
 	DiscoverySourceBoth     DiscoverySource = "both"
 )
 
+// ProbeSource identifies which transport a health check was collected
+// over: the Tari base node's gRPC BaseNode service, or a direct
+// Tari comms/RPC-over-P2P probe (go-tari-lib/p2p). A node can be probed
+// via either or both, independently, so each recorded HealthCheck carries
+// its own ProbeSource rather than this being a property of the node.
+type ProbeSource string
+
+const (
+	ProbeSourceGRPC ProbeSource = "grpc"
+	ProbeSourceP2P  ProbeSource = "p2p"
+)
+
 // Node is a Tari node known to netmap.
 type Node struct {
 	ID              uuid.UUID       `json:"id"`
@@ -55,23 +67,25 @@ type PeerEdge struct {
 
 // HealthCheck is one recorded health-check result for a node.
 type HealthCheck struct {
-	ID             uuid.UUID `json:"id"`
-	NodeID         uuid.UUID `json:"node_id"`
-	Timestamp      time.Time `json:"timestamp"`
-	Reachable      bool      `json:"reachable"`
-	Height         *int64    `json:"height,omitempty"`
-	ChainTipHeight *int64    `json:"chain_tip_height,omitempty"`
-	Version        *string   `json:"version,omitempty"`
-	LatencyMS      *int      `json:"latency_ms,omitempty"`
-	RxtHashrate    *float64  `json:"rxt_hashrate,omitempty"`
-	C29Hashrate    *float64  `json:"c29_hashrate,omitempty"`
-	Sha3xHashrate  *float64  `json:"sha3x_hashrate,omitempty"`
+	ID             uuid.UUID   `json:"id"`
+	NodeID         uuid.UUID   `json:"node_id"`
+	Timestamp      time.Time   `json:"timestamp"`
+	Reachable      bool        `json:"reachable"`
+	ProbeSource    ProbeSource `json:"probe_source"`
+	Height         *int64      `json:"height,omitempty"`
+	ChainTipHeight *int64      `json:"chain_tip_height,omitempty"`
+	Version        *string     `json:"version,omitempty"`
+	LatencyMS      *int        `json:"latency_ms,omitempty"`
+	RxtHashrate    *float64    `json:"rxt_hashrate,omitempty"`
+	C29Hashrate    *float64    `json:"c29_hashrate,omitempty"`
+	Sha3xHashrate  *float64    `json:"sha3x_hashrate,omitempty"`
 }
 
 // HealthCheckInput is the input to RecordHealthCheck.
 type HealthCheckInput struct {
 	NodeID         uuid.UUID
 	Reachable      bool
+	ProbeSource    ProbeSource
 	Height         *int64
 	ChainTipHeight *int64
 	Version        *string
