@@ -23,18 +23,28 @@ import (
 // PollIntervalGeneric is the minimum interval between polls of a discovered/generic node.
 // Enforced for politeness — polling more aggressively risks looking like abuse to the
 // wider Tari network.
-const PollIntervalGeneric = time.Hour
+const PollIntervalGeneric = 2 * time.Hour
 
 // PollIntervalPoolOwned is the poll interval for nodes explicitly tagged as pool-owned.
 // TODO(netmap): placeholder value — needs confirmation from the pool-ops team on the
 // actual desired cadence before this ships.
 const PollIntervalPoolOwned = 5 * time.Minute
 
+// DiscoveryIntervalGeneric is the minimum interval between discovery-walk
+// dials of an already-known generic node. Enforced for the same
+// politeness reasons as PollIntervalGeneric.
+const DiscoveryIntervalGeneric = 6 * time.Hour
+
+// DiscoveryIntervalPoolOwned is the discovery-walk cooldown for nodes
+// explicitly tagged as pool-owned — our own infra, walked more often
+// since we want fresher topology data for it specifically.
+const DiscoveryIntervalPoolOwned = 30 * time.Minute
+
 // defaultTickInterval is how often Run checks which known nodes are due for
 // a poll when Collector.TickInterval is unset. It is independent of
 // PollIntervalGeneric/PollIntervalPoolOwned, which govern per-node poll
 // cadence — this just controls the granularity of that check.
-const defaultTickInterval = 30 * time.Second
+const defaultTickInterval = 5 * time.Minute
 
 // NodeInfo is the subset of a Tari base node's health/sync-status info
 // needed to record a health check.
@@ -89,6 +99,23 @@ type Config struct {
 	// SeedNodes are the addresses of the seed nodes used to bootstrap peer
 	// discovery by walking the Tari peer graph.
 	SeedNodes []string
+
+	// DialJitter is the delay inserted before each per-node dial within a
+	// single Discover or Poll pass (only immediately before a dial that's
+	// actually about to happen — nodes skipped by a due()/dueForDiscovery
+	// cooldown check don't incur it), to avoid hammering many different
+	// nodes in rapid succession even when overall pass frequency is
+	// polite.
+	//
+	// Zero (the Go zero value, and thus the default for any Collector
+	// that doesn't set this explicitly, including every existing test in
+	// this package) means no delay at all — the collector package
+	// intentionally does NOT substitute a nonzero default for zero, so
+	// that tests stay fully test-controllable and fast by default.
+	// Production callers that want the "don't hammer nodes" behavior
+	// (500ms, per this package's recommended default) must set this
+	// field explicitly; see cmd/netmap/main.go.
+	DialJitter time.Duration
 }
 
 // Collector polls Tari nodes and discovers peers.
@@ -123,8 +150,9 @@ type Collector struct {
 	// hour for anything.
 	TickInterval time.Duration
 
-	mu       sync.Mutex
-	nextPoll map[string]time.Time // address -> next poll due time
+	mu            sync.Mutex
+	nextPoll      map[string]time.Time // address -> next poll due time
+	nextDiscovery map[string]time.Time // discoveryCooldownKey(transport, address) -> next discovery-walk due time
 }
 
 // New returns a new Collector for the given config. GRPCClient and
@@ -135,8 +163,9 @@ type Collector struct {
 // Poll.
 func New(cfg Config) *Collector {
 	return &Collector{
-		cfg:      cfg,
-		nextPoll: make(map[string]time.Time),
+		cfg:           cfg,
+		nextPoll:      make(map[string]time.Time),
+		nextDiscovery: make(map[string]time.Time),
 	}
 }
 
@@ -244,10 +273,10 @@ func (c *Collector) Discover(ctx context.Context) error {
 }
 
 // discoverWith walks the peer graph starting from Config.SeedNodes via
-// client.GetPeers, deduping visited addresses, and records discovered
-// nodes and edges in Storage. transportLabel is used only for log
-// messages, to distinguish which transport's walk a given log line came
-// from when both are configured.
+// client.GetPeers, deduping visited addresses within this pass, and
+// records discovered nodes and edges in Storage. transportLabel is used
+// only for log messages, to distinguish which transport's walk a given
+// log line came from when both are configured.
 //
 // Discovered nodes/edges are recorded with DiscoverySourceP2P regardless
 // of which NodeClient transport (gRPC or P2P-RPC) performed the walk —
@@ -255,9 +284,30 @@ func (c *Collector) Discover(ctx context.Context) error {
 // walking the peer graph" broadly, not the P2P-RPC transport specifically.
 // This is orthogonal to ProbeSource, which does track which transport a
 // given health check came from.
+//
+// Every address popped off the queue is still upserted into Storage
+// unconditionally — recording that a node exists/was seen is cheap and
+// not the politeness concern. What IS gated by a per-node discovery
+// cooldown (dueForDiscovery/setNextDiscovery, mirroring due/setNextPoll)
+// is the client.GetPeers call itself: re-dialing a node to ask for its
+// current peer list is the expensive/impolite part, so a node not yet due
+// for re-discovery is upserted (recording it was seen this pass) but not
+// dialed, and its peers are therefore not (re)enqueued from it this pass.
+// This cooldown is a separate, cross-pass/cross-call concept from the
+// visited map above, which only dedupes within a single discoverWith
+// call to prevent infinite loops/reprocessing.
+//
+// The cooldown key is scoped per-transport (transportLabel+addr), not
+// just addr: gRPC and P2P-RPC are independent network dials/connections
+// to the same address, so one transport's walk having just dialed addr
+// must not block the other transport's independent walk of that same
+// addr within the same (or a concurrent) Discover() call — see
+// TestDiscoverWalksBothTransportsIndependently, which specifically
+// exercises this.
 func (c *Collector) discoverWith(ctx context.Context, client NodeClient, transportLabel string) {
 	visited := make(map[string]bool)
 	queue := append([]string{}, c.cfg.SeedNodes...)
+	now := time.Now()
 
 	for len(queue) > 0 {
 		addr := queue[0]
@@ -276,11 +326,21 @@ func (c *Collector) discoverWith(ctx context.Context, client NodeClient, transpo
 			continue
 		}
 
+		cooldownKey := discoveryCooldownKey(transportLabel, addr)
+		if !c.dueForDiscovery(cooldownKey, now) {
+			continue
+		}
+
+		if jitter := c.dialJitter(); jitter > 0 {
+			time.Sleep(jitter)
+		}
+
 		peers, err := client.GetPeers(ctx, addr)
 		if err != nil {
 			log.Printf("collector: [%s] get peers for %s: %v", transportLabel, addr, err)
 			continue
 		}
+		c.setNextDiscovery(cooldownKey, now.Add(c.discoveryInterval(fromNode)))
 
 		for _, peerAddr := range peers {
 			toNode, err := c.Storage.UpsertNode(ctx, storage.NodeInput{
@@ -292,8 +352,8 @@ func (c *Collector) discoverWith(ctx context.Context, client NodeClient, transpo
 				continue
 			}
 
-			if err := c.Storage.UpsertPeerEdge(ctx, fromNode.ID, toNode.ID); err != nil {
-				log.Printf("collector: [%s] upsert edge %s -> %s: %v", transportLabel, addr, peerAddr, err)
+			if err := c.Storage.RecordPeerEdgeObservation(ctx, fromNode.ID, toNode.ID); err != nil {
+				log.Printf("collector: [%s] record edge observation %s -> %s: %v", transportLabel, addr, peerAddr, err)
 			}
 
 			if !visited[peerAddr] {
@@ -301,6 +361,13 @@ func (c *Collector) discoverWith(ctx context.Context, client NodeClient, transpo
 			}
 		}
 	}
+}
+
+// discoveryCooldownKey builds the nextDiscovery map key for a given
+// transport+address pair. See discoverWith's doc comment for why this is
+// scoped per-transport rather than just per-address.
+func discoveryCooldownKey(transportLabel, addr string) string {
+	return transportLabel + ":" + addr
 }
 
 // Poll checks all known nodes and, for those whose next-poll time is due,
@@ -322,6 +389,9 @@ func (c *Collector) Poll(ctx context.Context) error {
 			continue
 		}
 		c.setNextPoll(n.Address, now.Add(c.pollInterval(n)))
+		if jitter := c.dialJitter(); jitter > 0 {
+			time.Sleep(jitter)
+		}
 		if err := PollOnce(ctx, c.GRPCClient, c.P2PClient, c.Storage, n); err != nil {
 			log.Printf("collector: poll %s: %v", n.Address, err)
 		}
@@ -400,6 +470,26 @@ func (c *Collector) pollInterval(n storage.Node) time.Duration {
 	return PollIntervalGeneric
 }
 
+// discoveryInterval returns the discovery-walk cooldown for n based on
+// whether it is tagged pool-owned, mirroring pollInterval.
+func (c *Collector) discoveryInterval(n storage.Node) time.Duration {
+	if isPoolOwned(n) {
+		return DiscoveryIntervalPoolOwned
+	}
+	return DiscoveryIntervalGeneric
+}
+
+// dialJitter returns the effective per-dial delay to use before a real
+// network dial. It is simply Config.DialJitter with no implicit default
+// substitution — see Config.DialJitter's doc comment for why: this keeps
+// the collector package's behavior fully test-controllable (zero by
+// default), with any nonzero default (e.g. 500ms) being a production
+// wiring decision made by the caller (see cmd/netmap/main.go), not a
+// collector-package behavior.
+func (c *Collector) dialJitter() time.Duration {
+	return c.cfg.DialJitter
+}
+
 // isPoolOwned reports whether n's tags mark it as pool-owned.
 func isPoolOwned(n storage.Node) bool {
 	v, ok := n.Tags["pool_owned"]
@@ -424,4 +514,28 @@ func (c *Collector) setNextPoll(addr string, t time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.nextPoll[addr] = t
+}
+
+// dueForDiscovery reports whether the cooldown for the given
+// discoveryCooldownKey has elapsed (or it has never been discovery-walked
+// before), mirroring due.
+func (c *Collector) dueForDiscovery(key string, now time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	next, ok := c.nextDiscovery[key]
+	if !ok {
+		return true
+	}
+	return !now.Before(next)
+}
+
+// setNextDiscovery records the next discovery-walk due time for the given
+// discoveryCooldownKey, mirroring setNextPoll. It is guarded by the same
+// c.mu as nextPoll — both maps belong to the same Collector and neither
+// Discover nor Poll needs to hold the lock for long, so a second mutex
+// would add no real benefit.
+func (c *Collector) setNextDiscovery(key string, t time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.nextDiscovery[key] = t
 }
