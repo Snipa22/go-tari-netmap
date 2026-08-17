@@ -50,6 +50,7 @@ const defaultTickInterval = 5 * time.Minute
 // needed to record a health check.
 type NodeInfo struct {
 	Reachable      bool
+	PublicKey      []byte
 	Height         *int64
 	ChainTipHeight *int64
 	Version        *string
@@ -59,13 +60,26 @@ type NodeInfo struct {
 	Sha3xHashrate  *float64
 }
 
+// DiscoveredPeer is one address+pubkey pairing reported by a directly
+// connected peer during a GetPeers call. PublicKey may be nil if the peer
+// entry had no usable pubkey. Note that this pubkey is a claim the CURRENT
+// node (the one being walked) makes about its peer — it is NOT something
+// WE ourselves have confirmed by directly probing that peer, so it must
+// not be treated as a confirmed identity (see discoverWith's doc comment
+// in this file for why storage only ever records these as
+// UpsertDiscoveredNode placeholders, never UpsertConfirmedNode).
+type DiscoveredPeer struct {
+	Address   string
+	PublicKey []byte
+}
+
 // NodeClient is the interface the collector uses to talk to Tari base
 // nodes. This models the subset of go-tari-grpc-lib's base-node client
 // (ListConnectedPeers/GetPeers plus a health/sync-status call) the
 // collector needs.
 type NodeClient interface {
-	// GetPeers returns the addresses of addr's directly connected peers.
-	GetPeers(ctx context.Context, addr string) ([]string, error)
+	// GetPeers returns addr's directly connected peers.
+	GetPeers(ctx context.Context, addr string) ([]DiscoveredPeer, error)
 
 	// GetInfo returns addr's current health/sync-status info.
 	GetInfo(ctx context.Context, addr string) (NodeInfo, error)
@@ -86,7 +100,7 @@ func NewStubClient() NodeClient {
 	return &stubClient{}
 }
 
-func (s *stubClient) GetPeers(ctx context.Context, addr string) ([]string, error) {
+func (s *stubClient) GetPeers(ctx context.Context, addr string) ([]DiscoveredPeer, error) {
 	return nil, ErrNotConnected
 }
 
@@ -286,16 +300,17 @@ func (c *Collector) Discover(ctx context.Context) error {
 // given health check came from.
 //
 // Every address popped off the queue is still upserted into Storage
-// unconditionally — recording that a node exists/was seen is cheap and
-// not the politeness concern. What IS gated by a per-node discovery
-// cooldown (dueForDiscovery/setNextDiscovery, mirroring due/setNextPoll)
-// is the client.GetPeers call itself: re-dialing a node to ask for its
-// current peer list is the expensive/impolite part, so a node not yet due
-// for re-discovery is upserted (recording it was seen this pass) but not
-// dialed, and its peers are therefore not (re)enqueued from it this pass.
-// This cooldown is a separate, cross-pass/cross-call concept from the
-// visited map above, which only dedupes within a single discoverWith
-// call to prevent infinite loops/reprocessing.
+// unconditionally via UpsertDiscoveredNode — recording that a node
+// exists/was seen is cheap and not the politeness concern. What IS gated
+// by a per-node discovery cooldown (dueForDiscovery/setNextDiscovery,
+// mirroring due/setNextPoll) is the client.GetPeers call itself:
+// re-dialing a node to ask for its current peer list is the
+// expensive/impolite part, so a node not yet due for re-discovery is
+// upserted (recording it was seen this pass) but not dialed, and its
+// peers are therefore not (re)enqueued from it this pass. This cooldown
+// is a separate, cross-pass/cross-call concept from the visited map
+// above, which only dedupes within a single discoverWith call to prevent
+// infinite loops/reprocessing.
 //
 // The cooldown key is scoped per-transport (transportLabel+addr), not
 // just addr: gRPC and P2P-RPC are independent network dials/connections
@@ -304,6 +319,17 @@ func (c *Collector) Discover(ctx context.Context) error {
 // addr within the same (or a concurrent) Discover() call — see
 // TestDiscoverWalksBothTransportsIndependently, which specifically
 // exercises this.
+//
+// Every node upserted here — the node being walked and every peer it
+// reports — goes through UpsertDiscoveredNode, never UpsertConfirmedNode,
+// even for peer entries that carry a DiscoveredPeer.PublicKey. That
+// pubkey is a claim the node being walked makes about its peer; WE have
+// not ourselves directly, successfully probed that peer to confirm it —
+// only PollOnce's GetInfo path (a real direct probe) is allowed to call
+// UpsertConfirmedNode. Treating a peer-reported pubkey as confirmed here
+// would be an easy mistake (the data is right there!) but would let a
+// single misbehaving/malicious peer plant an arbitrary pubkey-to-address
+// binding into storage without ever being probed itself.
 func (c *Collector) discoverWith(ctx context.Context, client NodeClient, transportLabel string) {
 	visited := make(map[string]bool)
 	queue := append([]string{}, c.cfg.SeedNodes...)
@@ -317,10 +343,7 @@ func (c *Collector) discoverWith(ctx context.Context, client NodeClient, transpo
 		}
 		visited[addr] = true
 
-		fromNode, err := c.Storage.UpsertNode(ctx, storage.NodeInput{
-			Address:         addr,
-			DiscoverySource: storage.DiscoverySourceP2P,
-		})
+		fromNode, err := c.Storage.UpsertDiscoveredNode(ctx, addr, storage.DiscoverySourceP2P, nil, nil)
 		if err != nil {
 			log.Printf("collector: [%s] upsert node %s: %v", transportLabel, addr, err)
 			continue
@@ -342,22 +365,22 @@ func (c *Collector) discoverWith(ctx context.Context, client NodeClient, transpo
 		}
 		c.setNextDiscovery(cooldownKey, now.Add(c.discoveryInterval(fromNode)))
 
-		for _, peerAddr := range peers {
-			toNode, err := c.Storage.UpsertNode(ctx, storage.NodeInput{
-				Address:         peerAddr,
-				DiscoverySource: storage.DiscoverySourceP2P,
-			})
+		for _, peer := range peers {
+			// See this method's doc comment: peer.PublicKey is
+			// intentionally not passed through to storage here — only
+			// address-based discovery is recorded from a peer-walk hop.
+			toNode, err := c.Storage.UpsertDiscoveredNode(ctx, peer.Address, storage.DiscoverySourceP2P, nil, nil)
 			if err != nil {
-				log.Printf("collector: [%s] upsert node %s: %v", transportLabel, peerAddr, err)
+				log.Printf("collector: [%s] upsert node %s: %v", transportLabel, peer.Address, err)
 				continue
 			}
 
 			if err := c.Storage.RecordPeerEdgeObservation(ctx, fromNode.ID, toNode.ID); err != nil {
-				log.Printf("collector: [%s] record edge observation %s -> %s: %v", transportLabel, addr, peerAddr, err)
+				log.Printf("collector: [%s] record edge observation %s -> %s: %v", transportLabel, addr, peer.Address, err)
 			}
 
-			if !visited[peerAddr] {
-				queue = append(queue, peerAddr)
+			if !visited[peer.Address] {
+				queue = append(queue, peer.Address)
 			}
 		}
 	}
@@ -437,6 +460,17 @@ func PollOnce(ctx context.Context, grpcClient, p2pClient NodeClient, store stora
 // history reflects the failed check rather than silently having no data
 // point; the GetInfo error itself is not returned in that case, only any
 // error from the RecordHealthCheck call.
+//
+// If GetInfo succeeds and yields a confirmed PublicKey, this is a real,
+// direct probe of node.Address — exactly the case UpsertConfirmedNode
+// exists for — so it is called before recording the health check, and the
+// (possibly different, if this triggered a merge) surviving node's ID is
+// used for the recorded HealthCheckInput.NodeID rather than the original
+// node.ID: if node.Address was a placeholder that just got merged into an
+// already-confirmed node under a different id, the health check must be
+// recorded against the surviving node, not the now-deleted placeholder.
+// If info.PublicKey is nil/empty (GetInfo succeeded but didn't yield a
+// pubkey), the health check falls back to node.ID as before.
 func pollOnceWithSource(ctx context.Context, client NodeClient, store storage.Store, node storage.Node, probeSource storage.ProbeSource) error {
 	info, err := client.GetInfo(ctx, node.Address)
 	if err != nil {
@@ -447,8 +481,18 @@ func pollOnceWithSource(ctx context.Context, client NodeClient, store storage.St
 		})
 	}
 
+	nodeID := node.ID
+	if len(info.PublicKey) > 0 {
+		confirmed, err := store.UpsertConfirmedNode(ctx, node.Address, info.PublicKey, storage.DiscoverySourceP2P)
+		if err != nil {
+			log.Printf("collector: upsert confirmed node %s: %v", node.Address, err)
+		} else {
+			nodeID = confirmed.ID
+		}
+	}
+
 	return store.RecordHealthCheck(ctx, storage.HealthCheckInput{
-		NodeID:         node.ID,
+		NodeID:         nodeID,
 		Reachable:      info.Reachable,
 		ProbeSource:    probeSource,
 		Height:         info.Height,
