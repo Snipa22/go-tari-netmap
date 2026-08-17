@@ -215,13 +215,17 @@ func (s *pgStore) GetNode(ctx context.Context, id uuid.UUID) (Node, error) {
 }
 
 func (s *pgStore) RecordHealthCheck(ctx context.Context, in HealthCheckInput) error {
+	if in.ProbeSource == "" {
+		return fmt.Errorf("storage: probe_source is required")
+	}
+
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO node_health (
-			node_id, ts, reachable, height, chain_tip_height, version, latency_ms,
-			rxt_hashrate, c29_hashrate, sha3x_hashrate
-		) VALUES ($1, now(), $2, $3, $4, $5, $6, $7, $8, $9)
-	`, in.NodeID, in.Reachable, in.Height, in.ChainTipHeight, in.Version, in.LatencyMS,
-		in.RxtHashrate, in.C29Hashrate, in.Sha3xHashrate,
+			node_id, ts, reachable, probe_source, height, chain_tip_height, version,
+			latency_ms, rxt_hashrate, c29_hashrate, sha3x_hashrate
+		) VALUES ($1, now(), $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	`, in.NodeID, in.Reachable, string(in.ProbeSource), in.Height, in.ChainTipHeight, in.Version,
+		in.LatencyMS, in.RxtHashrate, in.C29Hashrate, in.Sha3xHashrate,
 	)
 	if err != nil {
 		return fmt.Errorf("storage: record health check: %w", err)
@@ -235,7 +239,7 @@ func (s *pgStore) GetNodeHistory(ctx context.Context, nodeID uuid.UUID, limit in
 	}
 
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, node_id, ts, reachable, height, chain_tip_height, version, latency_ms,
+		SELECT id, node_id, ts, reachable, probe_source, height, chain_tip_height, version, latency_ms,
 			rxt_hashrate, c29_hashrate, sha3x_hashrate
 		FROM node_health
 		WHERE node_id = $1
@@ -250,7 +254,7 @@ func (s *pgStore) GetNodeHistory(ctx context.Context, nodeID uuid.UUID, limit in
 	checks := []HealthCheck{}
 	for rows.Next() {
 		var h HealthCheck
-		if err := rows.Scan(&h.ID, &h.NodeID, &h.Timestamp, &h.Reachable, &h.Height, &h.ChainTipHeight,
+		if err := rows.Scan(&h.ID, &h.NodeID, &h.Timestamp, &h.Reachable, &h.ProbeSource, &h.Height, &h.ChainTipHeight,
 			&h.Version, &h.LatencyMS, &h.RxtHashrate, &h.C29Hashrate, &h.Sha3xHashrate); err != nil {
 			return nil, fmt.Errorf("storage: scan health check: %w", err)
 		}

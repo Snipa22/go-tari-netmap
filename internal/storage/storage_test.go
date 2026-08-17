@@ -194,10 +194,11 @@ func TestRecordHealthCheckAndHistory(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		h := height + int64(i)
 		if err := store.RecordHealthCheck(ctx, HealthCheckInput{
-			NodeID:    n.ID,
-			Reachable: true,
-			Height:    &h,
-			LatencyMS: &latency,
+			NodeID:      n.ID,
+			Reachable:   true,
+			ProbeSource: ProbeSourceGRPC,
+			Height:      &h,
+			LatencyMS:   &latency,
 		}); err != nil {
 			t.Fatalf("record health check %d: %v", i, err)
 		}
@@ -217,6 +218,69 @@ func TestRecordHealthCheckAndHistory(t *testing.T) {
 	}
 	if *history[1].Height != height+1 {
 		t.Errorf("history[1].Height = %d, want %d", *history[1].Height, height+1)
+	}
+	if history[0].ProbeSource != ProbeSourceGRPC {
+		t.Errorf("history[0].ProbeSource = %q, want %q", history[0].ProbeSource, ProbeSourceGRPC)
+	}
+}
+
+// TestRecordHealthCheckProbeSourceRoundTrip verifies that both
+// ProbeSourceGRPC and ProbeSourceP2P round-trip correctly through
+// RecordHealthCheck + GetNodeHistory, and that a node can accrue history
+// rows from both probe sources independently.
+func TestRecordHealthCheckProbeSourceRoundTrip(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	n, err := store.UpsertNode(ctx, NodeInput{Address: "node:1", DiscoverySource: DiscoverySourceP2P})
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	if err := store.RecordHealthCheck(ctx, HealthCheckInput{
+		NodeID:      n.ID,
+		Reachable:   true,
+		ProbeSource: ProbeSourceGRPC,
+	}); err != nil {
+		t.Fatalf("record grpc health check: %v", err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	if err := store.RecordHealthCheck(ctx, HealthCheckInput{
+		NodeID:      n.ID,
+		Reachable:   true,
+		ProbeSource: ProbeSourceP2P,
+	}); err != nil {
+		t.Fatalf("record p2p health check: %v", err)
+	}
+
+	history, err := store.GetNodeHistory(ctx, n.ID, 10)
+	if err != nil {
+		t.Fatalf("get history: %v", err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("len(history) = %d, want 2", len(history))
+	}
+	// Newest first: p2p was recorded after grpc.
+	if history[0].ProbeSource != ProbeSourceP2P {
+		t.Errorf("history[0].ProbeSource = %q, want %q", history[0].ProbeSource, ProbeSourceP2P)
+	}
+	if history[1].ProbeSource != ProbeSourceGRPC {
+		t.Errorf("history[1].ProbeSource = %q, want %q", history[1].ProbeSource, ProbeSourceGRPC)
+	}
+}
+
+func TestRecordHealthCheckRequiresProbeSource(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	n, err := store.UpsertNode(ctx, NodeInput{Address: "node:1", DiscoverySource: DiscoverySourceP2P})
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	err = store.RecordHealthCheck(ctx, HealthCheckInput{NodeID: n.ID, Reachable: true})
+	if err == nil {
+		t.Fatal("expected error when ProbeSource is unset, got nil")
 	}
 }
 
