@@ -87,7 +87,7 @@ func newTestStore(t *testing.T) storage.Store {
 	if err != nil {
 		t.Fatalf("connect for truncate: %v", err)
 	}
-	if _, err := pool.Exec(ctx, "TRUNCATE TABLE node_health, peer_edge_observations, nodes CASCADE"); err != nil {
+	if _, err := pool.Exec(ctx, "TRUNCATE TABLE node_health, peer_edge_observations, node_addresses, nodes CASCADE"); err != nil {
 		pool.Close()
 		t.Fatalf("truncate test tables: %v", err)
 	}
@@ -111,11 +111,19 @@ type fakeClient struct {
 	getPeersCalls map[string]int
 }
 
-func (f *fakeClient) GetPeers(ctx context.Context, addr string) ([]string, error) {
+func (f *fakeClient) GetPeers(ctx context.Context, addr string) ([]DiscoveredPeer, error) {
 	if f.getPeersCalls != nil {
 		f.getPeersCalls[addr]++
 	}
-	return f.peers[addr], nil
+	addrs := f.peers[addr]
+	if addrs == nil {
+		return nil, nil
+	}
+	peers := make([]DiscoveredPeer, len(addrs))
+	for i, a := range addrs {
+		peers[i] = DiscoveredPeer{Address: a}
+	}
+	return peers, nil
 }
 
 func (f *fakeClient) GetInfo(ctx context.Context, addr string) (NodeInfo, error) {
@@ -284,10 +292,7 @@ func TestPollRecordsHealthChecksAndRespectsCadence(t *testing.T) {
 		},
 	}
 
-	node, err := store.UpsertNode(ctx, storage.NodeInput{
-		Address:         "node:1",
-		DiscoverySource: storage.DiscoverySourceP2P,
-	})
+	node, err := store.UpsertDiscoveredNode(ctx, "node:1", storage.DiscoverySourceP2P, nil, nil)
 	if err != nil {
 		t.Fatalf("seed node: %v", err)
 	}
@@ -337,10 +342,7 @@ func TestPollUnreachableNodeRecordsFailure(t *testing.T) {
 
 	client := &fakeClient{info: map[string]NodeInfo{}} // no fixture => GetInfo errors
 
-	node, err := store.UpsertNode(ctx, storage.NodeInput{
-		Address:         "unreachable:1",
-		DiscoverySource: storage.DiscoverySourceP2P,
-	})
+	node, err := store.UpsertDiscoveredNode(ctx, "unreachable:1", storage.DiscoverySourceP2P, nil, nil)
 	if err != nil {
 		t.Fatalf("seed node: %v", err)
 	}
@@ -395,10 +397,7 @@ func TestPollDualProbeBothSucceed(t *testing.T) {
 		"node:1": {Reachable: true, Height: &p2pHeight},
 	}}
 
-	node, err := store.UpsertNode(ctx, storage.NodeInput{
-		Address:         "node:1",
-		DiscoverySource: storage.DiscoverySourceP2P,
-	})
+	node, err := store.UpsertDiscoveredNode(ctx, "node:1", storage.DiscoverySourceP2P, nil, nil)
 	if err != nil {
 		t.Fatalf("seed node: %v", err)
 	}
@@ -452,10 +451,7 @@ func TestPollDualProbeGRPCFailsP2PSucceeds(t *testing.T) {
 		"node:1": {Reachable: true, Height: &p2pHeight},
 	}}
 
-	node, err := store.UpsertNode(ctx, storage.NodeInput{
-		Address:         "node:1",
-		DiscoverySource: storage.DiscoverySourceP2P,
-	})
+	node, err := store.UpsertDiscoveredNode(ctx, "node:1", storage.DiscoverySourceP2P, nil, nil)
 	if err != nil {
 		t.Fatalf("seed node: %v", err)
 	}
@@ -504,10 +500,7 @@ func TestPollDualProbeP2PFailsGRPCSucceeds(t *testing.T) {
 	}}
 	p2pClient := &fakeClient{info: map[string]NodeInfo{}} // no fixture => errors
 
-	node, err := store.UpsertNode(ctx, storage.NodeInput{
-		Address:         "node:1",
-		DiscoverySource: storage.DiscoverySourceP2P,
-	})
+	node, err := store.UpsertDiscoveredNode(ctx, "node:1", storage.DiscoverySourceP2P, nil, nil)
 	if err != nil {
 		t.Fatalf("seed node: %v", err)
 	}
@@ -556,10 +549,7 @@ func TestPollNilP2PClientSkipsP2PProbe(t *testing.T) {
 		"node:1": {Reachable: true, Height: &height},
 	}}
 
-	node, err := store.UpsertNode(ctx, storage.NodeInput{
-		Address:         "node:1",
-		DiscoverySource: storage.DiscoverySourceP2P,
-	})
+	node, err := store.UpsertDiscoveredNode(ctx, "node:1", storage.DiscoverySourceP2P, nil, nil)
 	if err != nil {
 		t.Fatalf("seed node: %v", err)
 	}
@@ -640,7 +630,7 @@ type slowPeersFastInfoClient struct {
 	info map[string]NodeInfo
 }
 
-func (s *slowPeersFastInfoClient) GetPeers(ctx context.Context, addr string) ([]string, error) {
+func (s *slowPeersFastInfoClient) GetPeers(ctx context.Context, addr string) ([]DiscoveredPeer, error) {
 	close(s.peersCalled)
 	defer s.getPeersDone.Store(true)
 	select {
@@ -692,10 +682,7 @@ func TestRunDoesNotStarvePollOnSlowDiscover(t *testing.T) {
 
 	// A node that's already due for a poll (no prior nextPoll entry —
 	// due() treats that as immediately due).
-	node, err := store.UpsertNode(seedCtx, storage.NodeInput{
-		Address:         "node:1",
-		DiscoverySource: storage.DiscoverySourceP2P,
-	})
+	node, err := store.UpsertDiscoveredNode(seedCtx, "node:1", storage.DiscoverySourceP2P, nil, nil)
 	if err != nil {
 		t.Fatalf("seed node: %v", err)
 	}
