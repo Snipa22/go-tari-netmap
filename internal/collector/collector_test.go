@@ -87,7 +87,7 @@ func newTestStore(t *testing.T) storage.Store {
 	if err != nil {
 		t.Fatalf("connect for truncate: %v", err)
 	}
-	if _, err := pool.Exec(ctx, "TRUNCATE TABLE node_health, peer_edges, nodes CASCADE"); err != nil {
+	if _, err := pool.Exec(ctx, "TRUNCATE TABLE node_health, peer_edge_observations, nodes CASCADE"); err != nil {
 		pool.Close()
 		t.Fatalf("truncate test tables: %v", err)
 	}
@@ -103,9 +103,18 @@ func newTestStore(t *testing.T) storage.Store {
 type fakeClient struct {
 	peers map[string][]string
 	info  map[string]NodeInfo
+
+	// getPeersCalls counts GetPeers calls per address, letting tests
+	// assert directly on whether/how-many-times a given node was
+	// (re-)dialed for its peer list, rather than only inferring it from
+	// what did or didn't end up in storage.
+	getPeersCalls map[string]int
 }
 
 func (f *fakeClient) GetPeers(ctx context.Context, addr string) ([]string, error) {
+	if f.getPeersCalls != nil {
+		f.getPeersCalls[addr]++
+	}
 	return f.peers[addr], nil
 }
 
@@ -210,6 +219,60 @@ func TestDiscoverWalksBothTransportsIndependently(t *testing.T) {
 	}
 }
 
+// TestDiscoverRespectsPerNodeCooldown verifies that a node re-encountered
+// within the same seed list on a second Discover() call, before its
+// discovery cooldown (DiscoveryIntervalGeneric) has elapsed, is upserted
+// (recording it was seen) but NOT re-dialed via GetPeers — proving the
+// per-node discovery cooldown actually gates the expensive/impolite
+// re-walk, not just the cheap node-existence bookkeeping.
+func TestDiscoverRespectsPerNodeCooldown(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	client := &fakeClient{
+		peers: map[string][]string{
+			"seed:1":  {"peerA:1"},
+			"peerA:1": {},
+		},
+		getPeersCalls: map[string]int{},
+	}
+
+	c := New(Config{SeedNodes: []string{"seed:1"}})
+	c.Storage = store
+	c.GRPCClient = client
+
+	if err := c.Discover(ctx); err != nil {
+		t.Fatalf("first discover: %v", err)
+	}
+	if client.getPeersCalls["seed:1"] != 1 {
+		t.Fatalf("getPeersCalls[seed:1] after first discover = %d, want 1", client.getPeersCalls["seed:1"])
+	}
+
+	// Mutate seed:1's peer list to include a brand-new peer. If seed:1
+	// gets re-dialed on the second Discover() call (the cooldown bug),
+	// this new peer would show up in storage; if the cooldown correctly
+	// blocks the re-dial, it won't.
+	client.peers["seed:1"] = []string{"peerA:1", "newPeer:1"}
+
+	if err := c.Discover(ctx); err != nil {
+		t.Fatalf("second discover: %v", err)
+	}
+
+	if client.getPeersCalls["seed:1"] != 1 {
+		t.Errorf("getPeersCalls[seed:1] after second discover = %d, want still 1 (cooldown should block re-dial)", client.getPeersCalls["seed:1"])
+	}
+
+	nodes, err := store.ListNodes(ctx, storage.NodeFilter{})
+	if err != nil {
+		t.Fatalf("list nodes: %v", err)
+	}
+	for _, n := range nodes {
+		if n.Address == "newPeer:1" {
+			t.Fatalf("newPeer:1 was discovered even though seed:1's discovery cooldown should have blocked re-dialing it; nodes = %+v", nodes)
+		}
+	}
+}
+
 func TestPollRecordsHealthChecksAndRespectsCadence(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -255,7 +318,7 @@ func TestPollRecordsHealthChecksAndRespectsCadence(t *testing.T) {
 	}
 
 	// Polling again immediately must be a no-op: the generic node's
-	// next-poll time (PollIntervalGeneric = 1h) hasn't elapsed yet.
+	// next-poll time (PollIntervalGeneric = 2h) hasn't elapsed yet.
 	if err := c.Poll(ctx); err != nil {
 		t.Fatalf("second poll: %v", err)
 	}
