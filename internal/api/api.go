@@ -22,9 +22,11 @@ import (
 const asyncCheckTimeout = 30 * time.Second
 
 // NewRouter returns the HTTP handler for the API. store persists topology
-// and health data; client is used to kick off an async, non-blocking health
-// check when a new node is registered via POST /nodes.
-func NewRouter(store storage.Store, client collector.NodeClient) http.Handler {
+// and health data; grpcClient and p2pClient are used to kick off an async,
+// non-blocking health check via each configured transport when a new node
+// is registered via POST /nodes. Either may be nil — collector.PollOnce
+// skips a nil client's probe entirely rather than erroring.
+func NewRouter(store storage.Store, grpcClient, p2pClient collector.NodeClient) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -32,7 +34,7 @@ func NewRouter(store storage.Store, client collector.NodeClient) http.Handler {
 	})
 
 	mux.HandleFunc("GET /nodes", handleListNodes(store))
-	mux.HandleFunc("POST /nodes", handleCreateNode(store, client))
+	mux.HandleFunc("POST /nodes", handleCreateNode(store, grpcClient, p2pClient))
 	mux.HandleFunc("GET /nodes/{id}", handleGetNode(store))
 	mux.HandleFunc("GET /nodes/{id}/history", handleGetNodeHistory(store))
 	mux.HandleFunc("GET /topology", handleTopology(store))
@@ -89,7 +91,7 @@ func (p *flexPort) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func handleCreateNode(store storage.Store, client collector.NodeClient) http.HandlerFunc {
+func handleCreateNode(store storage.Store, grpcClient, p2pClient collector.NodeClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req createNodeRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -135,11 +137,12 @@ func handleCreateNode(store storage.Store, client collector.NodeClient) http.Han
 		// no request left to report the outcome to, so errors are
 		// swallowed after logging is left to collector.PollOnce's own
 		// RecordHealthCheck call (an unreachable result is still
-		// recorded).
+		// recorded). PollOnce attempts grpcClient and p2pClient
+		// independently, skipping whichever is nil.
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), asyncCheckTimeout)
 			defer cancel()
-			_ = collector.PollOnce(ctx, client, store, node)
+			_ = collector.PollOnce(ctx, grpcClient, p2pClient, store, node)
 		}()
 
 		writeJSON(w, http.StatusCreated, node)

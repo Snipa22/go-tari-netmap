@@ -130,7 +130,7 @@ func TestDiscoverWalksAndDedupes(t *testing.T) {
 
 	c := New(Config{SeedNodes: []string{"seed:1"}})
 	c.Storage = store
-	c.Client = client
+	c.GRPCClient = client
 
 	if err := c.Discover(ctx); err != nil {
 		t.Fatalf("discover: %v", err)
@@ -162,6 +162,53 @@ func TestDiscoverWalksAndDedupes(t *testing.T) {
 	}
 }
 
+// TestDiscoverWalksBothTransportsIndependently verifies that when both
+// GRPCClient and P2PClient are configured, Discover runs a separate walk
+// over each, and a peer only reachable via one transport still ends up
+// discovered — neither walk's peer graph is required to feed into the
+// other's, and one having a smaller graph doesn't limit the other.
+func TestDiscoverWalksBothTransportsIndependently(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	grpcClient := &fakeClient{
+		peers: map[string][]string{
+			"seed:1": {"grpc-only-peer:1"},
+		},
+	}
+	p2pClient := &fakeClient{
+		peers: map[string][]string{
+			"seed:1": {"p2p-only-peer:1"},
+		},
+	}
+
+	c := New(Config{SeedNodes: []string{"seed:1"}})
+	c.Storage = store
+	c.GRPCClient = grpcClient
+	c.P2PClient = p2pClient
+
+	if err := c.Discover(ctx); err != nil {
+		t.Fatalf("discover: %v", err)
+	}
+
+	nodes, err := store.ListNodes(ctx, storage.NodeFilter{})
+	if err != nil {
+		t.Fatalf("list nodes: %v", err)
+	}
+	addrs := make(map[string]bool)
+	for _, n := range nodes {
+		addrs[n.Address] = true
+	}
+	for _, want := range []string{"seed:1", "grpc-only-peer:1", "p2p-only-peer:1"} {
+		if !addrs[want] {
+			t.Errorf("expected node %q to be discovered, got nodes %v", want, addrs)
+		}
+	}
+	if len(nodes) != 3 {
+		t.Fatalf("len(nodes) = %d, want 3", len(nodes))
+	}
+}
+
 func TestPollRecordsHealthChecksAndRespectsCadence(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -183,7 +230,7 @@ func TestPollRecordsHealthChecksAndRespectsCadence(t *testing.T) {
 
 	c := New(Config{})
 	c.Storage = store
-	c.Client = client
+	c.GRPCClient = client
 
 	if err := c.Poll(ctx); err != nil {
 		t.Fatalf("poll: %v", err)
@@ -201,6 +248,9 @@ func TestPollRecordsHealthChecksAndRespectsCadence(t *testing.T) {
 	}
 	if history[0].Height == nil || *history[0].Height != height {
 		t.Errorf("height = %v, want %d", history[0].Height, height)
+	}
+	if history[0].ProbeSource != storage.ProbeSourceGRPC {
+		t.Errorf("probe_source = %q, want %q", history[0].ProbeSource, storage.ProbeSourceGRPC)
 	}
 
 	// Polling again immediately must be a no-op: the generic node's
@@ -233,7 +283,7 @@ func TestPollUnreachableNodeRecordsFailure(t *testing.T) {
 
 	c := New(Config{})
 	c.Storage = store
-	c.Client = client
+	c.GRPCClient = client
 
 	if err := c.Poll(ctx); err != nil {
 		t.Fatalf("poll: %v", err)
@@ -248,6 +298,226 @@ func TestPollUnreachableNodeRecordsFailure(t *testing.T) {
 	}
 	if history[0].Reachable {
 		t.Errorf("expected reachable = false for a GetInfo error")
+	}
+	if history[0].ProbeSource != storage.ProbeSourceGRPC {
+		t.Errorf("probe_source = %q, want %q", history[0].ProbeSource, storage.ProbeSourceGRPC)
+	}
+}
+
+// historyByProbeSource groups history rows by their ProbeSource, for tests
+// that need to assert on both a grpc-sourced and a p2p-sourced row
+// independently.
+func historyByProbeSource(history []storage.HealthCheck) map[storage.ProbeSource][]storage.HealthCheck {
+	out := make(map[storage.ProbeSource][]storage.HealthCheck)
+	for _, h := range history {
+		out[h.ProbeSource] = append(out[h.ProbeSource], h)
+	}
+	return out
+}
+
+// TestPollDualProbeBothSucceed verifies that when both GRPCClient and
+// P2PClient are configured and both successfully report info for a node,
+// Poll (via PollOnce) records two independent rows, one per probe_source.
+func TestPollDualProbeBothSucceed(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	grpcHeight := int64(100)
+	p2pHeight := int64(200)
+	grpcClient := &fakeClient{info: map[string]NodeInfo{
+		"node:1": {Reachable: true, Height: &grpcHeight},
+	}}
+	p2pClient := &fakeClient{info: map[string]NodeInfo{
+		"node:1": {Reachable: true, Height: &p2pHeight},
+	}}
+
+	node, err := store.UpsertNode(ctx, storage.NodeInput{
+		Address:         "node:1",
+		DiscoverySource: storage.DiscoverySourceP2P,
+	})
+	if err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	c := New(Config{})
+	c.Storage = store
+	c.GRPCClient = grpcClient
+	c.P2PClient = p2pClient
+
+	if err := c.Poll(ctx); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+
+	history, err := store.GetNodeHistory(ctx, node.ID, 10)
+	if err != nil {
+		t.Fatalf("get history: %v", err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("len(history) = %d, want 2 (one per probe source)", len(history))
+	}
+
+	bySource := historyByProbeSource(history)
+	grpcRows := bySource[storage.ProbeSourceGRPC]
+	p2pRows := bySource[storage.ProbeSourceP2P]
+	if len(grpcRows) != 1 {
+		t.Fatalf("len(grpc rows) = %d, want 1", len(grpcRows))
+	}
+	if len(p2pRows) != 1 {
+		t.Fatalf("len(p2p rows) = %d, want 1", len(p2pRows))
+	}
+	if grpcRows[0].Height == nil || *grpcRows[0].Height != grpcHeight {
+		t.Errorf("grpc row height = %v, want %d", grpcRows[0].Height, grpcHeight)
+	}
+	if p2pRows[0].Height == nil || *p2pRows[0].Height != p2pHeight {
+		t.Errorf("p2p row height = %v, want %d", p2pRows[0].Height, p2pHeight)
+	}
+}
+
+// TestPollDualProbeGRPCFailsP2PSucceeds verifies that when GRPCClient
+// fails (no fixture => GetInfo errors) but P2PClient succeeds for the same
+// node, both attempts are still made independently: a p2p-sourced
+// reachable row is recorded, and a grpc-sourced unreachable row is
+// recorded — not a missing grpc row and not a skipped p2p attempt.
+func TestPollDualProbeGRPCFailsP2PSucceeds(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	p2pHeight := int64(300)
+	grpcClient := &fakeClient{info: map[string]NodeInfo{}} // no fixture => errors
+	p2pClient := &fakeClient{info: map[string]NodeInfo{
+		"node:1": {Reachable: true, Height: &p2pHeight},
+	}}
+
+	node, err := store.UpsertNode(ctx, storage.NodeInput{
+		Address:         "node:1",
+		DiscoverySource: storage.DiscoverySourceP2P,
+	})
+	if err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	c := New(Config{})
+	c.Storage = store
+	c.GRPCClient = grpcClient
+	c.P2PClient = p2pClient
+
+	if err := c.Poll(ctx); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+
+	history, err := store.GetNodeHistory(ctx, node.ID, 10)
+	if err != nil {
+		t.Fatalf("get history: %v", err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("len(history) = %d, want 2 (one failed grpc row, one successful p2p row)", len(history))
+	}
+
+	bySource := historyByProbeSource(history)
+	grpcRows := bySource[storage.ProbeSourceGRPC]
+	p2pRows := bySource[storage.ProbeSourceP2P]
+	if len(grpcRows) != 1 || grpcRows[0].Reachable {
+		t.Fatalf("grpc rows = %+v, want exactly 1 unreachable row", grpcRows)
+	}
+	if len(p2pRows) != 1 || !p2pRows[0].Reachable {
+		t.Fatalf("p2p rows = %+v, want exactly 1 reachable row", p2pRows)
+	}
+	if p2pRows[0].Height == nil || *p2pRows[0].Height != p2pHeight {
+		t.Errorf("p2p row height = %v, want %d", p2pRows[0].Height, p2pHeight)
+	}
+}
+
+// TestPollDualProbeP2PFailsGRPCSucceeds is the mirror of
+// TestPollDualProbeGRPCFailsP2PSucceeds, with the failing/succeeding
+// transports swapped.
+func TestPollDualProbeP2PFailsGRPCSucceeds(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	grpcHeight := int64(400)
+	grpcClient := &fakeClient{info: map[string]NodeInfo{
+		"node:1": {Reachable: true, Height: &grpcHeight},
+	}}
+	p2pClient := &fakeClient{info: map[string]NodeInfo{}} // no fixture => errors
+
+	node, err := store.UpsertNode(ctx, storage.NodeInput{
+		Address:         "node:1",
+		DiscoverySource: storage.DiscoverySourceP2P,
+	})
+	if err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	c := New(Config{})
+	c.Storage = store
+	c.GRPCClient = grpcClient
+	c.P2PClient = p2pClient
+
+	if err := c.Poll(ctx); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+
+	history, err := store.GetNodeHistory(ctx, node.ID, 10)
+	if err != nil {
+		t.Fatalf("get history: %v", err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("len(history) = %d, want 2 (one successful grpc row, one failed p2p row)", len(history))
+	}
+
+	bySource := historyByProbeSource(history)
+	grpcRows := bySource[storage.ProbeSourceGRPC]
+	p2pRows := bySource[storage.ProbeSourceP2P]
+	if len(grpcRows) != 1 || !grpcRows[0].Reachable {
+		t.Fatalf("grpc rows = %+v, want exactly 1 reachable row", grpcRows)
+	}
+	if len(p2pRows) != 1 || p2pRows[0].Reachable {
+		t.Fatalf("p2p rows = %+v, want exactly 1 unreachable row", p2pRows)
+	}
+	if grpcRows[0].Height == nil || *grpcRows[0].Height != grpcHeight {
+		t.Errorf("grpc row height = %v, want %d", grpcRows[0].Height, grpcHeight)
+	}
+}
+
+// TestPollNilP2PClientSkipsP2PProbe verifies that a nil P2PClient (the
+// default for a Collector that only has GRPCClient configured) is simply
+// skipped, not treated as an error, and does not prevent the GRPCClient
+// probe from being recorded.
+func TestPollNilP2PClientSkipsP2PProbe(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	height := int64(50)
+	grpcClient := &fakeClient{info: map[string]NodeInfo{
+		"node:1": {Reachable: true, Height: &height},
+	}}
+
+	node, err := store.UpsertNode(ctx, storage.NodeInput{
+		Address:         "node:1",
+		DiscoverySource: storage.DiscoverySourceP2P,
+	})
+	if err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	c := New(Config{})
+	c.Storage = store
+	c.GRPCClient = grpcClient
+	// c.P2PClient intentionally left nil.
+
+	if err := c.Poll(ctx); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+
+	history, err := store.GetNodeHistory(ctx, node.ID, 10)
+	if err != nil {
+		t.Fatalf("get history: %v", err)
+	}
+	if len(history) != 1 {
+		t.Fatalf("len(history) = %d, want 1 (grpc only, p2p skipped)", len(history))
+	}
+	if history[0].ProbeSource != storage.ProbeSourceGRPC {
+		t.Errorf("probe_source = %q, want %q", history[0].ProbeSource, storage.ProbeSourceGRPC)
 	}
 }
 
@@ -269,7 +539,7 @@ func TestRunRespectsContextCancellation(t *testing.T) {
 
 	c := New(Config{})
 	c.Storage = store
-	c.Client = &fakeClient{}
+	c.GRPCClient = &fakeClient{}
 	c.TickInterval = time.Millisecond
 
 	ctx, cancel := context.WithCancel(context.Background())

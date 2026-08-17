@@ -42,11 +42,17 @@ func main() {
 	// Real go-tari-grpc-lib-backed client: talks to Tari base nodes over
 	// gRPC. Dials fresh per-call (see grpcNodeClient's doc comment in
 	// internal/collector/grpc_client.go for why that's fine here).
-	client := collector.NewGRPCClient()
+	grpcClient := collector.NewGRPCClient()
+
+	// Real go-tari-lib/p2p-backed client: talks to Tari nodes over the
+	// direct comms/RPC-over-P2P transport, independent of gRPC — see
+	// p2pNodeClient's doc comment in internal/collector/p2p_client.go.
+	p2pClient := collector.NewP2PClient()
 
 	c := collector.New(collector.Config{SeedNodes: parseSeedNodes(os.Getenv("NETMAP_SEED_NODES"))})
 	c.Storage = store
-	c.Client = client
+	c.GRPCClient = grpcClient
+	c.P2PClient = p2pClient
 
 	go func() {
 		if err := c.Run(ctx); err != nil {
@@ -61,7 +67,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.Handle("/", webHandler)
-	mux.Handle("/api/", http.StripPrefix("/api", api.NewRouter(store, client)))
+	mux.Handle("/api/", http.StripPrefix("/api", api.NewRouter(store, grpcClient, p2pClient)))
 
 	srv := &http.Server{Addr: *addr, Handler: mux}
 
