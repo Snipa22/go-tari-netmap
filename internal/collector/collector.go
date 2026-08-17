@@ -110,10 +110,17 @@ type Collector struct {
 	// still works correctly, just without data from the other transport.
 	P2PClient NodeClient
 
-	// TickInterval governs how often Run checks which known nodes are due
-	// for a poll. Defaults to defaultTickInterval if unset. Kept short and
-	// independent of the (much longer) per-node poll cadence so tests
-	// don't need to wait an hour for anything.
+	// TickInterval governs both how often Run checks which known nodes
+	// are due for a poll, and how often Run kicks off a fresh discovery
+	// pass. The two run on independent tickers/goroutines (see Run) but
+	// share this same cadence value for simplicity — there's no need for
+	// separate configuration since a discovery pass that's still running
+	// when its next tick fires simply doesn't overlap with itself (Run
+	// waits for the previous Discover call to return before scheduling
+	// off the next tick), and the same is true for Poll. Defaults to
+	// defaultTickInterval if unset. Kept short and independent of the
+	// (much longer) per-node poll cadence so tests don't need to wait an
+	// hour for anything.
 	TickInterval time.Duration
 
 	mu       sync.Mutex
@@ -133,37 +140,86 @@ func New(cfg Config) *Collector {
 	}
 }
 
-// Run starts the collector's discovery + poll loop. It respects ctx
-// cancellation and returns nil on clean shutdown.
+// Run starts the collector's discovery and poll loops. Discovery and
+// polling run on independent goroutines/tickers so that a slow or
+// never-ending Discover pass (a synchronous BFS over the real peer graph,
+// with real network dials — this can take minutes against the real
+// mainnet, or longer as the network grows) cannot starve Poll, which is
+// what actually produces the health-check data the rest of this tool is
+// for. Both goroutines share Storage and the NodeClients, and both
+// observe ctx cancellation independently. Run blocks until both have
+// exited (via a sync.WaitGroup) and returns nil on clean shutdown.
+//
+// Discover() only ever touches Storage and the NodeClients — never
+// c.nextPoll — so running it concurrently with Poll() introduces no new
+// data race: c.nextPoll access is already guarded by c.mu for
+// Poll-vs-Poll safety (due/setNextPoll), and Discover never reads or
+// writes it.
 func (c *Collector) Run(ctx context.Context) error {
 	tick := c.TickInterval
 	if tick <= 0 {
 		tick = defaultTickInterval
 	}
 
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		c.runDiscoverLoop(ctx, tick)
+	}()
+
+	go func() {
+		defer wg.Done()
+		c.runPollLoop(ctx, tick)
+	}()
+
+	wg.Wait()
+	return nil
+}
+
+// runDiscoverLoop runs Discover once immediately, then on every tick,
+// until ctx is cancelled. It runs entirely independently of runPollLoop.
+func (c *Collector) runDiscoverLoop(ctx context.Context, tick time.Duration) {
 	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
 
-	// Run one pass immediately so discovery/polling starts without waiting
-	// for the first tick.
-	c.runPass(ctx)
+	if err := c.Discover(ctx); err != nil {
+		log.Printf("collector: discovery pass error: %v", err)
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
+			return
 		case <-ticker.C:
-			c.runPass(ctx)
+			if err := c.Discover(ctx); err != nil {
+				log.Printf("collector: discovery pass error: %v", err)
+			}
 		}
 	}
 }
 
-func (c *Collector) runPass(ctx context.Context) {
-	if err := c.Discover(ctx); err != nil {
-		log.Printf("collector: discovery pass error: %v", err)
-	}
+// runPollLoop runs Poll once immediately, then on every tick, until ctx
+// is cancelled. It runs entirely independently of runDiscoverLoop, so a
+// slow/hanging Discover pass never delays or starves polling.
+func (c *Collector) runPollLoop(ctx context.Context, tick time.Duration) {
+	ticker := time.NewTicker(tick)
+	defer ticker.Stop()
+
 	if err := c.Poll(ctx); err != nil {
 		log.Printf("collector: poll pass error: %v", err)
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := c.Poll(ctx); err != nil {
+				log.Printf("collector: poll pass error: %v", err)
+			}
+		}
 	}
 }
 
