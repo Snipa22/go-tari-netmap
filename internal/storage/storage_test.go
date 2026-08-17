@@ -79,7 +79,7 @@ func newTestStore(t *testing.T) Store {
 	}
 
 	ps := store.(*pgStore)
-	if _, err := ps.pool.Exec(ctx, "TRUNCATE TABLE node_health, peer_edges, nodes CASCADE"); err != nil {
+	if _, err := ps.pool.Exec(ctx, "TRUNCATE TABLE node_health, peer_edge_observations, nodes CASCADE"); err != nil {
 		t.Fatalf("truncate test tables: %v", err)
 	}
 
@@ -297,12 +297,16 @@ func TestPeerEdgesAndTopology(t *testing.T) {
 		t.Fatalf("upsert b: %v", err)
 	}
 
-	if err := store.UpsertPeerEdge(ctx, a.ID, b.ID); err != nil {
-		t.Fatalf("upsert edge: %v", err)
+	if err := store.RecordPeerEdgeObservation(ctx, a.ID, b.ID); err != nil {
+		t.Fatalf("record edge observation: %v", err)
 	}
-	// Dedupe: upserting the same edge again must not create a duplicate.
-	if err := store.UpsertPeerEdge(ctx, a.ID, b.ID); err != nil {
-		t.Fatalf("upsert edge again: %v", err)
+	// Two observations of the same (from, to) pair are NOT deduped at the
+	// storage layer anymore — each is its own row in
+	// peer_edge_observations (see TestPeerEdgeObservationsAccumulateOverTime
+	// for a direct assertion of that). ListTopology's rollup view still
+	// shows this pair as a single current-snapshot edge, though.
+	if err := store.RecordPeerEdgeObservation(ctx, a.ID, b.ID); err != nil {
+		t.Fatalf("record edge observation again: %v", err)
 	}
 
 	nodes, edges, err := store.ListTopology(ctx)
@@ -317,6 +321,121 @@ func TestPeerEdgesAndTopology(t *testing.T) {
 	}
 	if edges[0].FromNodeID != a.ID || edges[0].ToNodeID != b.ID {
 		t.Errorf("edge = %+v, want from=%v to=%v", edges[0], a.ID, b.ID)
+	}
+}
+
+// TestPeerEdgeObservationsAccumulateOverTime is the core proof that the
+// old UpsertPeerEdge overwrite behavior is gone: two
+// RecordPeerEdgeObservation calls for the same (from, to) pair, separated
+// by a real time gap, must produce two distinct rows in
+// peer_edge_observations with two distinct, strictly increasing
+// observed_at timestamps — not one row with a bumped last_seen.
+func TestPeerEdgeObservationsAccumulateOverTime(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	a, err := store.UpsertNode(ctx, NodeInput{Address: "a:1", DiscoverySource: DiscoverySourceP2P})
+	if err != nil {
+		t.Fatalf("upsert a: %v", err)
+	}
+	b, err := store.UpsertNode(ctx, NodeInput{Address: "b:2", DiscoverySource: DiscoverySourceP2P})
+	if err != nil {
+		t.Fatalf("upsert b: %v", err)
+	}
+
+	if err := store.RecordPeerEdgeObservation(ctx, a.ID, b.ID); err != nil {
+		t.Fatalf("record edge observation 1: %v", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if err := store.RecordPeerEdgeObservation(ctx, a.ID, b.ID); err != nil {
+		t.Fatalf("record edge observation 2: %v", err)
+	}
+
+	ps := store.(*pgStore)
+	rows, err := ps.pool.Query(ctx, `
+		SELECT observed_at FROM peer_edge_observations
+		WHERE from_node_id = $1 AND to_node_id = $2
+		ORDER BY observed_at
+	`, a.ID, b.ID)
+	if err != nil {
+		t.Fatalf("query observations: %v", err)
+	}
+	defer rows.Close()
+
+	var timestamps []time.Time
+	for rows.Next() {
+		var ts time.Time
+		if err := rows.Scan(&ts); err != nil {
+			t.Fatalf("scan observed_at: %v", err)
+		}
+		timestamps = append(timestamps, ts)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("query observations: %v", err)
+	}
+
+	if len(timestamps) != 2 {
+		t.Fatalf("len(timestamps) = %d, want 2", len(timestamps))
+	}
+	if !timestamps[1].After(timestamps[0]) {
+		t.Errorf("timestamps[1] = %v, want strictly after timestamps[0] = %v", timestamps[1], timestamps[0])
+	}
+}
+
+// TestTopPeeredNodes verifies that TopPeeredNodes ranks nodes by distinct
+// peer count (undirected) and returns the correct Degree for the
+// highest-connected node.
+func TestTopPeeredNodes(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	hub, err := store.UpsertNode(ctx, NodeInput{Address: "hub:1", DiscoverySource: DiscoverySourceP2P})
+	if err != nil {
+		t.Fatalf("upsert hub: %v", err)
+	}
+	leaf1, err := store.UpsertNode(ctx, NodeInput{Address: "leaf1:1", DiscoverySource: DiscoverySourceP2P})
+	if err != nil {
+		t.Fatalf("upsert leaf1: %v", err)
+	}
+	leaf2, err := store.UpsertNode(ctx, NodeInput{Address: "leaf2:1", DiscoverySource: DiscoverySourceP2P})
+	if err != nil {
+		t.Fatalf("upsert leaf2: %v", err)
+	}
+	leaf3, err := store.UpsertNode(ctx, NodeInput{Address: "leaf3:1", DiscoverySource: DiscoverySourceP2P})
+	if err != nil {
+		t.Fatalf("upsert leaf3: %v", err)
+	}
+
+	// hub has edges to/from leaf1, leaf2, leaf3 (degree 3). leaf1 and
+	// leaf2 have one edge between them too (degree 2 each, counting the
+	// hub edge). leaf3 only connects to hub (degree 1).
+	for _, e := range []struct{ from, to uuid.UUID }{
+		{hub.ID, leaf1.ID},
+		{hub.ID, leaf2.ID},
+		{leaf3.ID, hub.ID},
+		{leaf1.ID, leaf2.ID},
+	} {
+		if err := store.RecordPeerEdgeObservation(ctx, e.from, e.to); err != nil {
+			t.Fatalf("record edge observation %v -> %v: %v", e.from, e.to, err)
+		}
+	}
+
+	since := time.Now().Add(-time.Hour)
+	top, err := store.TopPeeredNodes(ctx, since, 10)
+	if err != nil {
+		t.Fatalf("top peered nodes: %v", err)
+	}
+	if len(top) == 0 {
+		t.Fatalf("expected at least 1 result")
+	}
+	if top[0].NodeID != hub.ID {
+		t.Fatalf("top[0].NodeID = %v, want hub %v (top = %+v)", top[0].NodeID, hub.ID, top)
+	}
+	if top[0].Degree != 3 {
+		t.Errorf("top[0].Degree = %d, want 3", top[0].Degree)
+	}
+	if top[0].Address != "hub:1" {
+		t.Errorf("top[0].Address = %q, want %q", top[0].Address, "hub:1")
 	}
 }
 

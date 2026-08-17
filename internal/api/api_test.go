@@ -91,7 +91,7 @@ func newTestStore(t *testing.T) storage.Store {
 	if err != nil {
 		t.Fatalf("connect for truncate: %v", err)
 	}
-	if _, err := pool.Exec(ctx, "TRUNCATE TABLE node_health, peer_edges, nodes CASCADE"); err != nil {
+	if _, err := pool.Exec(ctx, "TRUNCATE TABLE node_health, peer_edge_observations, nodes CASCADE"); err != nil {
 		pool.Close()
 		t.Fatalf("truncate test tables: %v", err)
 	}
@@ -358,8 +358,8 @@ func TestTopology(t *testing.T) {
 	if err != nil {
 		t.Fatalf("upsert b: %v", err)
 	}
-	if err := store.UpsertPeerEdge(ctx, a.ID, b.ID); err != nil {
-		t.Fatalf("upsert edge: %v", err)
+	if err := store.RecordPeerEdgeObservation(ctx, a.ID, b.ID); err != nil {
+		t.Fatalf("record edge observation: %v", err)
 	}
 
 	resp, err := http.Get(srv.URL + "/topology")
