@@ -91,7 +91,7 @@ func newTestStore(t *testing.T) storage.Store {
 	if err != nil {
 		t.Fatalf("connect for truncate: %v", err)
 	}
-	if _, err := pool.Exec(ctx, "TRUNCATE TABLE node_health, peer_edge_observations, nodes CASCADE"); err != nil {
+	if _, err := pool.Exec(ctx, "TRUNCATE TABLE node_health, peer_edge_observations, node_addresses, nodes CASCADE"); err != nil {
 		pool.Close()
 		t.Fatalf("truncate test tables: %v", err)
 	}
@@ -108,7 +108,7 @@ type fakeClient struct {
 	info map[string]collector.NodeInfo
 }
 
-func (f *fakeClient) GetPeers(ctx context.Context, addr string) ([]string, error) {
+func (f *fakeClient) GetPeers(ctx context.Context, addr string) ([]collector.DiscoveredPeer, error) {
 	return nil, nil
 }
 
@@ -237,10 +237,10 @@ func TestListNodesFilter(t *testing.T) {
 	srv, store := newTestServer(t, nil)
 	ctx := context.Background()
 
-	if _, err := store.UpsertNode(ctx, storage.NodeInput{Address: "a:1", DiscoverySource: storage.DiscoverySourceP2P}); err != nil {
+	if _, err := store.UpsertDiscoveredNode(ctx, "a:1", storage.DiscoverySourceP2P, nil, nil); err != nil {
 		t.Fatalf("upsert a: %v", err)
 	}
-	if _, err := store.UpsertNode(ctx, storage.NodeInput{Address: "b:2", DiscoverySource: storage.DiscoverySourceRegistry}); err != nil {
+	if _, err := store.UpsertDiscoveredNode(ctx, "b:2", storage.DiscoverySourceRegistry, nil, nil); err != nil {
 		t.Fatalf("upsert b: %v", err)
 	}
 
@@ -275,7 +275,7 @@ func TestGetNode(t *testing.T) {
 	srv, store := newTestServer(t, nil)
 	ctx := context.Background()
 
-	node, err := store.UpsertNode(ctx, storage.NodeInput{Address: "a:1", DiscoverySource: storage.DiscoverySourceP2P})
+	node, err := store.UpsertDiscoveredNode(ctx, "a:1", storage.DiscoverySourceP2P, nil, nil)
 	if err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
@@ -314,7 +314,7 @@ func TestGetNodeHistory(t *testing.T) {
 	srv, store := newTestServer(t, nil)
 	ctx := context.Background()
 
-	node, err := store.UpsertNode(ctx, storage.NodeInput{Address: "a:1", DiscoverySource: storage.DiscoverySourceP2P})
+	node, err := store.UpsertDiscoveredNode(ctx, "a:1", storage.DiscoverySourceP2P, nil, nil)
 	if err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
@@ -350,11 +350,11 @@ func TestTopology(t *testing.T) {
 	srv, store := newTestServer(t, nil)
 	ctx := context.Background()
 
-	a, err := store.UpsertNode(ctx, storage.NodeInput{Address: "a:1", DiscoverySource: storage.DiscoverySourceP2P})
+	a, err := store.UpsertDiscoveredNode(ctx, "a:1", storage.DiscoverySourceP2P, nil, nil)
 	if err != nil {
 		t.Fatalf("upsert a: %v", err)
 	}
-	b, err := store.UpsertNode(ctx, storage.NodeInput{Address: "b:2", DiscoverySource: storage.DiscoverySourceP2P})
+	b, err := store.UpsertDiscoveredNode(ctx, "b:2", storage.DiscoverySourceP2P, nil, nil)
 	if err != nil {
 		t.Fatalf("upsert b: %v", err)
 	}

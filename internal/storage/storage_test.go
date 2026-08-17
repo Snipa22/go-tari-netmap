@@ -1,7 +1,9 @@
 package storage
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"os"
 	"testing"
 	"time"
@@ -79,7 +81,7 @@ func newTestStore(t *testing.T) Store {
 	}
 
 	ps := store.(*pgStore)
-	if _, err := ps.pool.Exec(ctx, "TRUNCATE TABLE node_health, peer_edge_observations, nodes CASCADE"); err != nil {
+	if _, err := ps.pool.Exec(ctx, "TRUNCATE TABLE node_health, peer_edge_observations, node_addresses, nodes CASCADE"); err != nil {
 		t.Fatalf("truncate test tables: %v", err)
 	}
 
@@ -90,19 +92,19 @@ func newTestStore(t *testing.T) Store {
 	return store
 }
 
-func TestUpsertNode(t *testing.T) {
+func TestUpsertDiscoveredNode(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	n, err := store.UpsertNode(ctx, NodeInput{
-		Address:         "127.0.0.1:18142",
-		DiscoverySource: DiscoverySourceP2P,
-	})
+	n, err := store.UpsertDiscoveredNode(ctx, "127.0.0.1:18142", DiscoverySourceP2P, nil, nil)
 	if err != nil {
 		t.Fatalf("upsert node: %v", err)
 	}
 	if n.Address != "127.0.0.1:18142" {
 		t.Errorf("address = %q, want %q", n.Address, "127.0.0.1:18142")
+	}
+	if n.PublicKey != nil {
+		t.Errorf("expected PublicKey to be nil for a discovered (placeholder) node, got %x", n.PublicKey)
 	}
 	if n.DiscoverySource != DiscoverySourceP2P {
 		t.Errorf("discovery_source = %q, want %q", n.DiscoverySource, DiscoverySourceP2P)
@@ -117,11 +119,7 @@ func TestUpsertNode(t *testing.T) {
 	// discovery_source should merge to "both", first_seen should be
 	// preserved, last_seen should be bumped, and the tag should stick.
 	time.Sleep(10 * time.Millisecond)
-	n2, err := store.UpsertNode(ctx, NodeInput{
-		Address:         "127.0.0.1:18142",
-		DiscoverySource: DiscoverySourceRegistry,
-		Tags:            map[string]any{"pool_owned": true},
-	})
+	n2, err := store.UpsertDiscoveredNode(ctx, "127.0.0.1:18142", DiscoverySourceRegistry, map[string]any{"pool_owned": true}, nil)
 	if err != nil {
 		t.Fatalf("upsert node again: %v", err)
 	}
@@ -140,16 +138,24 @@ func TestUpsertNode(t *testing.T) {
 	if poolOwned, _ := n2.Tags["pool_owned"].(bool); !poolOwned {
 		t.Errorf("expected pool_owned tag to be set, got %v", n2.Tags)
 	}
+
+	addrs, err := store.ListNodeAddresses(ctx, n.ID)
+	if err != nil {
+		t.Fatalf("list node addresses: %v", err)
+	}
+	if len(addrs) != 1 || addrs[0].Address != "127.0.0.1:18142" {
+		t.Fatalf("addrs = %+v, want just 127.0.0.1:18142", addrs)
+	}
 }
 
 func TestListNodesFilter(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	if _, err := store.UpsertNode(ctx, NodeInput{Address: "a:1", DiscoverySource: DiscoverySourceP2P}); err != nil {
+	if _, err := store.UpsertDiscoveredNode(ctx, "a:1", DiscoverySourceP2P, nil, nil); err != nil {
 		t.Fatalf("upsert a: %v", err)
 	}
-	if _, err := store.UpsertNode(ctx, NodeInput{Address: "b:2", DiscoverySource: DiscoverySourceRegistry}); err != nil {
+	if _, err := store.UpsertDiscoveredNode(ctx, "b:2", DiscoverySourceRegistry, nil, nil); err != nil {
 		t.Fatalf("upsert b: %v", err)
 	}
 
@@ -184,7 +190,7 @@ func TestRecordHealthCheckAndHistory(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	n, err := store.UpsertNode(ctx, NodeInput{Address: "node:1", DiscoverySource: DiscoverySourceP2P})
+	n, err := store.UpsertDiscoveredNode(ctx, "node:1", DiscoverySourceP2P, nil, nil)
 	if err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
@@ -232,7 +238,7 @@ func TestRecordHealthCheckProbeSourceRoundTrip(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	n, err := store.UpsertNode(ctx, NodeInput{Address: "node:1", DiscoverySource: DiscoverySourceP2P})
+	n, err := store.UpsertDiscoveredNode(ctx, "node:1", DiscoverySourceP2P, nil, nil)
 	if err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
@@ -273,7 +279,7 @@ func TestRecordHealthCheckRequiresProbeSource(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	n, err := store.UpsertNode(ctx, NodeInput{Address: "node:1", DiscoverySource: DiscoverySourceP2P})
+	n, err := store.UpsertDiscoveredNode(ctx, "node:1", DiscoverySourceP2P, nil, nil)
 	if err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
@@ -288,11 +294,11 @@ func TestPeerEdgesAndTopology(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	a, err := store.UpsertNode(ctx, NodeInput{Address: "a:1", DiscoverySource: DiscoverySourceP2P})
+	a, err := store.UpsertDiscoveredNode(ctx, "a:1", DiscoverySourceP2P, nil, nil)
 	if err != nil {
 		t.Fatalf("upsert a: %v", err)
 	}
-	b, err := store.UpsertNode(ctx, NodeInput{Address: "b:2", DiscoverySource: DiscoverySourceP2P})
+	b, err := store.UpsertDiscoveredNode(ctx, "b:2", DiscoverySourceP2P, nil, nil)
 	if err != nil {
 		t.Fatalf("upsert b: %v", err)
 	}
@@ -334,11 +340,11 @@ func TestPeerEdgeObservationsAccumulateOverTime(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	a, err := store.UpsertNode(ctx, NodeInput{Address: "a:1", DiscoverySource: DiscoverySourceP2P})
+	a, err := store.UpsertDiscoveredNode(ctx, "a:1", DiscoverySourceP2P, nil, nil)
 	if err != nil {
 		t.Fatalf("upsert a: %v", err)
 	}
-	b, err := store.UpsertNode(ctx, NodeInput{Address: "b:2", DiscoverySource: DiscoverySourceP2P})
+	b, err := store.UpsertDiscoveredNode(ctx, "b:2", DiscoverySourceP2P, nil, nil)
 	if err != nil {
 		t.Fatalf("upsert b: %v", err)
 	}
@@ -389,19 +395,19 @@ func TestTopPeeredNodes(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	hub, err := store.UpsertNode(ctx, NodeInput{Address: "hub:1", DiscoverySource: DiscoverySourceP2P})
+	hub, err := store.UpsertDiscoveredNode(ctx, "hub:1", DiscoverySourceP2P, nil, nil)
 	if err != nil {
 		t.Fatalf("upsert hub: %v", err)
 	}
-	leaf1, err := store.UpsertNode(ctx, NodeInput{Address: "leaf1:1", DiscoverySource: DiscoverySourceP2P})
+	leaf1, err := store.UpsertDiscoveredNode(ctx, "leaf1:1", DiscoverySourceP2P, nil, nil)
 	if err != nil {
 		t.Fatalf("upsert leaf1: %v", err)
 	}
-	leaf2, err := store.UpsertNode(ctx, NodeInput{Address: "leaf2:1", DiscoverySource: DiscoverySourceP2P})
+	leaf2, err := store.UpsertDiscoveredNode(ctx, "leaf2:1", DiscoverySourceP2P, nil, nil)
 	if err != nil {
 		t.Fatalf("upsert leaf2: %v", err)
 	}
-	leaf3, err := store.UpsertNode(ctx, NodeInput{Address: "leaf3:1", DiscoverySource: DiscoverySourceP2P})
+	leaf3, err := store.UpsertDiscoveredNode(ctx, "leaf3:1", DiscoverySourceP2P, nil, nil)
 	if err != nil {
 		t.Fatalf("upsert leaf3: %v", err)
 	}
@@ -481,5 +487,266 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	// again must be a no-op, not an error.
 	if err := store.Migrate(ctx); err != nil {
 		t.Fatalf("second migrate call: %v", err)
+	}
+}
+
+// TestMigrationBackfillsNodeAddresses proves
+// 0006_pubkey_identity.sql's backfill INSERT actually populates
+// node_addresses from existing nodes rows, and that it is safe/idempotent
+// to re-run (as its own doc comment claims): it simulates a node row that
+// predates node_addresses tracking (by deleting its node_addresses row
+// after creating it directly), re-runs the migration's backfill statement
+// verbatim, and asserts the row comes back.
+func TestMigrationBackfillsNodeAddresses(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	ps := store.(*pgStore)
+
+	var nodeID uuid.UUID
+	if err := ps.pool.QueryRow(ctx, `
+		INSERT INTO nodes (address, discovery_source, tags, first_seen, last_seen)
+		VALUES ('legacy:1', 'p2p_discovered', '{}'::jsonb, now(), now())
+		RETURNING id
+	`).Scan(&nodeID); err != nil {
+		t.Fatalf("insert legacy node: %v", err)
+	}
+	if _, err := ps.pool.Exec(ctx, `DELETE FROM node_addresses WHERE node_id = $1`, nodeID); err != nil {
+		t.Fatalf("delete node_addresses: %v", err)
+	}
+
+	// Re-run 0006's backfill statement directly, simulating a re-run of
+	// the (idempotent) migration itself.
+	if _, err := ps.pool.Exec(ctx, `
+		INSERT INTO node_addresses (node_id, address, first_seen, last_seen)
+			SELECT id, address, first_seen, last_seen FROM nodes
+			ON CONFLICT (node_id, address) DO NOTHING
+	`); err != nil {
+		t.Fatalf("backfill: %v", err)
+	}
+
+	addrs, err := store.ListNodeAddresses(ctx, nodeID)
+	if err != nil {
+		t.Fatalf("list node addresses: %v", err)
+	}
+	if len(addrs) != 1 || addrs[0].Address != "legacy:1" {
+		t.Fatalf("addrs = %+v, want just legacy:1", addrs)
+	}
+}
+
+// TestNodesPublicKeyPartialUniqueIndexAllowsMultipleNulls proves the
+// partial unique index on nodes.public_key (WHERE public_key IS NOT NULL)
+// does not reject multiple placeholder rows, each with public_key NULL.
+func TestNodesPublicKeyPartialUniqueIndexAllowsMultipleNulls(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	if _, err := store.UpsertDiscoveredNode(ctx, "a:1", DiscoverySourceP2P, nil, nil); err != nil {
+		t.Fatalf("upsert a: %v", err)
+	}
+	if _, err := store.UpsertDiscoveredNode(ctx, "b:2", DiscoverySourceP2P, nil, nil); err != nil {
+		t.Fatalf("upsert b: %v", err)
+	}
+
+	nodes, err := store.ListNodes(ctx, NodeFilter{})
+	if err != nil {
+		t.Fatalf("list nodes: %v", err)
+	}
+	if len(nodes) != 2 {
+		t.Fatalf("len(nodes) = %d, want 2", len(nodes))
+	}
+	for _, n := range nodes {
+		if n.PublicKey != nil {
+			t.Errorf("node %s public_key = %x, want nil", n.Address, n.PublicKey)
+		}
+	}
+}
+
+// TestNodesPublicKeyUniqueIndexRejectsDuplicate proves the partial unique
+// index on nodes.public_key DOES reject a second row with the same
+// non-null public_key.
+func TestNodesPublicKeyUniqueIndexRejectsDuplicate(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	ps := store.(*pgStore)
+
+	pubkey := []byte("dup-pubkey")
+	if _, err := ps.pool.Exec(ctx, `
+		INSERT INTO nodes (address, public_key, discovery_source, tags, first_seen, last_seen)
+		VALUES ('a:1', $1, 'p2p_discovered', '{}'::jsonb, now(), now())
+	`, pubkey); err != nil {
+		t.Fatalf("insert first node: %v", err)
+	}
+
+	_, err := ps.pool.Exec(ctx, `
+		INSERT INTO nodes (address, public_key, discovery_source, tags, first_seen, last_seen)
+		VALUES ('b:2', $1, 'p2p_discovered', '{}'::jsonb, now(), now())
+	`, pubkey)
+	if err == nil {
+		t.Fatal("expected a unique-violation error inserting a second node with the same public_key, got nil")
+	}
+}
+
+// TestUpsertConfirmedNodePromotesPlaceholder is case (c) of
+// UpsertConfirmedNode: an existing placeholder row (public_key NULL) at
+// the given address gets promoted in place, preserving its id.
+func TestUpsertConfirmedNodePromotesPlaceholder(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	placeholder, err := store.UpsertDiscoveredNode(ctx, "node:1", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert discovered: %v", err)
+	}
+	if placeholder.PublicKey != nil {
+		t.Fatalf("expected placeholder.PublicKey = nil, got %x", placeholder.PublicKey)
+	}
+
+	pubkey := []byte("confirmed-pubkey-1")
+	confirmed, err := store.UpsertConfirmedNode(ctx, "node:1", pubkey, DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("upsert confirmed: %v", err)
+	}
+
+	if confirmed.ID != placeholder.ID {
+		t.Errorf("confirmed.ID = %v, want placeholder.ID = %v (promote in place)", confirmed.ID, placeholder.ID)
+	}
+	if !bytes.Equal(confirmed.PublicKey, pubkey) {
+		t.Errorf("confirmed.PublicKey = %x, want %x", confirmed.PublicKey, pubkey)
+	}
+}
+
+// TestUpsertConfirmedNodeAddsAddressToKnownPubkey is case (b) of
+// UpsertConfirmedNode: a second, brand-new address confirmed under a
+// pubkey that already has a confirmed node attaches to that same node
+// (same id) rather than creating a new one.
+func TestUpsertConfirmedNodeAddsAddressToKnownPubkey(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	pubkey := []byte("confirmed-pubkey-2")
+	n1, err := store.UpsertConfirmedNode(ctx, "addrA:1", pubkey, DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("upsert confirmed A: %v", err)
+	}
+
+	n2, err := store.UpsertConfirmedNode(ctx, "addrB:1", pubkey, DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("upsert confirmed B: %v", err)
+	}
+
+	if n2.ID != n1.ID {
+		t.Fatalf("n2.ID = %v, want same as n1.ID = %v (same pubkey => same node)", n2.ID, n1.ID)
+	}
+
+	addrs, err := store.ListNodeAddresses(ctx, n1.ID)
+	if err != nil {
+		t.Fatalf("list node addresses: %v", err)
+	}
+	if len(addrs) != 2 {
+		t.Fatalf("len(addrs) = %d, want 2 (addrA:1 and addrB:1)", len(addrs))
+	}
+}
+
+// TestUpsertConfirmedNodeMergesPlaceholderIntoConfirmedNode is case (d) of
+// UpsertConfirmedNode, and the most important new test in this task: two
+// independent placeholders (A, B), each already carrying its own
+// health-check and peer-edge history, turn out — once directly, separately
+// probed — to be the SAME real node (pubkeyX). Promoting A first, then
+// confirming B at the same pubkeyX, must MERGE B into A: A's id survives,
+// B's history is repointed onto A's id, B's address becomes one of A's
+// addresses, and B's own nodes row is gone.
+func TestUpsertConfirmedNodeMergesPlaceholderIntoConfirmedNode(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	a, err := store.UpsertDiscoveredNode(ctx, "addrA:1", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert discovered A: %v", err)
+	}
+	b, err := store.UpsertDiscoveredNode(ctx, "addrB:1", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert discovered B: %v", err)
+	}
+	other, err := store.UpsertDiscoveredNode(ctx, "other:1", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert discovered other: %v", err)
+	}
+
+	if err := store.RecordHealthCheck(ctx, HealthCheckInput{NodeID: a.ID, Reachable: true, ProbeSource: ProbeSourceP2P}); err != nil {
+		t.Fatalf("record health check A: %v", err)
+	}
+	if err := store.RecordPeerEdgeObservation(ctx, a.ID, other.ID); err != nil {
+		t.Fatalf("record edge A->other: %v", err)
+	}
+
+	if err := store.RecordHealthCheck(ctx, HealthCheckInput{NodeID: b.ID, Reachable: true, ProbeSource: ProbeSourceP2P}); err != nil {
+		t.Fatalf("record health check B: %v", err)
+	}
+	if err := store.RecordPeerEdgeObservation(ctx, b.ID, other.ID); err != nil {
+		t.Fatalf("record edge B->other: %v", err)
+	}
+
+	pubkeyX := []byte("shared-pubkey-x")
+
+	// Promote A to a confirmed node with pubkeyX.
+	confirmedA, err := store.UpsertConfirmedNode(ctx, "addrA:1", pubkeyX, DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("upsert confirmed A: %v", err)
+	}
+	if confirmedA.ID != a.ID {
+		t.Fatalf("confirmedA.ID = %v, want a.ID = %v (promote in place)", confirmedA.ID, a.ID)
+	}
+
+	// Confirm B is reachable at addrB:1 with the SAME pubkeyX: B (still a
+	// placeholder) must be merged into A (already confirmed with
+	// pubkeyX). The surviving node's id is documented to be the
+	// already-confirmed node's id (A's), not B's.
+	merged, err := store.UpsertConfirmedNode(ctx, "addrB:1", pubkeyX, DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("upsert confirmed B (merge): %v", err)
+	}
+	if merged.ID != a.ID {
+		t.Fatalf("merged.ID = %v, want a.ID = %v (A survives the merge)", merged.ID, a.ID)
+	}
+
+	// B's own nodes row must be gone.
+	if _, err := store.GetNode(ctx, b.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetNode(b.ID) err = %v, want ErrNotFound (placeholder should have been deleted)", err)
+	}
+
+	// B's health check must now reference the surviving node's ID.
+	history, err := store.GetNodeHistory(ctx, a.ID, 10)
+	if err != nil {
+		t.Fatalf("get history: %v", err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("len(history) = %d, want 2 (A's + B's health checks, both now under a.ID)", len(history))
+	}
+
+	// B's node_addresses row must now point at the surviving node.
+	addrs, err := store.ListNodeAddresses(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("list node addresses: %v", err)
+	}
+	addrSet := map[string]bool{}
+	for _, addr := range addrs {
+		addrSet[addr.Address] = true
+	}
+	if !addrSet["addrA:1"] || !addrSet["addrB:1"] {
+		t.Fatalf("addrs = %+v, want both addrA:1 and addrB:1 under the surviving node", addrs)
+	}
+
+	// Both peer edges (A->other, and B->other repointed to A->other) must
+	// now reference a.ID directly in peer_edge_observations -- queried
+	// directly, not just inferred from ListTopology's rollup view.
+	ps := store.(*pgStore)
+	var fromCount int
+	if err := ps.pool.QueryRow(ctx, `
+		SELECT count(*) FROM peer_edge_observations WHERE from_node_id = $1 AND to_node_id = $2
+	`, a.ID, other.ID).Scan(&fromCount); err != nil {
+		t.Fatalf("query peer_edge_observations: %v", err)
+	}
+	if fromCount != 2 {
+		t.Fatalf("peer_edge_observations from=a.ID to=other.ID count = %d, want 2 (A's original edge + B's repointed edge)", fromCount)
 	}
 }
