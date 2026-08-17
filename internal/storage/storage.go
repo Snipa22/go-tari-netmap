@@ -7,7 +7,9 @@ package storage
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"os"
 	"time"
 
@@ -42,12 +44,36 @@ type Store interface {
 	// use of the Store.
 	Migrate(ctx context.Context) error
 
-	// UpsertNode inserts a new node or updates an existing one (matched by
-	// address). first_seen is set once on insert; last_seen is bumped on
-	// every call. If the node already exists with a different
-	// discovery_source than the one supplied, the stored source is merged
-	// to DiscoverySourceBoth.
-	UpsertNode(ctx context.Context, in NodeInput) (Node, error)
+	// UpsertDiscoveredNode records a node discovered by address alone (no
+	// confirmed pubkey yet — e.g. a peer-walk GetPeers hop, or a registry
+	// submission that hasn't been probed yet). If this address has never
+	// been seen before, it creates a placeholder row (public_key NULL).
+	// If it has, it bumps last_seen (and merges discovery_source into
+	// DiscoverySourceBoth if it differs from the stored value, mirroring
+	// the old UpsertNode's merge semantics) on the existing row for that
+	// address — whether that row is still a placeholder or has since
+	// been confirmed with a real pubkey. Either way, a node_addresses row
+	// for address is also upserted (inserted, or its last_seen bumped).
+	// tags are merged into any existing tags (like the old UpsertNode);
+	// label, if non-nil, overwrites the stored label.
+	UpsertDiscoveredNode(ctx context.Context, address string, discoverySource DiscoverySource, tags map[string]any, label *string) (Node, error)
+
+	// UpsertConfirmedNode records a node we've successfully, directly
+	// probed and confirmed the real pubkey of, reached at address. See
+	// this method's doc comment on pgStore for the full case breakdown
+	// (new node, known-pubkey/new-address, placeholder promotion, and the
+	// placeholder-merge-into-already-confirmed-node case) — the short
+	// version is: the same real node can be discovered at multiple
+	// addresses and via multiple placeholder rows over time, and this
+	// method is responsible for converging those onto a single node row
+	// once its pubkey is confirmed, without losing any of the
+	// health-check/peer-edge history already recorded against the
+	// placeholder id(s) being retired.
+	UpsertConfirmedNode(ctx context.Context, address string, publicKey []byte, discoverySource DiscoverySource) (Node, error)
+
+	// ListNodeAddresses returns every address a node has ever been seen
+	// at, oldest first.
+	ListNodeAddresses(ctx context.Context, nodeID uuid.UUID) ([]NodeAddress, error)
 
 	// ListNodes returns nodes matching filter. A zero-value filter returns
 	// all nodes.
@@ -126,15 +152,142 @@ func (s *pgStore) Migrate(ctx context.Context) error {
 	return migrate(ctx, s.pool)
 }
 
-func (s *pgStore) UpsertNode(ctx context.Context, in NodeInput) (Node, error) {
-	if in.Address == "" {
+// nodeColumns is the column list, in order, matching scanNode's Scan calls.
+const nodeColumns = "id, address, public_key, discovery_source, tags, label, first_seen, last_seen"
+
+// rowQuerier is the subset of *pgxpool.Pool's and pgx.Tx's method sets that
+// getNodeByID needs, letting it run against either a plain pool query or a
+// query scoped inside an in-flight transaction.
+type rowQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// scanNode scans one nodeColumns-shaped row into a Node.
+func scanNode(row pgx.Row) (Node, error) {
+	var n Node
+	var tagsOut []byte
+	if err := row.Scan(&n.ID, &n.Address, &n.PublicKey, &n.DiscoverySource, &tagsOut, &n.Label, &n.FirstSeen, &n.LastSeen); err != nil {
+		return Node{}, err
+	}
+	if err := json.Unmarshal(tagsOut, &n.Tags); err != nil {
+		return Node{}, fmt.Errorf("storage: unmarshal tags: %w", err)
+	}
+	return n, nil
+}
+
+// getNodeByID fetches a single node by id via q (a pool or an in-flight
+// transaction), returning ErrNotFound if no such node exists.
+func getNodeByID(ctx context.Context, q rowQuerier, id uuid.UUID) (Node, error) {
+	row := q.QueryRow(ctx, "SELECT "+nodeColumns+" FROM nodes WHERE id = $1", id)
+	n, err := scanNode(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Node{}, ErrNotFound
+		}
+		return Node{}, fmt.Errorf("storage: get node: %w", err)
+	}
+	return n, nil
+}
+
+// ensureNodeAddress upserts a node_addresses row for (nodeID, address),
+// bumping last_seen if the row already exists.
+func ensureNodeAddress(ctx context.Context, tx pgx.Tx, nodeID uuid.UUID, address string) error {
+	_, err := tx.Exec(ctx, `
+		INSERT INTO node_addresses (node_id, address, first_seen, last_seen)
+		VALUES ($1, $2, now(), now())
+		ON CONFLICT (node_id, address) DO UPDATE SET last_seen = now()
+	`, nodeID, address)
+	if err != nil {
+		return fmt.Errorf("storage: upsert node_addresses: %w", err)
+	}
+	return nil
+}
+
+// bumpNodeSeen bumps a node's last_seen and merges discoverySource into
+// its stored discovery_source (to DiscoverySourceBoth if they differ),
+// mirroring the old UpsertNode's merge semantics.
+func bumpNodeSeen(ctx context.Context, tx pgx.Tx, nodeID uuid.UUID, discoverySource DiscoverySource) error {
+	_, err := tx.Exec(ctx, `
+		UPDATE nodes SET
+			discovery_source = CASE WHEN discovery_source = $1 THEN discovery_source ELSE 'both' END,
+			last_seen = now()
+		WHERE id = $2
+	`, string(discoverySource), nodeID)
+	if err != nil {
+		return fmt.Errorf("storage: bump node last_seen: %w", err)
+	}
+	return nil
+}
+
+// insertConfirmedNode inserts a brand-new node row with a confirmed
+// public_key set from the start, plus its node_addresses row, and returns
+// the new node's id. Used by UpsertConfirmedNode's case (a) (brand new
+// pubkey + brand new address) and its mirror image under the
+// address-claimed-by-a-different-node inconsistency handling.
+func insertConfirmedNode(ctx context.Context, tx pgx.Tx, address string, publicKey []byte, discoverySource DiscoverySource) (uuid.UUID, error) {
+	var id uuid.UUID
+	err := tx.QueryRow(ctx, `
+		INSERT INTO nodes (address, public_key, discovery_source, tags, label, first_seen, last_seen)
+		VALUES ($1, $2, $3, '{}'::jsonb, NULL, now(), now())
+		RETURNING id
+	`, address, publicKey, string(discoverySource)).Scan(&id)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("storage: insert confirmed node: %w", err)
+	}
+	if err := ensureNodeAddress(ctx, tx, id, address); err != nil {
+		return uuid.Nil, err
+	}
+	return id, nil
+}
+
+// mergeNodeInto retires placeholderID into confirmedID: every
+// node_addresses/peer_edge_observations/node_health row referencing
+// placeholderID is repointed at confirmedID (deleting any node_addresses
+// row that would otherwise collide with confirmedID's own
+// UNIQUE(node_id, address) constraint), placeholderID's nodes row is
+// deleted, and confirmedID's last_seen is bumped. Called from within an
+// existing transaction (tx) — the caller is responsible for
+// Commit/Rollback.
+func mergeNodeInto(ctx context.Context, tx pgx.Tx, placeholderID, confirmedID uuid.UUID) error {
+	// Drop any of the placeholder's node_addresses rows that would
+	// collide with an address confirmedID already has, before
+	// repointing the rest — UPDATE ... SET node_id = confirmedID would
+	// otherwise violate UNIQUE(node_id, address) for those rows.
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM node_addresses na
+		WHERE na.node_id = $1
+		  AND EXISTS (SELECT 1 FROM node_addresses na2 WHERE na2.node_id = $2 AND na2.address = na.address)
+	`, placeholderID, confirmedID); err != nil {
+		return fmt.Errorf("storage: merge: dedupe node_addresses: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE node_addresses SET node_id = $2 WHERE node_id = $1`, placeholderID, confirmedID); err != nil {
+		return fmt.Errorf("storage: merge: repoint node_addresses: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE peer_edge_observations SET from_node_id = $2 WHERE from_node_id = $1`, placeholderID, confirmedID); err != nil {
+		return fmt.Errorf("storage: merge: repoint peer_edge_observations.from_node_id: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE peer_edge_observations SET to_node_id = $2 WHERE to_node_id = $1`, placeholderID, confirmedID); err != nil {
+		return fmt.Errorf("storage: merge: repoint peer_edge_observations.to_node_id: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE node_health SET node_id = $2 WHERE node_id = $1`, placeholderID, confirmedID); err != nil {
+		return fmt.Errorf("storage: merge: repoint node_health: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM nodes WHERE id = $1`, placeholderID); err != nil {
+		return fmt.Errorf("storage: merge: delete placeholder node: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE nodes SET last_seen = now() WHERE id = $1`, confirmedID); err != nil {
+		return fmt.Errorf("storage: merge: bump confirmed last_seen: %w", err)
+	}
+	return nil
+}
+
+func (s *pgStore) UpsertDiscoveredNode(ctx context.Context, address string, discoverySource DiscoverySource, tags map[string]any, label *string) (Node, error) {
+	if address == "" {
 		return Node{}, fmt.Errorf("storage: address is required")
 	}
-	if in.DiscoverySource == "" {
+	if discoverySource == "" {
 		return Node{}, fmt.Errorf("storage: discovery_source is required")
 	}
-
-	tags := in.Tags
 	if tags == nil {
 		tags = map[string]any{}
 	}
@@ -143,29 +296,272 @@ func (s *pgStore) UpsertNode(ctx context.Context, in NodeInput) (Node, error) {
 		return Node{}, fmt.Errorf("storage: marshal tags: %w", err)
 	}
 
-	var n Node
-	var tagsOut []byte
-	err = s.pool.QueryRow(ctx, `
-		INSERT INTO nodes (address, discovery_source, tags, label, first_seen, last_seen)
-		VALUES ($1, $2, $3, $4, now(), now())
-		ON CONFLICT (address) DO UPDATE SET
-			discovery_source = CASE
-				WHEN nodes.discovery_source = EXCLUDED.discovery_source THEN nodes.discovery_source
-				ELSE 'both'
-			END,
-			tags = nodes.tags || EXCLUDED.tags,
-			label = COALESCE(EXCLUDED.label, nodes.label),
-			last_seen = now()
-		RETURNING id, address, discovery_source, tags, label, first_seen, last_seen
-	`, in.Address, string(in.DiscoverySource), tagsJSON, in.Label,
-	).Scan(&n.ID, &n.Address, &n.DiscoverySource, &tagsOut, &n.Label, &n.FirstSeen, &n.LastSeen)
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return Node{}, fmt.Errorf("storage: upsert node: %w", err)
+		return Node{}, fmt.Errorf("storage: begin tx: %w", err)
 	}
-	if err := json.Unmarshal(tagsOut, &n.Tags); err != nil {
-		return Node{}, fmt.Errorf("storage: unmarshal tags: %w", err)
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
+
+	var nodeID uuid.UUID
+	found := true
+	if err := tx.QueryRow(ctx, `SELECT node_id FROM node_addresses WHERE address = $1`, address).Scan(&nodeID); err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return Node{}, fmt.Errorf("storage: lookup node by address: %w", err)
+		}
+		// Fall back to nodes.address for addresses that predate
+		// node_addresses being consistently maintained (e.g. rows only
+		// touched by 0006_pubkey_identity.sql's one-time backfill).
+		if err := tx.QueryRow(ctx, `SELECT id FROM nodes WHERE address = $1 LIMIT 1`, address).Scan(&nodeID); err != nil {
+			if !errors.Is(err, pgx.ErrNoRows) {
+				return Node{}, fmt.Errorf("storage: lookup node by address: %w", err)
+			}
+			found = false
+		}
+	}
+
+	if !found {
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO nodes (address, discovery_source, tags, label, first_seen, last_seen)
+			VALUES ($1, $2, $3, $4, now(), now())
+			RETURNING id
+		`, address, string(discoverySource), tagsJSON, label).Scan(&nodeID); err != nil {
+			return Node{}, fmt.Errorf("storage: insert discovered node: %w", err)
+		}
+	} else {
+		if _, err := tx.Exec(ctx, `
+			UPDATE nodes SET
+				discovery_source = CASE WHEN discovery_source = $1 THEN discovery_source ELSE 'both' END,
+				tags = tags || $2,
+				label = COALESCE($3, label),
+				last_seen = now()
+			WHERE id = $4
+		`, string(discoverySource), tagsJSON, label, nodeID); err != nil {
+			return Node{}, fmt.Errorf("storage: update discovered node: %w", err)
+		}
+	}
+
+	if err := ensureNodeAddress(ctx, tx, nodeID, address); err != nil {
+		return Node{}, err
+	}
+
+	n, err := getNodeByID(ctx, tx, nodeID)
+	if err != nil {
+		return Node{}, fmt.Errorf("storage: get upserted node: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return Node{}, fmt.Errorf("storage: commit: %w", err)
 	}
 	return n, nil
+}
+
+// UpsertConfirmedNode records a node we've successfully, directly probed
+// and confirmed the real pubkey of, reached at address. Four cases,
+// determined by whether a row already exists with public_key = publicKey
+// ("foundByPubkey") and/or whether address is already associated with some
+// node ("foundByAddr", via node_addresses or, as a fallback, nodes.address
+// directly):
+//
+//   - (a) !foundByPubkey && !foundByAddr: brand new pubkey and brand new
+//     address — create a new confirmed node row plus its node_addresses
+//     row.
+//   - (b) foundByPubkey && (!foundByAddr || same node both ways): known
+//     pubkey; address is either new to it or already tied to it — ensure
+//     the node_addresses row exists and bump last_seen. The node's id
+//     never changes.
+//   - (c) !foundByPubkey && foundByAddr, and address's node is a
+//     placeholder (public_key IS NULL): promote that row in place —
+//     UPDATE nodes SET public_key = ... WHERE id = placeholder.id — so
+//     the placeholder's id (and all history recorded against it) is
+//     preserved.
+//   - (d) foundByPubkey && foundByAddr && the two resolve to different
+//     node ids, and address's node is a placeholder: MERGE. The
+//     placeholder is retired into the already-confirmed node (see
+//     mergeNodeInto) — its node_addresses/peer_edge_observations/
+//     node_health rows are repointed at the confirmed node's id and the
+//     placeholder's nodes row is deleted. The surviving id is the
+//     already-confirmed node's id.
+//
+// Two further, non-nominal branches handle a real-network inconsistency
+// (the same address reported by two different already-confirmed pubkeys —
+// e.g. two nodes behind the same NAT/relay at different times) without
+// corrupting either existing node: the new pubkey/address pairing is
+// attached to (or creates) the node for publicKey, and the other node is
+// left untouched. See the case analysis inline below for exactly which
+// branch that falls into.
+//
+// The entire operation runs inside a single transaction so a failure
+// partway through the merge case cannot leave a half-repointed state.
+func (s *pgStore) UpsertConfirmedNode(ctx context.Context, address string, publicKey []byte, discoverySource DiscoverySource) (Node, error) {
+	if address == "" {
+		return Node{}, fmt.Errorf("storage: address is required")
+	}
+	if len(publicKey) == 0 {
+		return Node{}, fmt.Errorf("storage: public_key is required")
+	}
+	if discoverySource == "" {
+		return Node{}, fmt.Errorf("storage: discovery_source is required")
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Node{}, fmt.Errorf("storage: begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
+
+	var byPubkeyID uuid.UUID
+	foundByPubkey := true
+	if err := tx.QueryRow(ctx, `SELECT id FROM nodes WHERE public_key = $1`, publicKey).Scan(&byPubkeyID); err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return Node{}, fmt.Errorf("storage: lookup node by pubkey: %w", err)
+		}
+		foundByPubkey = false
+	}
+
+	var addrNodeID uuid.UUID
+	var addrPubKey []byte
+	foundByAddr := true
+	if err := tx.QueryRow(ctx, `
+		SELECT n.id, n.public_key FROM node_addresses na
+		JOIN nodes n ON n.id = na.node_id
+		WHERE na.address = $1
+		LIMIT 1
+	`, address).Scan(&addrNodeID, &addrPubKey); err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return Node{}, fmt.Errorf("storage: lookup node by address: %w", err)
+		}
+		// Fall back to nodes.address, same reasoning as
+		// UpsertDiscoveredNode's fallback.
+		if err := tx.QueryRow(ctx, `SELECT id, public_key FROM nodes WHERE address = $1 LIMIT 1`, address).Scan(&addrNodeID, &addrPubKey); err != nil {
+			if !errors.Is(err, pgx.ErrNoRows) {
+				return Node{}, fmt.Errorf("storage: lookup node by address: %w", err)
+			}
+			foundByAddr = false
+		}
+	}
+
+	var nodeID uuid.UUID
+
+	switch {
+	case foundByPubkey && (!foundByAddr || addrNodeID == byPubkeyID):
+		// (b): known pubkey; address is new to it, or already tied to
+		// it. Node id never changes.
+		nodeID = byPubkeyID
+		if err := ensureNodeAddress(ctx, tx, nodeID, address); err != nil {
+			return Node{}, err
+		}
+		if err := bumpNodeSeen(ctx, tx, nodeID, discoverySource); err != nil {
+			return Node{}, err
+		}
+
+	case foundByPubkey && foundByAddr:
+		// addrNodeID != byPubkeyID here (the same-id case is handled
+		// above).
+		if addrPubKey == nil {
+			// (d): address's placeholder must be merged into the
+			// already-confirmed node.
+			if err := mergeNodeInto(ctx, tx, addrNodeID, byPubkeyID); err != nil {
+				return Node{}, err
+			}
+			nodeID = byPubkeyID
+		} else {
+			// addrPubKey is necessarily != publicKey: the partial
+			// unique index on nodes.public_key guarantees no two rows
+			// share a non-null pubkey, and we already know
+			// addrNodeID != byPubkeyID. This means address is claimed
+			// by two different already-confirmed nodes — a real-network
+			// inconsistency (e.g. a shared NAT/relay/onion address seen
+			// from two distinct nodes at different times), not a bug in
+			// this code. Attach it to the publicKey node instead of
+			// touching the other, already-confirmed node.
+			log.Printf("storage: address %s already belongs to a different confirmed node (pubkey %x); attaching it to pubkey %x instead", address, addrPubKey, publicKey)
+			nodeID = byPubkeyID
+			if err := ensureNodeAddress(ctx, tx, nodeID, address); err != nil {
+				return Node{}, err
+			}
+			if err := bumpNodeSeen(ctx, tx, nodeID, discoverySource); err != nil {
+				return Node{}, err
+			}
+		}
+
+	case foundByAddr:
+		// !foundByPubkey here.
+		if addrPubKey == nil {
+			// (c): promote the placeholder in place, preserving its id
+			// (and thus all history already recorded against it).
+			if _, err := tx.Exec(ctx, `
+				UPDATE nodes SET
+					public_key = $1,
+					discovery_source = CASE WHEN discovery_source = $2 THEN discovery_source ELSE 'both' END,
+					last_seen = now()
+				WHERE id = $3
+			`, publicKey, string(discoverySource), addrNodeID); err != nil {
+				return Node{}, fmt.Errorf("storage: promote placeholder node: %w", err)
+			}
+			nodeID = addrNodeID
+			if err := ensureNodeAddress(ctx, tx, nodeID, address); err != nil {
+				return Node{}, err
+			}
+		} else {
+			// addrPubKey is necessarily != publicKey (no row has
+			// publicKey, per !foundByPubkey). address already belongs to
+			// a different already-confirmed node — the same
+			// inconsistency as above, mirrored: since no node yet exists
+			// for publicKey, create a brand new one rather than
+			// corrupting the existing node at this address.
+			log.Printf("storage: address %s already belongs to a different confirmed node (pubkey %x); creating a separate node for pubkey %x", address, addrPubKey, publicKey)
+			newID, err := insertConfirmedNode(ctx, tx, address, publicKey, discoverySource)
+			if err != nil {
+				return Node{}, err
+			}
+			nodeID = newID
+		}
+
+	default:
+		// (a): !foundByPubkey && !foundByAddr — brand new pubkey and
+		// brand new address.
+		newID, err := insertConfirmedNode(ctx, tx, address, publicKey, discoverySource)
+		if err != nil {
+			return Node{}, err
+		}
+		nodeID = newID
+	}
+
+	n, err := getNodeByID(ctx, tx, nodeID)
+	if err != nil {
+		return Node{}, fmt.Errorf("storage: get upserted node: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return Node{}, fmt.Errorf("storage: commit: %w", err)
+	}
+	return n, nil
+}
+
+func (s *pgStore) ListNodeAddresses(ctx context.Context, nodeID uuid.UUID) ([]NodeAddress, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, node_id, address, first_seen, last_seen
+		FROM node_addresses
+		WHERE node_id = $1
+		ORDER BY first_seen
+	`, nodeID)
+	if err != nil {
+		return nil, fmt.Errorf("storage: list node addresses: %w", err)
+	}
+	defer rows.Close()
+
+	addrs := []NodeAddress{}
+	for rows.Next() {
+		var a NodeAddress
+		if err := rows.Scan(&a.ID, &a.NodeID, &a.Address, &a.FirstSeen, &a.LastSeen); err != nil {
+			return nil, fmt.Errorf("storage: scan node address: %w", err)
+		}
+		addrs = append(addrs, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage: list node addresses: %w", err)
+	}
+	return addrs, nil
 }
 
 func (s *pgStore) ListNodes(ctx context.Context, filter NodeFilter) ([]Node, error) {
@@ -173,14 +569,14 @@ func (s *pgStore) ListNodes(ctx context.Context, filter NodeFilter) ([]Node, err
 	var err error
 	if filter.DiscoverySource != "" {
 		rows, err = s.pool.Query(ctx, `
-			SELECT id, address, discovery_source, tags, label, first_seen, last_seen
+			SELECT `+nodeColumns+`
 			FROM nodes
 			WHERE discovery_source = $1
 			ORDER BY address
 		`, string(filter.DiscoverySource))
 	} else {
 		rows, err = s.pool.Query(ctx, `
-			SELECT id, address, discovery_source, tags, label, first_seen, last_seen
+			SELECT `+nodeColumns+`
 			FROM nodes
 			ORDER BY address
 		`)
@@ -192,13 +588,9 @@ func (s *pgStore) ListNodes(ctx context.Context, filter NodeFilter) ([]Node, err
 
 	nodes := []Node{}
 	for rows.Next() {
-		var n Node
-		var tagsOut []byte
-		if err := rows.Scan(&n.ID, &n.Address, &n.DiscoverySource, &tagsOut, &n.Label, &n.FirstSeen, &n.LastSeen); err != nil {
+		n, err := scanNode(rows)
+		if err != nil {
 			return nil, fmt.Errorf("storage: scan node: %w", err)
-		}
-		if err := json.Unmarshal(tagsOut, &n.Tags); err != nil {
-			return nil, fmt.Errorf("storage: unmarshal tags: %w", err)
 		}
 		nodes = append(nodes, n)
 	}
@@ -209,23 +601,7 @@ func (s *pgStore) ListNodes(ctx context.Context, filter NodeFilter) ([]Node, err
 }
 
 func (s *pgStore) GetNode(ctx context.Context, id uuid.UUID) (Node, error) {
-	var n Node
-	var tagsOut []byte
-	err := s.pool.QueryRow(ctx, `
-		SELECT id, address, discovery_source, tags, label, first_seen, last_seen
-		FROM nodes
-		WHERE id = $1
-	`, id).Scan(&n.ID, &n.Address, &n.DiscoverySource, &tagsOut, &n.Label, &n.FirstSeen, &n.LastSeen)
-	if err != nil {
-		if err == pgx.ErrNoRows {
-			return Node{}, ErrNotFound
-		}
-		return Node{}, fmt.Errorf("storage: get node: %w", err)
-	}
-	if err := json.Unmarshal(tagsOut, &n.Tags); err != nil {
-		return Node{}, fmt.Errorf("storage: unmarshal tags: %w", err)
-	}
-	return n, nil
+	return getNodeByID(ctx, s.pool, id)
 }
 
 func (s *pgStore) RecordHealthCheck(ctx context.Context, in HealthCheckInput) error {
