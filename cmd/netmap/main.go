@@ -49,7 +49,17 @@ func main() {
 	// p2pNodeClient's doc comment in internal/collector/p2p_client.go.
 	p2pClient := collector.NewP2PClient()
 
-	c := collector.New(collector.Config{SeedNodes: parseSeedNodes(os.Getenv("NETMAP_SEED_NODES"))})
+	c := collector.New(collector.Config{
+		SeedNodes: parseSeedNodes(os.Getenv("NETMAP_SEED_NODES")),
+		// 500ms between per-node dials within a single Discover/Poll
+		// pass, so we don't hammer many different nodes in rapid
+		// succession even though the overall pass frequency is polite.
+		// The collector package itself defaults DialJitter to zero (no
+		// delay) so its own tests stay fast and deterministic; this
+		// production default is set here instead — see
+		// collector.Config.DialJitter's doc comment for why.
+		DialJitter: 500 * time.Millisecond,
+	})
 	c.Storage = store
 	c.GRPCClient = grpcClient
 	c.P2PClient = p2pClient
