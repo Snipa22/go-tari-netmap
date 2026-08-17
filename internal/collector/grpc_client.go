@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"log"
 	"net"
 	"strconv"
 	"strings"
@@ -100,6 +101,18 @@ func (c *grpcNodeClient) GetInfo(ctx context.Context, addr string) (NodeInfo, er
 		Reachable: true,
 	}
 
+	// Identify recovers the node's own confirmed pubkey (as opposed to
+	// GetPeers' Peer.PublicKey, which is a claim addr makes about its
+	// peers, not about itself). This is best-effort/non-fatal: an
+	// Identify failure must not affect Reachable/Height/Version, which
+	// are already established by the calls above — only PublicKey is
+	// left nil in that case.
+	if identity, err := client.Identify(ctx, &tari_generated.Empty{}); err != nil {
+		log.Printf("GetInfo %s: Identify failed (non-fatal, PublicKey left nil): %v", addr, err)
+	} else {
+		info.PublicKey = identity.GetPublicKey()
+	}
+
 	if tip.Metadata != nil {
 		height := int64(tip.Metadata.BestBlockHeight)
 		info.Height = &height
@@ -132,7 +145,7 @@ func (c *grpcNodeClient) GetInfo(ctx context.Context, addr string) (NodeInfo, er
 }
 
 // GetPeers implements NodeClient.
-func (c *grpcNodeClient) GetPeers(ctx context.Context, addr string) ([]string, error) {
+func (c *grpcNodeClient) GetPeers(ctx context.Context, addr string) ([]DiscoveredPeer, error) {
 	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
 	defer cancel()
 
@@ -147,8 +160,12 @@ func (c *grpcNodeClient) GetPeers(ctx context.Context, addr string) ([]string, e
 		return nil, fmt.Errorf("ListConnectedPeers %s: %w", addr, err)
 	}
 
-	var peers []string
+	var peers []DiscoveredPeer
 	for _, peer := range resp.ConnectedPeers {
+		var pubKey []byte
+		if len(peer.PublicKey) > 0 {
+			pubKey = peer.PublicKey
+		}
 		for _, a := range peer.Addresses {
 			hostPort, ok := parsePeerAddress(a.Address)
 			if !ok {
@@ -158,7 +175,7 @@ func (c *grpcNodeClient) GetPeers(ctx context.Context, addr string) ([]string, e
 				// simply not appending anything for it).
 				continue
 			}
-			peers = append(peers, hostPort)
+			peers = append(peers, DiscoveredPeer{Address: hostPort, PublicKey: pubKey})
 		}
 	}
 

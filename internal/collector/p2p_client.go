@@ -3,6 +3,7 @@ package collector
 import (
 	"context"
 	"fmt"
+	"log"
 
 	"github.com/Snipa22/go-tari-lib/p2p"
 	pb "github.com/Snipa22/go-tari-lib/p2p/proto"
@@ -18,7 +19,7 @@ import (
 const p2pDialTimeout = dialTimeout
 
 // p2pProbeFuncs is the seam between p2pNodeClient and go-tari-lib/p2p's
-// free functions (ProbeChainMetadata/ProbeGetPeers). go-tari-lib/p2p
+// free functions (ProbeChainMetadata/ProbeGetPeers/Probe). go-tari-lib/p2p
 // exposes no interface of its own to mock, so this package-private
 // interface exists purely so tests can inject a fake implementation
 // instead of making real P2P network calls — mirroring how grpcNodeClient
@@ -26,6 +27,14 @@ const p2pDialTimeout = dialTimeout
 type p2pProbeFuncs interface {
 	probeChainMetadata(ctx context.Context, addr string) (*p2p.ChainMetadataInfo, error)
 	probeGetPeers(ctx context.Context, addr string, req rpcpkg.GetPeersRequest) ([]*pb.PeerInfo, error)
+
+	// probeIdentity performs a Noise_XX handshake against addr and
+	// returns the peer's confirmed pubkey (PeerInfo.RemoteStaticPubKey),
+	// recovered directly from the handshake rather than claimed by a
+	// third party. See GetInfo's doc comment for why this is a second,
+	// independent probe/dial from probeChainMetadata rather than
+	// something bolted onto ChainMetadataInfo.
+	probeIdentity(ctx context.Context, addr string) (*p2p.PeerInfo, error)
 }
 
 // realP2PProbeFuncs is the default p2pProbeFuncs implementation, backed by
@@ -38,6 +47,10 @@ func (realP2PProbeFuncs) probeChainMetadata(ctx context.Context, addr string) (*
 
 func (realP2PProbeFuncs) probeGetPeers(ctx context.Context, addr string, req rpcpkg.GetPeersRequest) ([]*pb.PeerInfo, error) {
 	return p2p.ProbeGetPeers(ctx, addr, req)
+}
+
+func (realP2PProbeFuncs) probeIdentity(ctx context.Context, addr string) (*p2p.PeerInfo, error) {
+	return p2p.Probe(ctx, addr)
 }
 
 // p2pNodeClient is the real go-tari-lib/p2p-backed NodeClient
@@ -67,6 +80,21 @@ func NewP2PClient() NodeClient {
 // PeerInfo.UserAgent is a separate call that requires a second full
 // handshake/dial — not worth the extra round trip just for Version, given
 // the GRPC path already covers Version on nodes that expose GRPC.
+//
+// PublicKey, unlike Version, IS worth that second dial: ChainMetadataInfo
+// has no pubkey field at all (out of scope to add — that's inside
+// go-tari-lib), so the only way to get addr's confirmed pubkey over this
+// transport is a second, independent p2p.Probe call (a full Noise_XX
+// handshake in its own right, recovering PeerInfo.RemoteStaticPubKey).
+// This means GetInfo now makes two separate P2P dials/handshakes to the
+// same addr on every call — an accepted, real limitation given
+// go-tari-lib is out of scope to modify further to merge them into one
+// round trip. The two probes are independent: if probeChainMetadata
+// succeeds but probeIdentity fails (or vice versa), that does not fail
+// the whole call — Reachable reflects whether probeChainMetadata
+// succeeded (the existing behavior/contract other code depends on);
+// PublicKey simply stays nil if probeIdentity failed, logged but
+// non-fatal.
 func (c *p2pNodeClient) GetInfo(ctx context.Context, addr string) (NodeInfo, error) {
 	ctx, cancel := context.WithTimeout(ctx, p2pDialTimeout)
 	defer cancel()
@@ -78,6 +106,12 @@ func (c *p2pNodeClient) GetInfo(ctx context.Context, addr string) (NodeInfo, err
 
 	info := NodeInfo{
 		Reachable: true,
+	}
+
+	if peerInfo, err := c.probes.probeIdentity(ctx, addr); err != nil {
+		log.Printf("p2p GetInfo %s: probeIdentity failed (non-fatal, PublicKey left nil): %v", addr, err)
+	} else {
+		info.PublicKey = peerInfo.RemoteStaticPubKey
 	}
 
 	height := int64(meta.BestBlockHeight)
@@ -100,7 +134,7 @@ func (c *p2pNodeClient) GetInfo(ctx context.Context, addr string) (NodeInfo, err
 }
 
 // GetPeers implements NodeClient.
-func (c *p2pNodeClient) GetPeers(ctx context.Context, addr string) ([]string, error) {
+func (c *p2pNodeClient) GetPeers(ctx context.Context, addr string) ([]DiscoveredPeer, error) {
 	ctx, cancel := context.WithTimeout(ctx, p2pDialTimeout)
 	defer cancel()
 
@@ -110,8 +144,12 @@ func (c *p2pNodeClient) GetPeers(ctx context.Context, addr string) ([]string, er
 	}
 
 	seen := make(map[string]bool)
-	var addrs []string
+	var discovered []DiscoveredPeer
 	for _, peer := range peers {
+		var pubKey []byte
+		if len(peer.PublicKey) > 0 {
+			pubKey = peer.PublicKey
+		}
 		for _, claim := range peer.Claims {
 			for _, a := range claim.Addresses {
 				hostPort, ok := parsePeerAddress(a)
@@ -126,10 +164,10 @@ func (c *p2pNodeClient) GetPeers(ctx context.Context, addr string) ([]string, er
 					continue
 				}
 				seen[hostPort] = true
-				addrs = append(addrs, hostPort)
+				discovered = append(discovered, DiscoveredPeer{Address: hostPort, PublicKey: pubKey})
 			}
 		}
 	}
 
-	return addrs, nil
+	return discovered, nil
 }
