@@ -119,13 +119,13 @@ func handleCreateNode(store storage.Store, grpcClient, p2pClient collector.NodeC
 			label = &req.Label
 		}
 
+		// A registry submission is address-only: the submitter's pubkey is
+		// unknown until the async health check kicked off below actually
+		// probes it, so this creates/updates a placeholder row (or bumps
+		// an already-confirmed row for this address) rather than a
+		// confirmed node.
 		address := fmt.Sprintf("%s:%d", req.Host, req.Port)
-		node, err := store.UpsertNode(r.Context(), storage.NodeInput{
-			Address:         address,
-			DiscoverySource: storage.DiscoverySourceRegistry,
-			Tags:            tags,
-			Label:           label,
-		})
+		node, err := store.UpsertDiscoveredNode(r.Context(), address, storage.DiscoverySourceRegistry, tags, label)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
