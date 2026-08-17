@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -555,5 +556,155 @@ func TestRunRespectsContextCancellation(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not return promptly after ctx cancellation")
+	}
+}
+
+// slowPeersFastInfoClient is a NodeClient fixture whose GetPeers blocks
+// until either its unblock channel is closed or ctx is cancelled — used
+// to simulate Discover()'s real-mainnet peer-walk hanging for a long
+// time — while GetInfo (used by Poll) returns immediately from an
+// in-memory fixture, same as fakeClient. peersCalled is closed the first
+// time GetPeers is entered (before it blocks), so a test can synchronize
+// on "discovery has started and is now hung" without a race. getPeersDone
+// is set (atomically) after GetPeers actually returns, so a test can
+// assert Poll produced data *before* the slow Discover call unblocked —
+// i.e. that Poll genuinely wasn't waiting on it.
+type slowPeersFastInfoClient struct {
+	unblock      chan struct{}
+	peersCalled  chan struct{}
+	getPeersDone atomic.Bool
+
+	info map[string]NodeInfo
+}
+
+func (s *slowPeersFastInfoClient) GetPeers(ctx context.Context, addr string) ([]string, error) {
+	close(s.peersCalled)
+	defer s.getPeersDone.Store(true)
+	select {
+	case <-s.unblock:
+		return nil, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (s *slowPeersFastInfoClient) GetInfo(ctx context.Context, addr string) (NodeInfo, error) {
+	info, ok := s.info[addr]
+	if !ok {
+		return NodeInfo{}, fmt.Errorf("collector_test: no fixture GetInfo response for %s", addr)
+	}
+	return info, nil
+}
+
+// TestRunDoesNotStarvePollOnSlowDiscover is the core regression test for
+// the Discover-vs-Poll starvation bug: previously, Run() executed
+// Discover() and Poll() sequentially within a single runPass() gated by
+// one shared ticker, so a Discover() call that hangs (as the real
+// mainnet peer-walk can, given real network dials with multi-second
+// timeouts across a large/slow-to-respond graph) starved Poll()
+// entirely — no health checks would ever be recorded. This test uses a
+// NodeClient whose GetPeers blocks indefinitely (until the test
+// unblocks it) as Discover's transport, while a separate, already-due
+// node is polled via that same client's fast, in-memory GetInfo. It
+// asserts a health check is recorded for the due node — proving Poll
+// ran and completed — while Discover's GetPeers call is still
+// (verifiably) in flight, i.e. before Discover's first pass could
+// possibly have returned.
+func TestRunDoesNotStarvePollOnSlowDiscover(t *testing.T) {
+	store := newTestStore(t)
+	seedCtx := context.Background()
+
+	client := &slowPeersFastInfoClient{
+		unblock:     make(chan struct{}),
+		peersCalled: make(chan struct{}),
+		info: map[string]NodeInfo{
+			"node:1": {Reachable: true},
+		},
+	}
+	// Ensures GetPeers (and therefore Run's Discover goroutine) actually
+	// unblocks/exits at the end of the test, even on failure, rather than
+	// leaking a goroutine blocked forever on a channel nothing else will
+	// ever close.
+	t.Cleanup(func() { close(client.unblock) })
+
+	// A node that's already due for a poll (no prior nextPoll entry —
+	// due() treats that as immediately due).
+	node, err := store.UpsertNode(seedCtx, storage.NodeInput{
+		Address:         "node:1",
+		DiscoverySource: storage.DiscoverySourceP2P,
+	})
+	if err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	c := New(Config{SeedNodes: []string{"seed:1"}})
+	c.Storage = store
+	c.GRPCClient = client
+	c.TickInterval = 20 * time.Millisecond
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- c.Run(runCtx) }()
+
+	// Wait for Discover's walk to actually reach (and hang in) GetPeers,
+	// so we know it's genuinely in flight for the rest of the test rather
+	// than, say, not having started yet.
+	select {
+	case <-client.peersCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Discover's GetPeers was never called")
+	}
+
+	// Poll ticks independently of the hung Discover call; poll for a
+	// recorded health check on node:1 within a deadline that comfortably
+	// exceeds several TickIntervals, but is short enough that this test
+	// completes quickly if (and only if) the fix is in place.
+	deadline := time.Now().Add(3 * time.Second)
+	var history []storage.HealthCheck
+	for {
+		history, err = store.GetNodeHistory(seedCtx, node.ID, 10)
+		if err != nil {
+			t.Fatalf("get history: %v", err)
+		}
+		if len(history) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no health check recorded for node:1 while Discover's GetPeers was still hung — Poll appears starved by Discover")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// The whole point: confirm the slow GetPeers call genuinely had not
+	// returned yet when Poll's result showed up above. If this were
+	// true, the test above wouldn't actually be proving independence —
+	// it'd just mean Discover happened to finish fast.
+	if client.getPeersDone.Load() {
+		t.Fatal("GetPeers had already returned by the time Poll recorded a health check — test doesn't prove independence")
+	}
+
+	if history[0].ProbeSource != storage.ProbeSourceGRPC {
+		t.Errorf("probe_source = %q, want %q", history[0].ProbeSource, storage.ProbeSourceGRPC)
+	}
+	if !history[0].Reachable {
+		t.Errorf("expected reachable = true")
+	}
+
+	// Cancel ctx so both loops exit — GetPeers observes ctx.Done() and
+	// returns rather than staying hung — and confirm Run actually returns
+	// promptly and without error. (client.unblock is closed separately by
+	// t.Cleanup, only as a belt-and-suspenders safety net in case this
+	// assertion fails before reaching here.)
+	cancel()
+
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Errorf("Run returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after ctx cancellation")
 	}
 }
