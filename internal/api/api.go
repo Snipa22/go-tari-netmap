@@ -38,6 +38,7 @@ func NewRouter(store storage.Store, grpcClient, p2pClient collector.NodeClient) 
 	mux.HandleFunc("GET /nodes/{id}", handleGetNode(store))
 	mux.HandleFunc("GET /nodes/{id}/history", handleGetNodeHistory(store))
 	mux.HandleFunc("GET /topology", handleTopology(store))
+	mux.HandleFunc("GET /topology/top-peered", handleTopPeeredNodes(store))
 
 	return mux
 }
@@ -211,6 +212,37 @@ func handleTopology(store storage.Store) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusOK, topologyResponse{Nodes: nodes, Edges: edges})
+	}
+}
+
+func handleTopPeeredNodes(store storage.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		since := time.Hour
+		if v := r.URL.Query().Get("since"); v != "" {
+			d, err := time.ParseDuration(v)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, errors.New("invalid since"))
+				return
+			}
+			since = d
+		}
+
+		limit := 20
+		if v := r.URL.Query().Get("limit"); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n <= 0 {
+				writeError(w, http.StatusBadRequest, errors.New("invalid limit"))
+				return
+			}
+			limit = n
+		}
+
+		degrees, err := store.TopPeeredNodes(r.Context(), time.Now().Add(-since), limit)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, degrees)
 	}
 }
 
