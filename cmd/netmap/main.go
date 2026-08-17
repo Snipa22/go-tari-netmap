@@ -39,10 +39,10 @@ func main() {
 		log.Fatalf("failed to run migrations: %v", err)
 	}
 
-	// go-tari-grpc-lib isn't wired in as a real dependency yet, so this is
-	// the no-op stub client — swap in a real implementation of
-	// collector.NodeClient once it is.
-	client := collector.NewStubClient()
+	// Real go-tari-grpc-lib-backed client: talks to Tari base nodes over
+	// gRPC. Dials fresh per-call (see grpcNodeClient's doc comment in
+	// internal/collector/grpc_client.go for why that's fine here).
+	client := collector.NewGRPCClient()
 
 	c := collector.New(collector.Config{SeedNodes: parseSeedNodes(os.Getenv("NETMAP_SEED_NODES"))})
 	c.Storage = store
