@@ -1,9 +1,12 @@
 // Package collector polls Tari nodes and discovers peers by walking the
 // peer graph starting from a set of seed nodes.
 //
-// go-tari-grpc-lib is not wired in as a real dependency in this repo yet;
-// the real gRPC calls are stubbed behind the NodeClient interface so
-// swapping in a real implementation later is a one-function change.
+// Two independent transports are supported for both discovery and
+// polling: a gRPC-backed NodeClient (go-tari-grpc-lib, see grpc_client.go)
+// and a P2P-backed NodeClient (go-tari-lib/p2p, see p2p_client.go). Either,
+// both, or neither may be configured on a Collector; each is probed
+// independently so that, e.g., a node reachable only over one transport
+// still contributes data.
 package collector
 
 import (
@@ -95,10 +98,17 @@ type Collector struct {
 	// Storage persists discovered nodes, peer edges, and health checks.
 	Storage storage.Store
 
-	// Client talks to Tari base nodes. Defaults to the no-op stub client;
-	// inject a real go-tari-grpc-lib-backed implementation to enable real
-	// network calls.
-	Client NodeClient
+	// GRPCClient talks to Tari base nodes over go-tari-grpc-lib's gRPC
+	// BaseNode service. Optional/nilable: if nil, the gRPC probe is
+	// skipped entirely for both Discover and Poll, rather than erroring.
+	GRPCClient NodeClient
+
+	// P2PClient talks to Tari nodes over go-tari-lib/p2p's direct
+	// comms/RPC-over-P2P transport. Optional/nilable: if nil, the P2P
+	// probe is skipped entirely for both Discover and Poll, rather than
+	// erroring. A Collector with only one of GRPCClient/P2PClient set
+	// still works correctly, just without data from the other transport.
+	P2PClient NodeClient
 
 	// TickInterval governs how often Run checks which known nodes are due
 	// for a poll. Defaults to defaultTickInterval if unset. Kept short and
@@ -110,13 +120,15 @@ type Collector struct {
 	nextPoll map[string]time.Time // address -> next poll due time
 }
 
-// New returns a new Collector for the given config, defaulting to the
-// no-op stub NodeClient. Set Storage (required) and optionally Client
-// before calling Run, Discover, or Poll.
+// New returns a new Collector for the given config. GRPCClient and
+// P2PClient are left nil (network calls are opt-in): set Storage
+// (required) and at least one of GRPCClient/P2PClient (recommended, but
+// not required — a Collector with neither set just does nothing on
+// Discover/Poll rather than panicking) before calling Run, Discover, or
+// Poll.
 func New(cfg Config) *Collector {
 	return &Collector{
 		cfg:      cfg,
-		Client:   NewStubClient(),
 		nextPoll: make(map[string]time.Time),
 	}
 }
@@ -155,14 +167,39 @@ func (c *Collector) runPass(ctx context.Context) {
 	}
 }
 
-// Discover walks the peer graph starting from Config.SeedNodes via
-// Client.GetPeers, deduping visited addresses, and records discovered nodes
-// and edges in Storage.
+// Discover walks the peer graph starting from Config.SeedNodes, deduping
+// visited addresses per transport, and records discovered nodes and edges
+// in Storage. GRPCClient and P2PClient (if non-nil) are each walked as a
+// separate, independent pass over the same seed nodes — one transport's
+// walk failing/erroring must not abort the other's.
 func (c *Collector) Discover(ctx context.Context) error {
 	if c.Storage == nil {
 		return errors.New("collector: Storage is not configured")
 	}
 
+	if c.GRPCClient != nil {
+		c.discoverWith(ctx, c.GRPCClient, "grpc")
+	}
+	if c.P2PClient != nil {
+		c.discoverWith(ctx, c.P2PClient, "p2p")
+	}
+
+	return nil
+}
+
+// discoverWith walks the peer graph starting from Config.SeedNodes via
+// client.GetPeers, deduping visited addresses, and records discovered
+// nodes and edges in Storage. transportLabel is used only for log
+// messages, to distinguish which transport's walk a given log line came
+// from when both are configured.
+//
+// Discovered nodes/edges are recorded with DiscoverySourceP2P regardless
+// of which NodeClient transport (gRPC or P2P-RPC) performed the walk —
+// see DiscoverySource's doc comment in models.go: it means "discovered by
+// walking the peer graph" broadly, not the P2P-RPC transport specifically.
+// This is orthogonal to ProbeSource, which does track which transport a
+// given health check came from.
+func (c *Collector) discoverWith(ctx context.Context, client NodeClient, transportLabel string) {
 	visited := make(map[string]bool)
 	queue := append([]string{}, c.cfg.SeedNodes...)
 
@@ -179,13 +216,13 @@ func (c *Collector) Discover(ctx context.Context) error {
 			DiscoverySource: storage.DiscoverySourceP2P,
 		})
 		if err != nil {
-			log.Printf("collector: upsert node %s: %v", addr, err)
+			log.Printf("collector: [%s] upsert node %s: %v", transportLabel, addr, err)
 			continue
 		}
 
-		peers, err := c.Client.GetPeers(ctx, addr)
+		peers, err := client.GetPeers(ctx, addr)
 		if err != nil {
-			log.Printf("collector: get peers for %s: %v", addr, err)
+			log.Printf("collector: [%s] get peers for %s: %v", transportLabel, addr, err)
 			continue
 		}
 
@@ -195,12 +232,12 @@ func (c *Collector) Discover(ctx context.Context) error {
 				DiscoverySource: storage.DiscoverySourceP2P,
 			})
 			if err != nil {
-				log.Printf("collector: upsert node %s: %v", peerAddr, err)
+				log.Printf("collector: [%s] upsert node %s: %v", transportLabel, peerAddr, err)
 				continue
 			}
 
 			if err := c.Storage.UpsertPeerEdge(ctx, fromNode.ID, toNode.ID); err != nil {
-				log.Printf("collector: upsert edge %s -> %s: %v", addr, peerAddr, err)
+				log.Printf("collector: [%s] upsert edge %s -> %s: %v", transportLabel, addr, peerAddr, err)
 			}
 
 			if !visited[peerAddr] {
@@ -208,12 +245,11 @@ func (c *Collector) Discover(ctx context.Context) error {
 			}
 		}
 	}
-
-	return nil
 }
 
 // Poll checks all known nodes and, for those whose next-poll time is due,
-// calls Client.GetInfo and records the result via Storage.RecordHealthCheck.
+// calls PollOnce (which independently attempts GRPCClient and P2PClient,
+// whichever are non-nil).
 func (c *Collector) Poll(ctx context.Context) error {
 	if c.Storage == nil {
 		return errors.New("collector: Storage is not configured")
@@ -230,32 +266,65 @@ func (c *Collector) Poll(ctx context.Context) error {
 			continue
 		}
 		c.setNextPoll(n.Address, now.Add(c.pollInterval(n)))
-		if err := PollOnce(ctx, c.Client, c.Storage, n); err != nil {
+		if err := PollOnce(ctx, c.GRPCClient, c.P2PClient, c.Storage, n); err != nil {
 			log.Printf("collector: poll %s: %v", n.Address, err)
 		}
 	}
 	return nil
 }
 
-// PollOnce performs a single synchronous health check of node via client
-// and records the result via store. It is exported so callers outside the
-// collector's own scheduled loop (e.g. the API's async health-check
-// kickoff for a freshly submitted node) can trigger the same check-and-
-// record logic without waiting for the next scheduled poll pass.
-func PollOnce(ctx context.Context, client NodeClient, store storage.Store, node storage.Node) error {
+// PollOnce performs a single synchronous health check of node via
+// grpcClient and p2pClient — whichever of the two are non-nil — and
+// records each result independently via store. Each attempt (gRPC, P2P)
+// is wrapped in its own error handling: one failing does not skip or
+// abort the other. It is exported so callers outside the collector's own
+// scheduled loop (e.g. the API's async health-check kickoff for a freshly
+// submitted node) can trigger the same check-and-record logic without
+// waiting for the next scheduled poll pass.
+//
+// The returned error, if any, is a joined combination of errors from
+// recording the health checks (not from the probes themselves — a probe
+// error is expected/normal for an unreachable node and is itself recorded
+// as a Reachable: false row, not surfaced as an error here); it exists
+// purely so call sites can log a combined failure, not for control flow.
+func PollOnce(ctx context.Context, grpcClient, p2pClient NodeClient, store storage.Store, node storage.Node) error {
+	var errs []error
+
+	if grpcClient != nil {
+		if err := pollOnceWithSource(ctx, grpcClient, store, node, storage.ProbeSourceGRPC); err != nil {
+			errs = append(errs, fmt.Errorf("grpc probe %s: %w", node.Address, err))
+		}
+	}
+	if p2pClient != nil {
+		if err := pollOnceWithSource(ctx, p2pClient, store, node, storage.ProbeSourceP2P); err != nil {
+			errs = append(errs, fmt.Errorf("p2p probe %s: %w", node.Address, err))
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+// pollOnceWithSource performs a single health check of node via client and
+// records the result via store, tagged with probeSource. If client.GetInfo
+// itself fails (the node is unreachable over this transport — a normal,
+// expected case, not a bug), an unreachable row is still recorded so
+// history reflects the failed check rather than silently having no data
+// point; the GetInfo error itself is not returned in that case, only any
+// error from the RecordHealthCheck call.
+func pollOnceWithSource(ctx context.Context, client NodeClient, store storage.Store, node storage.Node, probeSource storage.ProbeSource) error {
 	info, err := client.GetInfo(ctx, node.Address)
 	if err != nil {
-		// Still record the attempt, as unreachable, so history reflects
-		// the failed check rather than silently having no data point.
 		return store.RecordHealthCheck(ctx, storage.HealthCheckInput{
-			NodeID:    node.ID,
-			Reachable: false,
+			NodeID:      node.ID,
+			Reachable:   false,
+			ProbeSource: probeSource,
 		})
 	}
 
 	return store.RecordHealthCheck(ctx, storage.HealthCheckInput{
 		NodeID:         node.ID,
 		Reachable:      info.Reachable,
+		ProbeSource:    probeSource,
 		Height:         info.Height,
 		ChainTipHeight: info.ChainTipHeight,
 		Version:        info.Version,

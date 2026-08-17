@@ -126,7 +126,10 @@ func newTestServer(t *testing.T, client collector.NodeClient) (*httptest.Server,
 	if client == nil {
 		client = collector.NewStubClient()
 	}
-	srv := httptest.NewServer(api.NewRouter(store, client))
+	// p2pClient is nil here: these tests only exercise the gRPC-labeled
+	// async health-check kickoff path; dual-probe behavior is covered by
+	// internal/collector's own tests.
+	srv := httptest.NewServer(api.NewRouter(store, client, nil))
 	t.Cleanup(srv.Close)
 	return srv, store
 }
@@ -315,7 +318,11 @@ func TestGetNodeHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
-	if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{NodeID: node.ID, Reachable: true}); err != nil {
+	if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{
+		NodeID:      node.ID,
+		Reachable:   true,
+		ProbeSource: storage.ProbeSourceGRPC,
+	}); err != nil {
 		t.Fatalf("record health check: %v", err)
 	}
 
