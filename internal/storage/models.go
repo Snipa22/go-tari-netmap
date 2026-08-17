@@ -65,6 +65,17 @@ type PeerEdge struct {
 	LastSeen   time.Time `json:"last_seen"`
 }
 
+// NodeDegree is one row of a TopPeeredNodes result: a node and how many
+// distinct other nodes it has an observed peer-edge with (in either
+// direction) within the queried time window.
+type NodeDegree struct {
+	NodeID    uuid.UUID `json:"node_id"`
+	Address   string    `json:"address"`
+	Degree    int       `json:"degree"`
+	InDegree  int       `json:"in_degree"`
+	OutDegree int       `json:"out_degree"`
+}
+
 // HealthCheck is one recorded health-check result for a node.
 type HealthCheck struct {
 	ID             uuid.UUID   `json:"id"`
