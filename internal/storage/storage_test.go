@@ -439,6 +439,40 @@ func TestTopPeeredNodes(t *testing.T) {
 	}
 }
 
+// TestNodeHealthHypertableCompatiblePK verifies that, after
+// 0005_node_health_hypertable_pk_fix.sql has replaced node_health's
+// single-column primary key with a composite UNIQUE(id, ts) constraint,
+// TimescaleDB's create_hypertable() actually succeeds against the table
+// on a real, working TimescaleDB install. Without that migration this
+// fails with SQLSTATE TS103 ("cannot create a unique index without the
+// column \"ts\" (used in partitioning)"), since Timescale requires the
+// partitioning column to be part of any UNIQUE/PK constraint on the
+// table.
+//
+// This sandbox's TimescaleDB install is known to be unusable (ABI
+// mismatch between the only obtainable prebuilt TimescaleDB package and
+// the only obtainable Postgres build — see
+// 0002_timescale_hypertable_optional.sql), so if CREATE EXTENSION itself
+// fails here, this test skips rather than fails: it is asserting that
+// the PK fix works when TimescaleDB is actually available, not asserting
+// that TimescaleDB is available in every test environment.
+func TestNodeHealthHypertableCompatiblePK(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	ps := store.(*pgStore)
+
+	if _, err := ps.pool.Exec(ctx, "CREATE EXTENSION IF NOT EXISTS timescaledb"); err != nil {
+		t.Skipf("skipping: timescaledb extension unavailable: %v", err)
+	}
+
+	if _, err := ps.pool.Exec(ctx,
+		"SELECT create_hypertable('node_health', 'ts', if_not_exists => TRUE, migrate_data => TRUE)",
+	); err != nil {
+		t.Fatalf("create_hypertable: %v", err)
+	}
+}
+
 func TestMigrateIsIdempotent(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

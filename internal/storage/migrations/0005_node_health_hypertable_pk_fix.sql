@@ -1,0 +1,34 @@
+-- 0005_node_health_hypertable_pk_fix.sql
+--
+-- Fixes a real production schema bug: node_health's plain single-column
+-- `id uuid PRIMARY KEY` (from 0001_init.sql) is incompatible with
+-- TimescaleDB's create_hypertable() when partitioning on the `ts` column
+-- (see 0002_timescale_hypertable_optional.sql). On a correctly-installed
+-- TimescaleDB instance, create_hypertable('node_health', 'ts', ...) fails
+-- with:
+--
+--   ERROR: cannot create a unique index without the column "ts" (used in
+--   partitioning) (SQLSTATE TS103)
+--
+-- because Timescale requires every UNIQUE/PRIMARY KEY constraint on a
+-- hypertable to include the partitioning column. This is a distinct
+-- failure mode from the dev-sandbox TimescaleDB ABI-mismatch issue
+-- documented in 0002 (that one is about TimescaleDB not being installable
+-- at all here; this one bites on any real, working TimescaleDB install).
+--
+-- Fix: drop the single-column primary key and replace it with a
+-- composite UNIQUE(id, ts) constraint — the standard supported pattern
+-- for a UUID surrogate key on a Timescale hypertable. `id` remains
+-- useful for application-level lookups (e.g. node_health.id as returned
+-- by RecordHealthCheck's implicit row); `ts` satisfies the partitioning
+-- requirement.
+--
+-- This migration is plain DDL against a table that always exists (created
+-- unconditionally in 0001_init.sql) — it does not touch TimescaleDB and
+-- has no reason to fail on any Postgres instance, so unlike 0002 it is
+-- NOT marked "_optional" and must succeed unconditionally, every time,
+-- for the binary to start (see internal/storage/migrate.go for how the
+-- "_optional" filename marker changes failure handling).
+
+ALTER TABLE node_health DROP CONSTRAINT IF EXISTS node_health_pkey;
+ALTER TABLE node_health ADD CONSTRAINT node_health_id_ts_key UNIQUE (id, ts);
