@@ -29,10 +29,17 @@ const (
 	ProbeSourceP2P  ProbeSource = "p2p"
 )
 
-// Node is a Tari node known to netmap.
+// Node is a Tari node known to netmap. Address is the node's first-known
+// (primary) address, kept populated for backward compatibility with
+// existing code paths, but it is no longer the unique key for node
+// identity — see PublicKey and NodeAddress. A Node with a nil PublicKey is
+// a placeholder: it was discovered by address alone (e.g. via a peer-walk
+// GetPeers hop, or a registry submission) and has not yet been directly,
+// successfully probed to confirm its real pubkey.
 type Node struct {
 	ID              uuid.UUID       `json:"id"`
 	Address         string          `json:"address"`
+	PublicKey       []byte          `json:"public_key,omitempty"`
 	DiscoverySource DiscoverySource `json:"discovery_source"`
 	Tags            map[string]any  `json:"tags"`
 	Label           *string         `json:"label,omitempty"`
@@ -40,9 +47,24 @@ type Node struct {
 	LastSeen        time.Time       `json:"last_seen"`
 }
 
-// NodeInput is the input to UpsertNode.
+// NodeAddress is one address a node has ever been seen at. A node can have
+// multiple simultaneously-valid addresses (onion, clearnet, IPv4/IPv6),
+// each tracked as its own NodeAddress row.
+type NodeAddress struct {
+	ID        uuid.UUID `json:"id"`
+	NodeID    uuid.UUID `json:"node_id"`
+	Address   string    `json:"address"`
+	FirstSeen time.Time `json:"first_seen"`
+	LastSeen  time.Time `json:"last_seen"`
+}
+
+// NodeInput was the input to the old UpsertNode method. Superseded by the
+// explicit UpsertDiscoveredNode/UpsertConfirmedNode methods on Store, kept
+// here only as a plain data holder for any remaining external callers
+// that want to build a request; Store no longer accepts it directly.
 type NodeInput struct {
 	Address         string
+	PublicKey       []byte
 	DiscoverySource DiscoverySource
 	Tags            map[string]any
 	Label           *string
