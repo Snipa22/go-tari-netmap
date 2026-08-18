@@ -126,8 +126,7 @@
             <th>Capabilities</th>
             <th>Address</th>
             <th>Discovery source</th>
-            <th>Last seen</th>
-            <th>Reachable</th>
+            <th>Most recent probe, reachable</th>
             <th>Height</th>
           </tr>
         </thead>
@@ -157,12 +156,23 @@
               {{end}}
             </td>
             <td>{{.DiscoverySource}}</td>
-            <td>{{.LastSeen}}</td>
-            <td>{{if .LatestHealth}}{{.LatestHealth.Reachable}}{{else}}—{{end}}</td>
+            <td>
+              {{if .LatestHealth}}
+              {{.LatestHealth.Timestamp}}
+              {{if .LatestHealth.Reachable}}
+              <span class="badge badge-reachable">reachable</span>
+              {{else}}
+              <span class="badge badge-unreachable">unreachable</span>
+              {{end}}
+              {{if .LatestHealth.Version}}{{.LatestHealth.Version}}{{else}}—{{end}}
+              {{else}}
+              —
+              {{end}}
+            </td>
             <td>{{if .LatestHealth}}{{if .LatestHealth.Height}}{{.LatestHealth.Height}}{{else}}—{{end}}{{else}}—{{end}}</td>
           </tr>
           {{else}}
-          <tr><td colspan="7" class="empty-note">No nodes known yet.</td></tr>
+          <tr><td colspan="6" class="empty-note">No nodes known yet.</td></tr>
           {{end}}
         </tbody>
       </table>

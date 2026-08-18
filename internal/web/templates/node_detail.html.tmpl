@@ -23,6 +23,9 @@
       {{else}}
       <span class="badge badge-unconfirmed">unconfirmed</span>
       {{end}}
+      {{if .LikelyDead}}
+      <span class="badge badge-likely-dead">likely dead</span>
+      {{end}}
     </h1>
 
     <section class="detail-summary">

@@ -176,6 +176,76 @@ func TestListNodesFilter(t *testing.T) {
 	}
 }
 
+// TestListNodesReachableSinceFilter exercises NodeFilter.ReachableSince:
+// only nodes with at least one reachable=true node_health row at or
+// after the cutoff should come back. It uses a short 1-hour window
+// (rather than the dashboard's real 24h) to keep the test fast: n1 has a
+// reachable check 30 minutes ago (within a 1h cutoff) and must be
+// included; n2 has a reachable check 2 hours ago (older than the
+// cutoff, so effectively stale) and must be excluded, even though it
+// has been "seen" in the general sense. It also explicitly proves the
+// critical invariant that a zero-value NodeFilter{} (and a
+// NodeFilter{Limit: N} with ReachableSince left nil) are byte-for-byte
+// unaffected by this field's mere existence — old behavior must not
+// change at all when ReachableSince isn't set.
+func TestListNodesReachableSinceFilter(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	ps := store.(*pgStore)
+
+	n1, err := store.UpsertDiscoveredNode(ctx, "reach1:1", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert n1: %v", err)
+	}
+	if _, err := ps.pool.Exec(ctx, `
+		INSERT INTO node_health (node_id, ts, reachable, probe_source)
+		VALUES ($1, now() - interval '30 minutes', true, 'grpc')
+	`, n1.ID); err != nil {
+		t.Fatalf("insert recent reachable health n1: %v", err)
+	}
+
+	n2, err := store.UpsertDiscoveredNode(ctx, "reach2:1", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert n2: %v", err)
+	}
+	if _, err := ps.pool.Exec(ctx, `
+		INSERT INTO node_health (node_id, ts, reachable, probe_source)
+		VALUES ($1, now() - interval '2 hours', true, 'grpc')
+	`, n2.ID); err != nil {
+		t.Fatalf("insert stale reachable health n2: %v", err)
+	}
+
+	cutoff := time.Now().Add(-1 * time.Hour)
+	got, err := store.ListNodes(ctx, NodeFilter{ReachableSince: &cutoff})
+	if err != nil {
+		t.Fatalf("list reachable-since: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != n1.ID {
+		t.Fatalf("ReachableSince filter = %+v, want just n1 (%s)", got, n1.ID)
+	}
+
+	// Critical invariant: a zero-value filter (ReachableSince left nil)
+	// must return everything, completely unaffected by the new field's
+	// existence — this is what the collector's Poll loop relies on.
+	all, err := store.ListNodes(ctx, NodeFilter{})
+	if err != nil {
+		t.Fatalf("list all (zero-value filter): %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("len(all) = %d, want 2 (zero-value NodeFilter{} must be unaffected by ReachableSince)", len(all))
+	}
+
+	// Same invariant, but with Limit set alone (ReachableSince still
+	// nil): must behave exactly as before this field was added.
+	limited, err := store.ListNodes(ctx, NodeFilter{Limit: 1})
+	if err != nil {
+		t.Fatalf("list limit=1 (no ReachableSince): %v", err)
+	}
+	if len(limited) != 1 {
+		t.Fatalf("len(limited) = %d, want 1 (NodeFilter{Limit: 1} alone must be unaffected by ReachableSince)", len(limited))
+	}
+}
+
 // TestListNodesPagination verifies that NodeFilter.Limit/Offset apply
 // real SQL-level pagination (a correct page, in the same address-sorted
 // order ListNodes always uses), and that a zero-value filter still

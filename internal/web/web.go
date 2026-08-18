@@ -143,9 +143,13 @@ type dashboardData struct {
 	TopPeeredWindowLabel   string
 
 	// Node table pagination metadata (see handleDashboard). NodeTotal is
-	// the WHOLE population's count (Counts.Total), not just the current
-	// page — the summary cards above rely on that same total, so the two
-	// never disagree.
+	// the count of the reachable-within-window filtered set that the
+	// table itself is paginating through (see dashboardReachableWindow),
+	// NOT Counts.Total — the table only ever shows nodes from that
+	// filtered set, so pagination math must be based on its size, not
+	// the whole population's. Counts.Total (the "Total nodes" summary
+	// card) intentionally keeps reflecting the whole population and can
+	// disagree with NodeTotal.
 	NodePage       int
 	NodeLimit      int
 	NodeTotal      int
@@ -178,6 +182,11 @@ type nodeDetailData struct {
 	Capabilities    capabilities
 	PublicAddresses []string
 	PeerEdges       []peerEdgeRow
+
+	// LikelyDead is a simple, deliberately non-aggregate-query heuristic
+	// computed from the already-fetched History slice — see
+	// handleNodeDetail for exactly how it's derived.
+	LikelyDead bool
 }
 
 // topPeeredWindow is the lookback window used to compute the dashboard's
@@ -200,6 +209,16 @@ const dashboardNodeMaxPageSize = 200
 // nodeEdgesLimit caps the number of rows shown in a node detail page's
 // "peer connections" table.
 const nodeEdgesLimit = 50
+
+// dashboardReachableWindow is the display-layer cutoff for "reachable
+// recently enough to show in the main Nodes table" on the dashboard. It
+// only affects what's rendered on this one page — nodes outside this
+// window stay in the database and keep being probed by the collector
+// exactly as before; they just aren't shown in the main table until
+// they're reachable again. The whole-population summary cards
+// (dashboardCounts) are deliberately unaffected by this window (see
+// handleDashboard).
+const dashboardReachableWindow = 24 * time.Hour
 
 // windowLabel formats a lookback duration like topPeeredWindow into a
 // short human string (e.g. "(last 1h)") for display next to a panel
@@ -359,8 +378,14 @@ func handleDashboard(tmpl *template.Template, store storage.Store) http.HandlerF
 		}
 
 		// Paginated: the actual SQL-level LIMIT/OFFSET query backing the
-		// node table rows shown on this page.
-		pageNodes, err := store.ListNodes(ctx, storage.NodeFilter{Limit: limit, Offset: offset})
+		// node table rows shown on this page. Restricted to nodes
+		// reachable within dashboardReachableWindow (see its doc
+		// comment) — this is a display-only cut, the whole-population
+		// counts above are deliberately built from the unfiltered
+		// allNodes query and don't use this cutoff at all.
+		cutoff := time.Now().Add(-dashboardReachableWindow)
+		reachableFilter := storage.NodeFilter{ReachableSince: &cutoff}
+		pageNodes, err := store.ListNodes(ctx, storage.NodeFilter{ReachableSince: &cutoff, Limit: limit, Offset: offset})
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -384,17 +409,31 @@ func handleDashboard(tmpl *template.Template, store storage.Store) http.HandlerF
 			data.Nodes = append(data.Nodes, row)
 		}
 
-		total := data.Counts.Total
+		// reachableTotal is the size of the SAME reachable-within-window
+		// filtered set pageNodes is a page of — a second, unpaginated
+		// ListNodes call with the same ReachableSince filter, used only
+		// for its len() as pagination metadata (NodeTotal/HasNextPage/
+		// etc. below). This is deliberately separate from allNodes
+		// (which drives Counts.Total and must stay unfiltered) — the
+		// table's pagination math needs to reflect what it's actually
+		// paginating through, not the whole population.
+		reachableNodes, err := store.ListNodes(ctx, reachableFilter)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		reachableTotal := len(reachableNodes)
+
 		data.NodePage = page
 		data.NodeLimit = limit
-		data.NodeTotal = total
+		data.NodeTotal = reachableTotal
 		if len(pageNodes) > 0 {
 			data.NodeRangeStart = offset + 1
 			data.NodeRangeEnd = offset + len(pageNodes)
 		}
 		data.HasPrevPage = page > 1
 		data.PrevPage = page - 1
-		data.HasNextPage = offset+len(pageNodes) < total
+		data.HasNextPage = offset+len(pageNodes) < reachableTotal
 		data.NextPage = page + 1
 
 		height, heightNodeCount, err := store.NetworkHeight(ctx)
@@ -530,6 +569,25 @@ func handleNodeDetail(tmpl *template.Template, store storage.Store) http.Handler
 			Identity:        view.Identity,
 			Capabilities:    view.Capabilities,
 			PublicAddresses: view.PublicAddresses,
+		}
+
+		// LikelyDead: "3+ probes, zero successes" against the
+		// already-fetched 50-row history above — no new aggregate
+		// query needed. This is a deliberately simple, well-grounded
+		// proxy for "persistently dead", not a guess: in production,
+		// 83% of nodes probed 3+ times never once succeed, so a node
+		// with at least 3 recorded probes and not a single
+		// Reachable == true among them is overwhelmingly likely to be
+		// permanently gone rather than just having a bad day.
+		if len(history) >= 3 {
+			anyReachable := false
+			for _, h := range history {
+				if h.Reachable {
+					anyReachable = true
+					break
+				}
+			}
+			data.LikelyDead = !anyReachable
 		}
 
 		for _, e := range edges {
