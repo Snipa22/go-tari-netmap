@@ -131,15 +131,20 @@ type dashboardNodeRow struct {
 // privacy-scrubbed identity plus its connectivity stats from
 // storage.TopPeeredNodes.
 type topPeeredRow struct {
-	ID                uuid.UUID
-	Identity          identity
-	Capabilities      capabilities
-	PublicAddresses   []string
-	Degree            int
-	InDegree          int
-	OutDegree         int
-	OnionPeerCount    int
-	ClearnetPeerCount int
+	ID                    uuid.UUID
+	Identity              identity
+	Capabilities          capabilities
+	PublicAddresses       []string
+	Degree                int
+	InDegree              int
+	OutDegree             int
+	OnionPeerCount        int
+	ClearnetPeerCount     int
+	LiveDegree            int
+	LiveInDegree          int
+	LiveOutDegree         int
+	LiveOnionPeerCount    int
+	LiveClearnetPeerCount int
 }
 
 // dashboardData is the template data for index.html.tmpl.
@@ -497,6 +502,20 @@ func parseNodeTablePageParams(r *http.Request) (page, limit, offset int) {
 	return page, limit, offset
 }
 
+// truncateAddress returns addr unchanged if it's at most maxLen
+// characters, otherwise the first maxLen characters plus a "…" ellipsis.
+// Mirrors buildIdentity's ShortHex/FullHex truncation convention for
+// pubkeys, applied here to the top-peered panel's (potentially long,
+// especially for onion v3) address strings — the full address is still
+// available via a title="" tooltip in the template, same pattern as
+// buildIdentity's FullHex.
+func truncateAddress(addr string, maxLen int) string {
+	if len(addr) <= maxLen {
+		return addr
+	}
+	return addr[:maxLen] + "…"
+}
+
 // NewHandler returns an http.Handler serving the dashboard: a homepage
 // summary + node table (with a registry-submission form posted via htmx
 // directly to the /api/nodes JSON API), a per-node detail/history page,
@@ -512,7 +531,8 @@ func NewHandler(store storage.Store, adminCreds adminauth.Credentials) (http.Han
 	// submissions.html.tmpl's probe-result cell. Used to distinguish
 	// nil (not yet probed) from a genuine false (unreachable).
 	tmpl, err := template.New("web").Funcs(template.FuncMap{
-		"derefBool": func(b *bool) bool { return b != nil && *b },
+		"derefBool":       func(b *bool) bool { return b != nil && *b },
+		"truncateAddress": truncateAddress,
 	}).ParseFS(templatesFS, "templates/*.tmpl")
 	if err != nil {
 		return nil, err
@@ -607,15 +627,20 @@ func handleDashboard(tmpl *template.Template, store storage.Store) http.HandlerF
 			}
 			view := scrubForDisplay(n, addrs)
 			data.TopPeered = append(data.TopPeered, topPeeredRow{
-				ID:                nd.NodeID,
-				Identity:          view.Identity,
-				Capabilities:      view.Capabilities,
-				PublicAddresses:   view.PublicAddresses,
-				Degree:            nd.Degree,
-				InDegree:          nd.InDegree,
-				OutDegree:         nd.OutDegree,
-				OnionPeerCount:    nd.OnionPeerCount,
-				ClearnetPeerCount: nd.ClearnetPeerCount,
+				ID:                    nd.NodeID,
+				Identity:              view.Identity,
+				Capabilities:          view.Capabilities,
+				PublicAddresses:       view.PublicAddresses,
+				Degree:                nd.Degree,
+				InDegree:              nd.InDegree,
+				OutDegree:             nd.OutDegree,
+				OnionPeerCount:        nd.OnionPeerCount,
+				ClearnetPeerCount:     nd.ClearnetPeerCount,
+				LiveDegree:            nd.LiveDegree,
+				LiveInDegree:          nd.LiveInDegree,
+				LiveOutDegree:         nd.LiveOutDegree,
+				LiveOnionPeerCount:    nd.LiveOnionPeerCount,
+				LiveClearnetPeerCount: nd.LiveClearnetPeerCount,
 			})
 		}
 

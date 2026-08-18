@@ -1060,6 +1060,17 @@ func (s *pgStore) ListTopology(ctx context.Context, filter TopologyFilter) ([]No
 // PublicNode.HasOnion/HasIPv4/HasIPv6 in internal/api/privacy.go (that
 // classification is intentionally re-implemented here in SQL rather than
 // imported, since internal/storage must not depend on internal/api).
+//
+// LiveDegree/LiveInDegree/LiveOutDegree/LiveOnionPeerCount/
+// LiveClearnetPeerCount mirror the five fields above exactly, but each
+// additionally requires the peer node in question to have a non-null
+// public_key in the nodes table — i.e. to have actually been confirmed
+// by a successful probe, rather than merely gossiped about by some
+// other peer's GetPeers response. Unconfirmed "ghost" peer entries are a
+// known issue with Tari's gossip protocol propagating stale/dead
+// addresses (a real production node was observed with 539 total peers
+// but only 61 confirmed), so these Live* counts give a more meaningful
+// picture of a node's actual live connectivity alongside the raw totals.
 func (s *pgStore) TopPeeredNodes(ctx context.Context, since time.Time, limit int) ([]NodeDegree, error) {
 	if limit <= 0 {
 		limit = 20
@@ -1119,16 +1130,88 @@ func (s *pgStore) TopPeeredNodes(ctx context.Context, since time.Time, limit int
 				  )
 			)
 			GROUP BY u.node_id
+		),
+		live_degrees AS (
+			SELECT u.node_id, count(DISTINCT u.other_node_id) AS live_degree
+			FROM undirected u
+			WHERE EXISTS (
+				SELECT 1 FROM nodes n2
+				WHERE n2.id = u.other_node_id AND n2.public_key IS NOT NULL
+			)
+			GROUP BY u.node_id
+		),
+		live_in_degrees AS (
+			SELECT peo.to_node_id AS node_id, count(DISTINCT peo.from_node_id) AS live_in_degree
+			FROM peer_edge_observations peo
+			WHERE peo.observed_at >= $1
+			  AND EXISTS (
+				SELECT 1 FROM nodes n2
+				WHERE n2.id = peo.from_node_id AND n2.public_key IS NOT NULL
+			  )
+			GROUP BY peo.to_node_id
+		),
+		live_out_degrees AS (
+			SELECT peo.from_node_id AS node_id, count(DISTINCT peo.to_node_id) AS live_out_degree
+			FROM peer_edge_observations peo
+			WHERE peo.observed_at >= $1
+			  AND EXISTS (
+				SELECT 1 FROM nodes n2
+				WHERE n2.id = peo.to_node_id AND n2.public_key IS NOT NULL
+			  )
+			GROUP BY peo.from_node_id
+		),
+		live_onion_peer_counts AS (
+			SELECT u.node_id, count(DISTINCT u.other_node_id) AS live_onion_peer_count
+			FROM undirected u
+			WHERE EXISTS (
+				SELECT 1 FROM node_addresses na
+				WHERE na.node_id = u.other_node_id
+				  AND na.address ILIKE '%.onion%'
+			)
+			AND EXISTS (
+				SELECT 1 FROM nodes n2
+				WHERE n2.id = u.other_node_id AND n2.public_key IS NOT NULL
+			)
+			GROUP BY u.node_id
+		),
+		live_clearnet_peer_counts AS (
+			SELECT u.node_id, count(DISTINCT u.other_node_id) AS live_clearnet_peer_count
+			FROM undirected u
+			WHERE EXISTS (
+				SELECT 1 FROM node_addresses na
+				WHERE na.node_id = u.other_node_id
+				  AND na.address NOT ILIKE '%.onion%'
+				  AND (
+					-- host:port with an IPv4 dotted-quad host.
+					na.address ~ '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}:[0-9]+$'
+					-- [host]:port with a bracketed IPv6 host (the
+					-- textual form net.JoinHostPort/net.SplitHostPort
+					-- use, matching classifyAddress's Go-side handling).
+					OR na.address ~ '^\[[0-9a-fA-F:]+\]:[0-9]+$'
+				  )
+			)
+			AND EXISTS (
+				SELECT 1 FROM nodes n2
+				WHERE n2.id = u.other_node_id AND n2.public_key IS NOT NULL
+			)
+			GROUP BY u.node_id
 		)
 		SELECT n.id, n.address, d.degree,
 			COALESCE(ind.in_degree, 0), COALESCE(outd.out_degree, 0),
-			COALESCE(opc.onion_peer_count, 0), COALESCE(cpc.clearnet_peer_count, 0)
+			COALESCE(opc.onion_peer_count, 0), COALESCE(cpc.clearnet_peer_count, 0),
+			COALESCE(ld.live_degree, 0), COALESCE(lind.live_in_degree, 0), COALESCE(loutd.live_out_degree, 0),
+			COALESCE(lopc.live_onion_peer_count, 0), COALESCE(lcpc.live_clearnet_peer_count, 0)
 		FROM degrees d
 		JOIN nodes n ON n.id = d.node_id
 		LEFT JOIN in_degrees ind ON ind.node_id = d.node_id
 		LEFT JOIN out_degrees outd ON outd.node_id = d.node_id
 		LEFT JOIN onion_peer_counts opc ON opc.node_id = d.node_id
 		LEFT JOIN clearnet_peer_counts cpc ON cpc.node_id = d.node_id
+		LEFT JOIN live_degrees ld ON ld.node_id = d.node_id
+		LEFT JOIN live_in_degrees lind ON lind.node_id = d.node_id
+		LEFT JOIN live_out_degrees loutd ON loutd.node_id = d.node_id
+		LEFT JOIN live_onion_peer_counts lopc ON lopc.node_id = d.node_id
+		LEFT JOIN live_clearnet_peer_counts lcpc ON lcpc.node_id = d.node_id
 		ORDER BY d.degree DESC
 		LIMIT $2
 	`, since, limit)
@@ -1143,6 +1226,8 @@ func (s *pgStore) TopPeeredNodes(ctx context.Context, since time.Time, limit int
 		if err := rows.Scan(
 			&nd.NodeID, &nd.Address, &nd.Degree, &nd.InDegree, &nd.OutDegree,
 			&nd.OnionPeerCount, &nd.ClearnetPeerCount,
+			&nd.LiveDegree, &nd.LiveInDegree, &nd.LiveOutDegree,
+			&nd.LiveOnionPeerCount, &nd.LiveClearnetPeerCount,
 		); err != nil {
 			return nil, fmt.Errorf("storage: scan node degree: %w", err)
 		}

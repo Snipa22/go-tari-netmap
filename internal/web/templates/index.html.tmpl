@@ -74,10 +74,15 @@
             <th>Capabilities</th>
             <th>Address</th>
             <th>Degree</th>
+            <th>Degree (live)</th>
             <th>In</th>
+            <th>In (live)</th>
             <th>Out</th>
+            <th>Out (live)</th>
             <th>Onion peers</th>
+            <th>Onion peers (live)</th>
             <th>Clearnet peers</th>
+            <th>Clearnet peers (live)</th>
           </tr>
         </thead>
         <tbody>
@@ -101,18 +106,23 @@
             </td>
             <td>
               {{if .PublicAddresses}}
-              {{range .PublicAddresses}}<span class="public-address">{{.}}</span><br>{{end}}
+              {{range .PublicAddresses}}<span class="public-address" title="{{.}}">{{truncateAddress . 16}}</span><br>{{end}}
               <span class="badge badge-registry">opted-in</span>
               {{end}}
             </td>
             <td>{{.Degree}}</td>
+            <td>{{.LiveDegree}}</td>
             <td>{{.InDegree}}</td>
+            <td>{{.LiveInDegree}}</td>
             <td>{{.OutDegree}}</td>
+            <td>{{.LiveOutDegree}}</td>
             <td>{{.OnionPeerCount}}</td>
+            <td>{{.LiveOnionPeerCount}}</td>
             <td>{{.ClearnetPeerCount}}</td>
+            <td>{{.LiveClearnetPeerCount}}</td>
           </tr>
           {{else}}
-          <tr><td colspan="8" class="empty-note">No peer connections observed in the last hour.</td></tr>
+          <tr><td colspan="13" class="empty-note">No peer connections observed in the last hour.</td></tr>
           {{end}}
         </tbody>
       </table>
