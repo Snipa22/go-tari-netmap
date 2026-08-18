@@ -177,6 +177,9 @@ func TestDashboardTopPeeredIdentityIsLink(t *testing.T) {
 	if !strings.Contains(body, fmt.Sprintf(`href="/nodes/%s"`, hub.ID)) {
 		t.Errorf("GET / body missing top-peered identity link for hub node %s", hub.ID)
 	}
+	if !strings.Contains(body, "(last 1h)") {
+		t.Errorf("GET / body missing top-peered window label %q", "(last 1h)")
+	}
 }
 
 // TestNodeDetailHidesP2PAddress asserts GET /nodes/{id} returns 200 and
