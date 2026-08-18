@@ -18,7 +18,9 @@
 
   <main class="topology-main">
     <p class="tagline">
-      Peer topology graph. Node labels show a truncated, non-identifying
+      Peer topology graph. Only the top-peered CONFIRMED nodes are shown
+      on load — click a node to reveal its known peers, including
+      unconfirmed ones. Node labels show a truncated, non-identifying
       pubkey prefix (or "unconfirmed") — never a real address, even for
       nodes that have opted in to showing an address on the dashboard.
     </p>
@@ -36,11 +38,10 @@
   <script>
     (function () {
       // Privacy note: this page NEVER renders a node's `address` field,
-      // even when GET /api/topology's already-scrubbed response includes
-      // one for an opted-in (registry_submitted) node — the dashboard
-      // table is the place for that. This graph is about topology shape
-      // and capability only, so `address` is intentionally never read
-      // below.
+      // even when the API's already-scrubbed responses include one for
+      // an opted-in (registry_submitted) node — the dashboard table is
+      // the place for that. This graph is about topology shape and
+      // capability only, so `address` is intentionally never read below.
 
       var COLOR_ONION = '#b79bf0';
       var COLOR_CLEARNET = '#5aa9ff';
@@ -48,10 +49,14 @@
 
       // shortLabel derives a short, non-identifying display label for a
       // node from the JSON API's `public_key` field. Go's encoding/json
-      // encodes a []byte (PublicNode.PublicKey) as a base64 string, and
-      // omits the field entirely (via `omitempty`) when the node has no
-      // confirmed pubkey yet — so publicKeyB64 is undefined/null/absent
-      // for unconfirmed placeholder nodes, not just an empty string.
+      // encodes a []byte (PublicNode.PublicKey, and equally
+      // PublicNodeDegree.PublicKey) as a base64 string, and omits the
+      // field entirely (via `omitempty`) when the node has no confirmed
+      // pubkey yet — so publicKeyB64 is undefined/null/absent for
+      // unconfirmed placeholder nodes, not just an empty string. Shared
+      // as-is between the initial top-peered render and the
+      // click-to-expand render below, since both API shapes use the
+      // same `public_key`/`has_onion` field names.
       function shortLabel(publicKeyB64) {
         if (!publicKeyB64) {
           return 'unconfirmed';
@@ -80,69 +85,155 @@
         return n.has_onion ? 'diamond' : 'dot';
       }
 
+      // visNode builds a vis-network node object from a node id and a
+      // node-shaped API object (either a PublicNodeDegree from the
+      // initial top-peered fetch or a PublicNode from a click-expand
+      // fetch — both carry `public_key`/`has_onion`, which is all
+      // shortLabel/nodeColor/nodeShape read).
+      function visNode(id, n) {
+        return {
+          id: id,
+          label: shortLabel(n.public_key),
+          title: n.public_key ? 'pubkey (base64, truncated above): ' + n.public_key : 'unconfirmed node',
+          color: nodeColor(n),
+          shape: nodeShape(n),
+        };
+      }
+
+      function visEdge(e) {
+        return {
+          id: e.id,
+          from: e.from_node_id,
+          to: e.to_node_id,
+          arrows: 'to',
+        };
+      }
+
       var statusEl = document.getElementById('graph-status');
 
-      fetch('/api/topology')
+      // renderedNodeIds/renderedEdgeIds track every node/edge id already
+      // added to the vis DataSets, across both the initial render and
+      // every subsequent click-expand — so expanding a node whose
+      // neighborhood substantially overlaps with what's already shown
+      // (the common case) never tries to `.add()` a duplicate id, which
+      // vis-network's DataSet throws on.
+      var renderedNodeIds = new Set();
+      var renderedEdgeIds = new Set();
+
+      var nodesDataSet = new vis.DataSet([]);
+      var edgesDataSet = new vis.DataSet([]);
+
+      var container = document.getElementById('graph');
+      var options = {
+        nodes: {
+          borderWidth: 1,
+          font: { color: '#e4e8ee' },
+        },
+        edges: {
+          color: { color: '#2a323f', highlight: '#5aa9ff' },
+          smooth: { type: 'continuous' },
+        },
+        physics: {
+          stabilization: true,
+        },
+        interaction: {
+          hover: true,
+        },
+      };
+      var network = new vis.Network(container, { nodes: nodesDataSet, edges: edgesDataSet }, options);
+
+      // expandNode fetches nodeId's known peer edges and neighbor nodes
+      // (GET /api/nodes/{id}/edges) and merges any not-yet-rendered ones
+      // into the graph in place — this is what powers click-to-expand.
+      // Neighbor nodes returned here legitimately include unconfirmed
+      // ones (no public_key), rendered with the existing unconfirmed
+      // styling; that's intentional, not a bug.
+      function expandNode(nodeId) {
+        statusEl.textContent = 'Loading neighbors\u2026';
+
+        fetch('/api/nodes/' + encodeURIComponent(nodeId) + '/edges?limit=50')
+          .then(function (resp) {
+            if (!resp.ok) {
+              throw new Error('GET /api/nodes/' + nodeId + '/edges: ' + resp.status);
+            }
+            return resp.json();
+          })
+          .then(function (payload) {
+            var newNodes = payload.nodes || [];
+            var newEdges = payload.edges || [];
+
+            newNodes.forEach(function (n) {
+              if (renderedNodeIds.has(n.id)) {
+                return;
+              }
+              nodesDataSet.add(visNode(n.id, n));
+              renderedNodeIds.add(n.id);
+            });
+
+            newEdges.forEach(function (e) {
+              if (renderedEdgeIds.has(e.id)) {
+                return;
+              }
+              // An edge can reference a node that isn't in `nodes` if
+              // it's the clicked node itself (already rendered) — vis
+              // only needs both endpoint ids to already exist in
+              // nodesDataSet, which they do by construction here.
+              edgesDataSet.add(visEdge(e));
+              renderedEdgeIds.add(e.id);
+            });
+
+            statusEl.textContent = '';
+          })
+          .catch(function (err) {
+            statusEl.textContent = 'Failed to expand node: ' + err;
+          });
+      }
+
+      // params.nodes is the array of clicked node ids (vis-network's
+      // real documented click event) — empty when the click landed on
+      // empty canvas or on an edge, not a node, so guard against that
+      // rather than trying to expand `undefined`.
+      network.on('click', function (params) {
+        if (!params.nodes || params.nodes.length === 0) {
+          return;
+        }
+        expandNode(params.nodes[0]);
+      });
+
+      statusEl.textContent = 'Loading top-peered nodes\u2026';
+
+      fetch('/api/topology/top-peered?since=1h&limit=25')
         .then(function (resp) {
           if (!resp.ok) {
-            throw new Error('GET /api/topology: ' + resp.status);
+            throw new Error('GET /api/topology/top-peered: ' + resp.status);
           }
           return resp.json();
         })
         .then(function (payload) {
-          var apiNodes = payload.nodes || [];
-          var apiEdges = payload.edges || [];
+          var degrees = payload || [];
 
-          if (apiNodes.length === 0) {
-            statusEl.textContent = 'No nodes known yet.';
+          // Initial render is confirmed-only: keep only entries with a
+          // truthy `public_key`, same falsy-check convention as
+          // shortLabel/nodeColor above. Unconfirmed nodes are only
+          // introduced later, via click-expand.
+          var confirmed = degrees.filter(function (d) {
+            return !!d.public_key;
+          });
+
+          if (confirmed.length === 0) {
+            statusEl.textContent = 'No confirmed top-peered nodes known yet.';
             return;
           }
+
+          confirmed.forEach(function (d) {
+            nodesDataSet.add(visNode(d.node_id, d));
+            renderedNodeIds.add(d.node_id);
+          });
+
           statusEl.textContent = '';
-
-          var visNodes = apiNodes.map(function (n) {
-            return {
-              id: n.id,
-              label: shortLabel(n.public_key),
-              title: n.public_key ? 'pubkey (base64, truncated above): ' + n.public_key : 'unconfirmed node',
-              color: nodeColor(n),
-              shape: nodeShape(n),
-            };
-          });
-
-          var visEdges = apiEdges.map(function (e) {
-            return {
-              id: e.id,
-              from: e.from_node_id,
-              to: e.to_node_id,
-              arrows: 'to',
-            };
-          });
-
-          var container = document.getElementById('graph');
-          var data = {
-            nodes: new vis.DataSet(visNodes),
-            edges: new vis.DataSet(visEdges),
-          };
-          var options = {
-            nodes: {
-              borderWidth: 1,
-              font: { color: '#e4e8ee' },
-            },
-            edges: {
-              color: { color: '#2a323f', highlight: '#5aa9ff' },
-              smooth: { type: 'continuous' },
-            },
-            physics: {
-              stabilization: true,
-            },
-            interaction: {
-              hover: true,
-            },
-          };
-          new vis.Network(container, data, options);
         })
         .catch(function (err) {
-          statusEl.textContent = 'Failed to load topology: ' + err;
+          statusEl.textContent = 'Failed to load top-peered nodes: ' + err;
         });
     })();
   </script>

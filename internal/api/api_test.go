@@ -421,6 +421,181 @@ func TestGetNodeHistory(t *testing.T) {
 	}
 }
 
+// TestGetNodeEdges seeds a center node with a p2p_discovered neighbor and
+// a registry_submitted neighbor, records real peer-edge observations
+// between them, and asserts GET /nodes/{id}/edges returns exactly that
+// neighborhood — mirroring TestScrubbingP2PVsRegistry's setup style so
+// scrubbing behavior is actually exercised, not just the neighbor/edge
+// set itself. The raw-body substring check for the p2p neighbor's
+// address is the single most important assertion here — see
+// TestScrubbingP2PVsRegistry's doc comment for why a decoded-struct-only
+// check wouldn't be sufficient.
+func TestGetNodeEdges(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
+
+	const centerAddr = "center:1"
+	const p2pAddr = "1.2.3.4:18142"
+	const registryAddr = "5.6.7.8:18142"
+
+	center, err := store.UpsertDiscoveredNode(ctx, centerAddr, storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert center: %v", err)
+	}
+	p2pNeighbor, err := store.UpsertDiscoveredNode(ctx, p2pAddr, storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert p2p neighbor: %v", err)
+	}
+	registryNeighbor, err := store.UpsertDiscoveredNode(ctx, registryAddr, storage.DiscoverySourceRegistry, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert registry neighbor: %v", err)
+	}
+	// A third node, not connected to center at all, must NOT show up in
+	// the response — asserts ListNodeEdges' WHERE clause (and this
+	// handler's neighbor-collection logic) doesn't over-broadly include
+	// unrelated nodes.
+	unrelated, err := store.UpsertDiscoveredNode(ctx, "unrelated:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert unrelated: %v", err)
+	}
+
+	if err := store.RecordPeerEdgeObservation(ctx, center.ID, p2pNeighbor.ID); err != nil {
+		t.Fatalf("record edge center->p2p: %v", err)
+	}
+	if err := store.RecordPeerEdgeObservation(ctx, registryNeighbor.ID, center.ID); err != nil {
+		t.Fatalf("record edge registry->center: %v", err)
+	}
+
+	resp, err := http.Get(fmt.Sprintf("%s/nodes/%s/edges", srv.URL, center.ID))
+	if err != nil {
+		t.Fatalf("GET /nodes/{id}/edges: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+
+	var got struct {
+		Nodes []api.PublicNode   `json:"nodes"`
+		Edges []storage.PeerEdge `json:"edges"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(got.Edges) != 2 {
+		t.Fatalf("len(edges) = %d, want 2:\n%s", len(got.Edges), body)
+	}
+	if len(got.Nodes) != 2 {
+		t.Fatalf("len(nodes) = %d, want 2:\n%s", len(got.Nodes), body)
+	}
+
+	gotNodeIDs := map[uuid.UUID]bool{}
+	for _, n := range got.Nodes {
+		gotNodeIDs[n.ID] = true
+	}
+	if !gotNodeIDs[p2pNeighbor.ID] {
+		t.Errorf("nodes missing p2p neighbor %v:\n%s", p2pNeighbor.ID, body)
+	}
+	if !gotNodeIDs[registryNeighbor.ID] {
+		t.Errorf("nodes missing registry neighbor %v:\n%s", registryNeighbor.ID, body)
+	}
+	if gotNodeIDs[unrelated.ID] {
+		t.Errorf("nodes unexpectedly contains unrelated node %v:\n%s", unrelated.ID, body)
+	}
+	if gotNodeIDs[center.ID] {
+		t.Errorf("nodes unexpectedly contains the center node itself %v:\n%s", center.ID, body)
+	}
+
+	// Privacy: the p2p neighbor's real address must never appear in the
+	// raw response body, but the registry neighbor's (opted-in) address
+	// must.
+	rawBody := string(body)
+	if strings.Contains(rawBody, p2pAddr) {
+		t.Errorf("GET /nodes/%s/edges body contains p2p neighbor's address %q:\n%s", center.ID, p2pAddr, rawBody)
+	}
+	if !strings.Contains(rawBody, registryAddr) {
+		t.Errorf("GET /nodes/%s/edges body missing registry neighbor's address %q:\n%s", center.ID, registryAddr, rawBody)
+	}
+}
+
+// TestGetNodeEdgesEmpty asserts a node with zero real edges (or an id
+// that doesn't correspond to any node at all) gets a 200 with empty
+// nodes/edges slices, not a 404 — matching ListNodeEdges' own
+// "empty, not an error" semantics rather than inventing a 404 path that
+// doesn't match how the store method actually behaves.
+func TestGetNodeEdgesEmpty(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
+
+	lonely, err := store.UpsertDiscoveredNode(ctx, "lonely:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert lonely: %v", err)
+	}
+
+	resp, err := http.Get(fmt.Sprintf("%s/nodes/%s/edges", srv.URL, lonely.ID))
+	if err != nil {
+		t.Fatalf("GET /nodes/{id}/edges: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	var got struct {
+		Nodes []api.PublicNode   `json:"nodes"`
+		Edges []storage.PeerEdge `json:"edges"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got.Nodes) != 0 {
+		t.Errorf("len(nodes) = %d, want 0", len(got.Nodes))
+	}
+	if len(got.Edges) != 0 {
+		t.Errorf("len(edges) = %d, want 0", len(got.Edges))
+	}
+
+	// A node id with no corresponding node at all behaves the same way
+	// (empty, not 404) — ListNodeEdges doesn't error on zero matching
+	// rows regardless of whether the id belongs to a real node.
+	unknownResp, err := http.Get(fmt.Sprintf("%s/nodes/%s/edges", srv.URL, uuid.New()))
+	if err != nil {
+		t.Fatalf("GET /nodes/{unknown}/edges: %v", err)
+	}
+	defer unknownResp.Body.Close()
+	if unknownResp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", unknownResp.StatusCode, http.StatusOK)
+	}
+}
+
+// TestGetNodeEdgesInvalidLimit asserts `?limit=` on GET /nodes/{id}/edges
+// rejects non-positive/non-numeric values with 400, mirroring
+// handleGetNodeHistory's identical limit-parsing/validation pattern.
+func TestGetNodeEdgesInvalidLimit(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
+
+	node, err := store.UpsertDiscoveredNode(ctx, "a:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	for _, v := range []string{"0", "-1", "not-a-number"} {
+		resp, err := http.Get(fmt.Sprintf("%s/nodes/%s/edges?limit=%s", srv.URL, node.ID, v))
+		if err != nil {
+			t.Fatalf("GET /nodes/{id}/edges?limit=%s: %v", v, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("limit=%s: status = %d, want %d", v, resp.StatusCode, http.StatusBadRequest)
+		}
+	}
+}
+
 func TestTopology(t *testing.T) {
 	srv, store := newTestServer(t, nil)
 	ctx := context.Background()
