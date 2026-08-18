@@ -133,14 +133,29 @@ type PeerEdge struct {
 // NodeDegree is one row of a TopPeeredNodes result: a node and how many
 // distinct other nodes it has an observed peer-edge with (in either
 // direction) within the queried time window.
+//
+// The Live* fields (LiveDegree, LiveInDegree, LiveOutDegree,
+// LiveOnionPeerCount, LiveClearnetPeerCount) are the confirmed-node
+// subset of their corresponding raw totals above: only peers with a
+// non-null public_key (i.e. actually confirmed via a successful probe,
+// not just gossiped about) count toward them. This distinction exists
+// because Tari's gossip protocol propagates stale/dead peer addresses —
+// a real production node was observed with 539 total peers but only 61
+// (11%) confirmed — so the raw totals alone can grossly overstate a
+// node's actual live connectivity.
 type NodeDegree struct {
-	NodeID            uuid.UUID `json:"node_id"`
-	Address           string    `json:"address"`
-	Degree            int       `json:"degree"`
-	InDegree          int       `json:"in_degree"`
-	OutDegree         int       `json:"out_degree"`
-	OnionPeerCount    int       `json:"onion_peer_count"`
-	ClearnetPeerCount int       `json:"clearnet_peer_count"`
+	NodeID                uuid.UUID `json:"node_id"`
+	Address               string    `json:"address"`
+	Degree                int       `json:"degree"`
+	InDegree              int       `json:"in_degree"`
+	OutDegree             int       `json:"out_degree"`
+	OnionPeerCount        int       `json:"onion_peer_count"`
+	ClearnetPeerCount     int       `json:"clearnet_peer_count"`
+	LiveDegree            int       `json:"live_degree"`
+	LiveInDegree          int       `json:"live_in_degree"`
+	LiveOutDegree         int       `json:"live_out_degree"`
+	LiveOnionPeerCount    int       `json:"live_onion_peer_count"`
+	LiveClearnetPeerCount int       `json:"live_clearnet_peer_count"`
 }
 
 // SeedCandidate is one node that qualifies as a suggested Tari seed node:

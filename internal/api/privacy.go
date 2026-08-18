@@ -46,17 +46,22 @@ type PublicNode struct {
 // Address field, so it needs the same treatment as PublicNode rather than
 // being returned as-is.
 type PublicNodeDegree struct {
-	NodeID            uuid.UUID `json:"node_id"`
-	PublicKey         []byte    `json:"public_key,omitempty"`
-	HasIPv4           bool      `json:"has_ipv4"`
-	HasIPv6           bool      `json:"has_ipv6"`
-	HasOnion          bool      `json:"has_onion"`
-	Addresses         []string  `json:"addresses,omitempty"`
-	Degree            int       `json:"degree"`
-	InDegree          int       `json:"in_degree"`
-	OutDegree         int       `json:"out_degree"`
-	OnionPeerCount    int       `json:"onion_peer_count"`
-	ClearnetPeerCount int       `json:"clearnet_peer_count"`
+	NodeID                uuid.UUID `json:"node_id"`
+	PublicKey             []byte    `json:"public_key,omitempty"`
+	HasIPv4               bool      `json:"has_ipv4"`
+	HasIPv6               bool      `json:"has_ipv6"`
+	HasOnion              bool      `json:"has_onion"`
+	Addresses             []string  `json:"addresses,omitempty"`
+	Degree                int       `json:"degree"`
+	InDegree              int       `json:"in_degree"`
+	OutDegree             int       `json:"out_degree"`
+	OnionPeerCount        int       `json:"onion_peer_count"`
+	ClearnetPeerCount     int       `json:"clearnet_peer_count"`
+	LiveDegree            int       `json:"live_degree"`
+	LiveInDegree          int       `json:"live_in_degree"`
+	LiveOutDegree         int       `json:"live_out_degree"`
+	LiveOnionPeerCount    int       `json:"live_onion_peer_count"`
+	LiveClearnetPeerCount int       `json:"live_clearnet_peer_count"`
 }
 
 // addrKind classifies the host portion of an address string for the
@@ -168,16 +173,21 @@ func ScrubNodeDegree(ctx context.Context, store storage.Store, nd storage.NodeDe
 
 	pn := ScrubNode(n, addrs)
 	return PublicNodeDegree{
-		NodeID:            nd.NodeID,
-		PublicKey:         pn.PublicKey,
-		HasIPv4:           pn.HasIPv4,
-		HasIPv6:           pn.HasIPv6,
-		HasOnion:          pn.HasOnion,
-		Addresses:         pn.Addresses,
-		Degree:            nd.Degree,
-		InDegree:          nd.InDegree,
-		OutDegree:         nd.OutDegree,
-		OnionPeerCount:    nd.OnionPeerCount,
-		ClearnetPeerCount: nd.ClearnetPeerCount,
+		NodeID:                nd.NodeID,
+		PublicKey:             pn.PublicKey,
+		HasIPv4:               pn.HasIPv4,
+		HasIPv6:               pn.HasIPv6,
+		HasOnion:              pn.HasOnion,
+		Addresses:             pn.Addresses,
+		Degree:                nd.Degree,
+		InDegree:              nd.InDegree,
+		OutDegree:             nd.OutDegree,
+		OnionPeerCount:        nd.OnionPeerCount,
+		ClearnetPeerCount:     nd.ClearnetPeerCount,
+		LiveDegree:            nd.LiveDegree,
+		LiveInDegree:          nd.LiveInDegree,
+		LiveOutDegree:         nd.LiveOutDegree,
+		LiveOnionPeerCount:    nd.LiveOnionPeerCount,
+		LiveClearnetPeerCount: nd.LiveClearnetPeerCount,
 	}, nil
 }
