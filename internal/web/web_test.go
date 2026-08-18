@@ -2,6 +2,7 @@ package web_test
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -146,6 +147,35 @@ func TestDashboardHidesP2PAddress(t *testing.T) {
 	}
 	if !strings.Contains(body, "unconfirmed") {
 		t.Errorf("GET / body missing an unconfirmed badge for the placeholder node")
+	}
+}
+
+// TestDashboardTopPeeredIdentityIsLink asserts the dashboard's "top
+// peered" panel renders each row's identity cell as a link to
+// /nodes/{id}, matching the main Nodes table below it.
+func TestDashboardTopPeeredIdentityIsLink(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	hub, err := store.UpsertDiscoveredNode(ctx, "hub:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert hub: %v", err)
+	}
+	leaf, err := store.UpsertDiscoveredNode(ctx, "leaf:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert leaf: %v", err)
+	}
+	if err := store.RecordPeerEdgeObservation(ctx, hub.ID, leaf.ID); err != nil {
+		t.Fatalf("record edge observation: %v", err)
+	}
+
+	srv := newTestServer(t, store)
+	status, body := getBody(t, srv.URL+"/")
+	if status != http.StatusOK {
+		t.Fatalf("GET / status = %d, want %d", status, http.StatusOK)
+	}
+	if !strings.Contains(body, fmt.Sprintf(`href="/nodes/%s"`, hub.ID)) {
+		t.Errorf("GET / body missing top-peered identity link for hub node %s", hub.ID)
 	}
 }
 

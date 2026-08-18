@@ -117,6 +117,7 @@ type dashboardNodeRow struct {
 // privacy-scrubbed identity plus its connectivity stats from
 // storage.TopPeeredNodes.
 type topPeeredRow struct {
+	ID            uuid.UUID
 	Identity      identity
 	Capabilities  capabilities
 	PublicAddress *string
@@ -276,6 +277,7 @@ func handleDashboard(tmpl *template.Template, store storage.Store) http.HandlerF
 			}
 			view := scrubForDisplay(n, addrs)
 			data.TopPeered = append(data.TopPeered, topPeeredRow{
+				ID:            nd.NodeID,
 				Identity:      view.Identity,
 				Capabilities:  view.Capabilities,
 				PublicAddress: view.PublicAddress,
