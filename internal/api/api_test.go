@@ -990,6 +990,184 @@ func TestCreateNodeInvalidSubmissionLockout(t *testing.T) {
 	}
 }
 
+// TestPollNowCreatesNewNode asserts POST /nodes/poll-now against a
+// brand-new host:port creates exactly one node, synchronously probes it,
+// and returns the resulting node state (pubkey confirmed) in the
+// response body.
+func TestPollNowCreatesNewNode(t *testing.T) {
+	const addr = "203.0.113.20:18142"
+	pubkey := []byte{1, 2, 3, 4}
+	client := &fakeClient{info: map[string]collector.NodeInfo{
+		addr: {Reachable: true, PublicKey: pubkey},
+	}}
+	srv, store := newTestServer(t, client)
+	ctx := context.Background()
+
+	body := `{"host":"203.0.113.20","port":18142}`
+	resp, err := http.Post(srv.URL+"/nodes/poll-now", "application/json", bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatalf("POST /nodes/poll-now: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, http.StatusOK, respBody)
+	}
+
+	var got struct {
+		Node  storage.Node `json:"node"`
+		Error string       `json:"error,omitempty"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Error != "" {
+		t.Errorf("error = %q, want empty", got.Error)
+	}
+	if got.Node.Address != addr {
+		t.Errorf("node.address = %q, want %q", got.Node.Address, addr)
+	}
+	if len(got.Node.PublicKey) == 0 {
+		t.Errorf("node.public_key = %v, want the confirmed pubkey", got.Node.PublicKey)
+	}
+
+	nodes, err := store.ListNodes(ctx, storage.NodeFilter{})
+	if err != nil {
+		t.Fatalf("list nodes: %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("len(nodes) = %d, want 1", len(nodes))
+	}
+	if nodes[0].Address != addr {
+		t.Errorf("nodes[0].address = %q, want %q", nodes[0].Address, addr)
+	}
+}
+
+// TestPollNowReusesExistingNode asserts POST /nodes/poll-now against an
+// already-known address reuses the existing node row (same ID) rather
+// than creating a duplicate.
+func TestPollNowReusesExistingNode(t *testing.T) {
+	const addr = "203.0.113.21:18142"
+	client := &fakeClient{info: map[string]collector.NodeInfo{
+		addr: {Reachable: true},
+	}}
+	srv, store := newTestServer(t, client)
+	ctx := context.Background()
+
+	existing, err := store.UpsertDiscoveredNode(ctx, addr, storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert existing node: %v", err)
+	}
+
+	before, err := store.ListNodes(ctx, storage.NodeFilter{})
+	if err != nil {
+		t.Fatalf("list nodes before: %v", err)
+	}
+
+	body := fmt.Sprintf(`{"host":"203.0.113.21","port":18142}`)
+	resp, err := http.Post(srv.URL+"/nodes/poll-now", "application/json", bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatalf("POST /nodes/poll-now: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, http.StatusOK, respBody)
+	}
+
+	var got struct {
+		Node storage.Node `json:"node"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Node.ID != existing.ID {
+		t.Errorf("node.id = %v, want existing node's id %v (must reuse, not duplicate)", got.Node.ID, existing.ID)
+	}
+
+	after, err := store.ListNodes(ctx, storage.NodeFilter{})
+	if err != nil {
+		t.Fatalf("list nodes after: %v", err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("len(nodes) = %d, want unchanged %d (no duplicate row created)", len(after), len(before))
+	}
+}
+
+// TestPollNowSkipsSSRFValidation asserts POST /nodes/poll-now does NOT
+// apply the SSRF/private-IP validation that POST /nodes does — it must
+// accept a private-IP host and probe it (200, even when the probe
+// itself fails/is unreachable), in contrast to POST /nodes rejecting the
+// exact same host with a 400 and the SSRF error message.
+func TestPollNowSkipsSSRFValidation(t *testing.T) {
+	srv, _ := newTestServer(t, nil) // no fixture for this address -> GetInfo fails -> unreachable
+
+	body := `{"host":"127.0.0.1","port":18142}`
+
+	// Contrast: POST /nodes rejects this exact host with the SSRF
+	// message.
+	createResp, err := http.Post(srv.URL+"/nodes", "application/json", bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatalf("POST /nodes: %v", err)
+	}
+	defer createResp.Body.Close()
+	createBody, _ := io.ReadAll(createResp.Body)
+	if createResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("POST /nodes status = %d, want %d", createResp.StatusCode, http.StatusBadRequest)
+	}
+	if !strings.Contains(string(createBody), "private/reserved IP addresses are not allowed") {
+		t.Errorf("POST /nodes body missing SSRF rejection message: %s", createBody)
+	}
+
+	// POST /nodes/poll-now must accept the same host.
+	pollResp, err := http.Post(srv.URL+"/nodes/poll-now", "application/json", bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatalf("POST /nodes/poll-now: %v", err)
+	}
+	defer pollResp.Body.Close()
+	pollBody, _ := io.ReadAll(pollResp.Body)
+	if pollResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /nodes/poll-now status = %d, want %d (body: %s)", pollResp.StatusCode, http.StatusOK, pollBody)
+	}
+	if strings.Contains(string(pollBody), "private/reserved IP addresses are not allowed") {
+		t.Errorf("POST /nodes/poll-now body unexpectedly contains SSRF rejection message: %s", pollBody)
+	}
+}
+
+// TestPollNowInvalid asserts empty-host and out-of-range-port requests
+// are rejected with 400 and the same error message text as
+// handleCreateNode's equivalent checks.
+func TestPollNowInvalid(t *testing.T) {
+	srv, _ := newTestServer(t, nil)
+
+	cases := []struct {
+		name    string
+		body    string
+		wantMsg string
+	}{
+		{"missing host", `{"port":18142}`, "host is required"},
+		{"port too small", `{"host":"1.2.3.4","port":0}`, "port must be between 1 and 65535"},
+		{"port too large", `{"host":"1.2.3.4","port":65536}`, "port must be between 1 and 65535"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := http.Post(srv.URL+"/nodes/poll-now", "application/json", bytes.NewBufferString(tc.body))
+			if err != nil {
+				t.Fatalf("POST /nodes/poll-now: %v", err)
+			}
+			defer resp.Body.Close()
+			respBody, _ := io.ReadAll(resp.Body)
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, http.StatusBadRequest, respBody)
+			}
+			if !strings.Contains(string(respBody), tc.wantMsg) {
+				t.Errorf("body = %s, want it to contain %q", respBody, tc.wantMsg)
+			}
+		})
+	}
+}
+
 // TestCreateNodeQueueCap asserts that once the pending-submission queue
 // reaches api.MaxPendingSubmissions, further submissions are rejected
 // with 503 rather than growing the queue further. MaxPendingSubmissions
