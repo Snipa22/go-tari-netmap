@@ -150,6 +150,19 @@ type Store interface {
 	// (nil, 0, nil) if no health checks with a non-nil height exist yet.
 	NetworkHeight(ctx context.Context) (*int64, int, error)
 
+	// ListSeedCandidates returns nodes that are BOTH opted-in
+	// (discovery_source IN ('registry_submitted', 'both')) AND have at
+	// least one reachable=true node_health row at or after
+	// (now() - since). This is the monero.fail-style "suggested seed
+	// node" gate: opt-in alone is not enough, the node must also be
+	// currently/recently healthy. A single SQL query (no N+1 loop)
+	// joins nodes, a recency-filtered EXISTS against node_health, and
+	// node_addresses. Nodes with a NULL public_key are excluded (a
+	// peer_seeds line requires a real pubkey; a placeholder node
+	// discovered by address alone can't produce one). Returns a
+	// non-nil, empty slice (never nil) when nothing qualifies.
+	ListSeedCandidates(ctx context.Context, since time.Duration) ([]SeedCandidate, error)
+
 	// IsAddressPubliclyOptedIn reports whether address already belongs
 	// to a node whose discovery_source is registry_submitted or both —
 	// i.e. an address whose owner has already opted in to public
@@ -198,6 +211,20 @@ type Store interface {
 	// queue size (abuse-mitigation: prevents unbounded growth from spam).
 	CountPendingSubmissions(ctx context.Context) (int, error)
 }
+
+// DefaultSeedHealthWindow is the default "currently healthy" recency
+// window ListSeedCandidates (and the API endpoints built on it, see
+// internal/api's handleListSeedCandidates/handleConfigPeerSeeds) use to
+// decide whether an opted-in node counts as a suggested seed node. This
+// project's poll cadence for a regular node is PollIntervalGeneric = 2h
+// (see internal/collector/collector.go) — a node that's simply due for
+// its next scheduled poll, not actually unreachable, could otherwise go
+// up to ~2h without a fresh node_health row. 3h gives one full poll
+// cycle of slack (survives a single missed/delayed poll) while staying
+// tight enough that a node that's actually been down for anywhere close
+// to a day is correctly excluded: a real "reachable right now" signal,
+// not stale data.
+const DefaultSeedHealthWindow = 3 * time.Hour
 
 // ErrNotFound is returned by GetNode when no node with the given ID exists.
 var ErrNotFound = fmt.Errorf("storage: not found")
@@ -1178,6 +1205,61 @@ func (s *pgStore) NetworkHeight(ctx context.Context) (*int64, int, error) {
 		return nil, 0, fmt.Errorf("storage: network height: %w", err)
 	}
 	return &height, count, nil
+}
+
+// ListSeedCandidates returns nodes that are BOTH opted-in
+// (discovery_source IN ('registry_submitted', 'both')) AND have at least
+// one reachable=true node_health row at or after (now() - since). This
+// is a single query, not N+1: it filters nodes by discovery_source and
+// a non-null public_key, gates on a recency-filtered EXISTS against
+// node_health (passing a computed time.Time cutoff, the same
+// `time.Now().Add(-since)` convention TopPeeredNodes already uses for
+// its own `since` parameter, rather than a raw interval), INNER JOINs
+// node_addresses (a confirmed node — public_key IS NOT NULL — always
+// has at least one node_addresses row, since every path that sets
+// public_key also calls ensureNodeAddress), and aggregates every known
+// address per node with array_agg + GROUP BY, ordered by node id for
+// stable output. Nodes with a NULL public_key are excluded entirely: a
+// peer_seeds line requires a real pubkey, and a placeholder node
+// discovered by address alone can't produce one.
+func (s *pgStore) ListSeedCandidates(ctx context.Context, since time.Duration) ([]SeedCandidate, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT n.id, n.public_key, n.label, n.tags,
+			array_agg(na.address ORDER BY na.first_seen) AS addresses
+		FROM nodes n
+		JOIN node_addresses na ON na.node_id = n.id
+		WHERE n.discovery_source IN ('registry_submitted', 'both')
+		  AND n.public_key IS NOT NULL
+		  AND EXISTS (
+		      SELECT 1 FROM node_health h
+		      WHERE h.node_id = n.id AND h.reachable AND h.ts >= $1
+		  )
+		GROUP BY n.id, n.public_key, n.label, n.tags
+		ORDER BY n.id
+	`, time.Now().Add(-since))
+	if err != nil {
+		return nil, fmt.Errorf("storage: list seed candidates: %w", err)
+	}
+	defer rows.Close()
+
+	out := []SeedCandidate{}
+	for rows.Next() {
+		var c SeedCandidate
+		var tagsOut []byte
+		if err := rows.Scan(&c.NodeID, &c.PublicKey, &c.Label, &tagsOut, &c.Addresses); err != nil {
+			return nil, fmt.Errorf("storage: scan seed candidate: %w", err)
+		}
+		if len(tagsOut) > 0 {
+			if err := json.Unmarshal(tagsOut, &c.Tags); err != nil {
+				return nil, fmt.Errorf("storage: unmarshal seed candidate tags: %w", err)
+			}
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage: list seed candidates: %w", err)
+	}
+	return out, nil
 }
 
 // pendingSubmissionColumns is the column list, in order, matching

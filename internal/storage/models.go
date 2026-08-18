@@ -132,6 +132,21 @@ type NodeDegree struct {
 	ClearnetPeerCount int       `json:"clearnet_peer_count"`
 }
 
+// SeedCandidate is one node that qualifies as a suggested Tari seed node:
+// opted into public disclosure via the registry (DiscoverySource
+// registry_submitted or both) AND observed reachable=true in node_health
+// within the queried `since` window. PublicKey and Addresses are the
+// minimum needed to build one or more Tari config.toml peer_seeds lines
+// (one line per address, same pubkey). See Store.ListSeedCandidates for
+// the exact gating logic.
+type SeedCandidate struct {
+	NodeID    uuid.UUID
+	PublicKey []byte
+	Label     *string
+	Tags      map[string]any
+	Addresses []string
+}
+
 // HealthCheck is one recorded health-check result for a node.
 type HealthCheck struct {
 	ID             uuid.UUID   `json:"id"`

@@ -4,12 +4,14 @@ package api
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -72,6 +74,16 @@ func NewRouter(store storage.Store, grpcClient, p2pClient collector.NodeClient, 
 	mux.HandleFunc("GET /nodes/{id}/edges", handleGetNodeEdges(store))
 	mux.HandleFunc("GET /topology", handleTopology(store))
 	mux.HandleFunc("GET /topology/top-peered", handleTopPeeredNodes(store))
+
+	// Seed-node suggestion + Tari config.toml peer_seeds generator. Same
+	// trust level as the other read routes above (GET /nodes, GET
+	// /topology) — deliberately NOT under /admin. These are opted-in,
+	// health-verified nodes, so — unlike every other node-returning
+	// route in this file — they are NOT run through ScrubNode/PublicNode
+	// (see handleListSeedCandidates' doc comment for why real addresses
+	// are the entire point here).
+	mux.HandleFunc("GET /nodes/seeds", handleListSeedCandidates(store))
+	mux.HandleFunc("GET /config/peer-seeds", handleConfigPeerSeeds(store))
 
 	// Every /admin/* route — the submission review queue (list/approve/
 	// reject) and the poll-now admin tool — is registered on its own
@@ -860,6 +872,165 @@ func handleTopPeeredNodes(store storage.Store) http.HandlerFunc {
 			public[i] = pd
 		}
 		writeJSON(w, http.StatusOK, public)
+	}
+}
+
+// PublicSeedCandidate is the public-facing DTO for a storage.SeedCandidate,
+// returned by GET /nodes/seeds and used internally by GET
+// /config/peer-seeds. PublicKey is hex-encoded explicitly
+// (hex.EncodeToString), NOT left to Go's default []byte JSON marshaling
+// (which would base64-encode it) — this endpoint exists specifically to
+// feed a config generator that needs the hex format Tari's real
+// config.toml peer_seeds lines actually use. This is deliberately
+// different from other []byte fields elsewhere in this codebase (e.g.
+// PublicNode.PublicKey), which may use Go's default base64 marshaling
+// for a different reason — do not "fix" those to match this one, and do
+// not change this one to match those.
+type PublicSeedCandidate struct {
+	NodeID    uuid.UUID `json:"node_id"`
+	PublicKey string    `json:"public_key"`
+	Label     *string   `json:"label,omitempty"`
+	Addresses []string  `json:"addresses"`
+}
+
+// listSeedCandidatesResponse is the GET /nodes/seeds response body: the
+// candidate list plus the actual `since` window applied (helpful for a
+// caller that didn't pass an explicit `?since=` and wants to know what
+// default was used).
+type listSeedCandidatesResponse struct {
+	Candidates []PublicSeedCandidate `json:"candidates"`
+	Since      string                `json:"since"`
+}
+
+// parseSeedSinceParam parses the optional `?since=` duration override
+// shared by GET /nodes/seeds and GET /config/peer-seeds, defaulting to
+// storage.DefaultSeedHealthWindow — same time.ParseDuration
+// validation/error convention as handleTopPeeredNodes' `?since=`
+// handling above.
+func parseSeedSinceParam(r *http.Request) (time.Duration, error) {
+	since := storage.DefaultSeedHealthWindow
+	if v := r.URL.Query().Get("since"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return 0, errors.New("invalid since")
+		}
+		since = d
+	}
+	return since, nil
+}
+
+// handleListSeedCandidates returns the JSON list of suggested Tari seed
+// nodes: opted-in (registry_submitted/both) AND recently reachable (see
+// storage.Store.ListSeedCandidates' doc comment for the exact gate).
+// Deliberately does NOT run results through ScrubNode/PublicNode's
+// privacy redaction — a candidate here is, by construction, both
+// opted-in and health-verified, and showing its real address(es) is the
+// entire point of this endpoint (a future reader must not "fix" this by
+// adding scrubbing back in).
+func handleListSeedCandidates(store storage.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		since, err := parseSeedSinceParam(r)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+
+		candidates, err := store.ListSeedCandidates(r.Context(), since)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+
+		public := make([]PublicSeedCandidate, len(candidates))
+		for i, c := range candidates {
+			public[i] = PublicSeedCandidate{
+				NodeID:    c.NodeID,
+				PublicKey: hex.EncodeToString(c.PublicKey),
+				Label:     c.Label,
+				Addresses: c.Addresses,
+			}
+		}
+
+		writeJSON(w, http.StatusOK, listSeedCandidatesResponse{
+			Candidates: public,
+			Since:      since.String(),
+		})
+	}
+}
+
+// renderPeerSeedsTOML builds the real Tari config.toml text (matching
+// tari/common/config/presets/b_peer_seeds.toml's format) for candidates,
+// under a `[<network>.p2p.seeds]` header if network is non-empty, or the
+// generic placeholder `[p2p.seeds]` header otherwise (network is used
+// ONLY for this cosmetic header text — no other network-specific
+// dispatch logic is in scope here). Only peer_seeds is emitted (no
+// dns_seeds — there is no DNS-seed data source yet, out of scope for
+// v1). Each candidate contributes one peer_seeds entry per address
+// (`pubkey_hex + "::" + multiaddr`); an address that fails
+// addressToMultiaddr conversion is skipped (that one line only) rather
+// than failing the whole response — candidates are guaranteed a non-nil
+// PublicKey by ListSeedCandidates' own public_key IS NOT NULL filter.
+// Each line is built with strconv.Quote so it's always a correctly
+// escaped/quoted TOML string, even though real hex/IP/onion data is not
+// expected to need any escaping in practice.
+func renderPeerSeedsTOML(candidates []storage.SeedCandidate, network string) string {
+	header := "[p2p.seeds]"
+	if network != "" {
+		header = fmt.Sprintf("[%s.p2p.seeds]", network)
+	}
+
+	var sb strings.Builder
+	sb.WriteString(header)
+	sb.WriteString("\n")
+	sb.WriteString("peer_seeds = [\n")
+	for _, c := range candidates {
+		pubkeyHex := hex.EncodeToString(c.PublicKey)
+		for _, addr := range c.Addresses {
+			ma, err := addressToMultiaddr(addr)
+			if err != nil {
+				// Skip just this address line — a single unparseable
+				// address must not take down the whole generated
+				// config (see this func's doc comment).
+				continue
+			}
+			sb.WriteString("    ")
+			sb.WriteString(strconv.Quote(pubkeyHex + "::" + ma))
+			sb.WriteString(",\n")
+		}
+	}
+	sb.WriteString("]\n")
+	return sb.String()
+}
+
+// handleConfigPeerSeeds returns real, ready-to-paste Tari config.toml
+// text for the [p2p.seeds]/peer_seeds section, built from the same
+// opted-in + recently-reachable candidate set as GET /nodes/seeds (same
+// `?since=` override, same default window). `?network=` is accepted
+// purely to control the TOML section header text (e.g.
+// `[esmeralda.p2p.seeds]`); it has no other effect. Content-Type is
+// text/plain rather than application/toml, chosen so the response
+// previews as plain text directly in a browser rather than prompting a
+// download.
+func handleConfigPeerSeeds(store storage.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		since, err := parseSeedSinceParam(r)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		network := r.URL.Query().Get("network")
+
+		candidates, err := store.ListSeedCandidates(r.Context(), since)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+
+		body := renderPeerSeedsTOML(candidates, network)
+
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(body))
 	}
 }
 
