@@ -183,6 +183,7 @@ func NewHandler(store storage.Store) (http.Handler, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", handleDashboard(tmpl, store))
 	mux.HandleFunc("GET /nodes/{id}", handleNodeDetail(tmpl, store))
+	mux.HandleFunc("GET /topology", handleTopologyGraph(tmpl))
 	mux.HandleFunc("GET /static/style.css", handleStaticCSS)
 	return mux, nil
 }
@@ -285,6 +286,21 @@ func handleDashboard(tmpl *template.Template, store storage.Store) http.HandlerF
 		}
 
 		if err := tmpl.ExecuteTemplate(w, "index.html.tmpl", data); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	}
+}
+
+// handleTopologyGraph serves the visual topology graph page. It is a
+// near-static handler: it renders the page shell only, with no node/edge
+// data passed in as Go template values. All graph data is fetched
+// client-side from the already-scrubbed GET /api/topology JSON endpoint
+// (see topology.html.tmpl's inline <script>) — this guarantees the graph
+// can never bypass the one place the privacy contract (no raw addresses
+// for p2p_discovered nodes) is enforced, api.ScrubNode.
+func handleTopologyGraph(tmpl *template.Template) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if err := tmpl.ExecuteTemplate(w, "topology.html.tmpl", nil); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 	}
