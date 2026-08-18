@@ -93,15 +93,21 @@ type NodeFilter struct {
 }
 
 // TopologyFilter filters/caps the result of ListTopology. A zero-value
-// TopologyFilter (MaxNodes == 0) applies no cap — every node and edge is
-// returned, byte-for-byte identical to ListTopology's pre-capping
-// behavior.
+// TopologyFilter (MaxNodes == 0 and MaxEdges == 0) applies no cap — every
+// node and edge is returned, byte-for-byte identical to ListTopology's
+// pre-capping behavior.
 type TopologyFilter struct {
 	// MaxNodes, if > 0, caps the returned node set to the top MaxNodes
 	// nodes ranked by total peer-degree (see ListTopology's doc comment
 	// for the exact ranking and edge-consistency rules). Zero means no
 	// cap.
 	MaxNodes int
+
+	// MaxEdges, if > 0, caps the number of edges returned (see
+	// ListTopology's doc comment for exactly which query this applies
+	// to). Zero means no cap. MaxEdges is independent of MaxNodes — it
+	// can be set alone or combined with it.
+	MaxEdges int
 }
 
 // PeerEdge is a directed edge in the observed peer topology graph.

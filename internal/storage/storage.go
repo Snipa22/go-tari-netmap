@@ -902,6 +902,12 @@ func topNodeIDsByDegree(ctx context.Context, pool *pgxpool.Pool, maxNodes int) (
 // are restricted to those where BOTH endpoints are in that capped set —
 // so the returned graph never has an edge dangling to a node that isn't
 // also present in the returned node list.
+//
+// filter.MaxEdges, if > 0, additionally caps the number of edges
+// returned within that same MaxNodes > 0 branch (independent of
+// MaxNodes — it can be set alone or combined with it). It has no effect
+// when filter.MaxNodes <= 0 (the uncapped branch always returns every
+// edge, matching MaxNodes's own all-or-nothing semantics there).
 func (s *pgStore) ListTopology(ctx context.Context, filter TopologyFilter) ([]Node, []PeerEdge, error) {
 	if filter.MaxNodes <= 0 {
 		nodes, err := s.ListNodes(ctx, NodeFilter{})
@@ -957,12 +963,25 @@ func (s *pgStore) ListTopology(ctx context.Context, filter TopologyFilter) ([]No
 		return nil, nil, fmt.Errorf("storage: list capped topology nodes: %w", err)
 	}
 
-	edgeRows, err := s.pool.Query(ctx, `
+	// filter.MaxEdges, when > 0, adds a LIMIT here. ORDER BY first_seen
+	// (already in place above for determinism) means a MaxEdges-truncated
+	// result is a non-exhaustive sample of the real edges between the
+	// capped node set, not necessarily "the N most significant edges" by
+	// any topological measure — this is an intentional, accepted
+	// data-volume/response-size tradeoff (not a correctness bug),
+	// matching the same tradeoff already accepted for MaxNodes above.
+	edgeQuery := `
 		SELECT id, from_node_id, to_node_id, first_seen, last_seen
 		FROM peer_edges
 		WHERE from_node_id = ANY($1) AND to_node_id = ANY($1)
 		ORDER BY first_seen
-	`, nodeIDs)
+	`
+	args := []any{nodeIDs}
+	if filter.MaxEdges > 0 {
+		edgeQuery += `LIMIT $2`
+		args = append(args, filter.MaxEdges)
+	}
+	edgeRows, err := s.pool.Query(ctx, edgeQuery, args...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("storage: list capped topology edges: %w", err)
 	}

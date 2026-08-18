@@ -447,6 +447,61 @@ func TestListTopologyMaxNodesCap(t *testing.T) {
 	}
 }
 
+// TestListTopologyMaxEdgesCap verifies that ListTopology with
+// TopologyFilter.MaxEdges set (independent of MaxNodes) caps the number
+// of returned edges, even when MaxNodes is large enough to admit the
+// full node set and more real edges exist between those nodes than the
+// MaxEdges cap.
+func TestListTopologyMaxEdgesCap(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	// A small clique: a, b, c, d all pairwise connected -- 6 undirected
+	// edges recorded as 6 directed observations, more than the MaxEdges
+	// cap used below.
+	var ids []uuid.UUID
+	for _, addr := range []string{"clique-a:1", "clique-b:1", "clique-c:1", "clique-d:1"} {
+		n, err := store.UpsertDiscoveredNode(ctx, addr, DiscoverySourceP2P, nil, nil)
+		if err != nil {
+			t.Fatalf("upsert %s: %v", addr, err)
+		}
+		ids = append(ids, n.ID)
+	}
+	for i := 0; i < len(ids); i++ {
+		for j := i + 1; j < len(ids); j++ {
+			if err := store.RecordPeerEdgeObservation(ctx, ids[i], ids[j]); err != nil {
+				t.Fatalf("record edge observation %v -> %v: %v", ids[i], ids[j], err)
+			}
+		}
+	}
+
+	// Sanity check: uncapped, there really are 6 edges among these 4
+	// nodes (so a MaxEdges=3 cap below is actually truncating something).
+	_, uncappedEdges, err := store.ListTopology(ctx, TopologyFilter{})
+	if err != nil {
+		t.Fatalf("list topology (uncapped): %v", err)
+	}
+	if len(uncappedEdges) != 6 {
+		t.Fatalf("len(uncappedEdges) = %d, want 6 (sanity check on seeded clique)", len(uncappedEdges))
+	}
+
+	// MaxNodes is large enough to include all 4 clique nodes untouched;
+	// MaxEdges=3 is smaller than the real edge count (6) between them.
+	nodes, edges, err := store.ListTopology(ctx, TopologyFilter{MaxNodes: 100, MaxEdges: 3})
+	if err != nil {
+		t.Fatalf("list topology (edge-capped): %v", err)
+	}
+	if len(nodes) != 4 {
+		t.Fatalf("len(nodes) = %d, want 4 (MaxNodes=100 admits all of them)", len(nodes))
+	}
+	if len(edges) > 3 {
+		t.Fatalf("len(edges) = %d, want <= 3 (MaxEdges cap)", len(edges))
+	}
+	if len(edges) == 0 {
+		t.Fatalf("len(edges) = 0, want > 0 (some edges should still be returned)")
+	}
+}
+
 func TestGetNodeNotFound(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
