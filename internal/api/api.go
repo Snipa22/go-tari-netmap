@@ -75,10 +75,58 @@ func NewRouter(store storage.Store, grpcClient, p2pClient collector.NodeClient) 
 	return mux
 }
 
+// defaultNodeListLimit is the GET /nodes page size used when the caller
+// doesn't specify a `?limit=`. 100 is a reasonable "just show me a
+// useful chunk" default for a human paging through the registry via the
+// dashboard or the API directly.
+const defaultNodeListLimit = 100
+
+// maxNodeListLimit caps `?limit=` on GET /nodes regardless of what the
+// caller asks for — bounds worst-case response size/query cost per
+// request while still allowing a much bigger page than the default when
+// genuinely needed.
+const maxNodeListLimit = 500
+
+// listNodesResponse is the GET /nodes response body: a page of nodes
+// plus enough pagination metadata (Total, Limit, Offset, HasMore) for a
+// caller to walk every page without needing to guess page count from
+// len(Nodes) alone.
+type listNodesResponse struct {
+	Nodes   []PublicNode `json:"nodes"`
+	Total   int          `json:"total"`
+	Limit   int          `json:"limit"`
+	Offset  int          `json:"offset"`
+	HasMore bool         `json:"has_more"`
+}
+
 func handleListNodes(store storage.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		limit := defaultNodeListLimit
+		if v := r.URL.Query().Get("limit"); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n <= 0 {
+				n = defaultNodeListLimit
+			}
+			limit = n
+		}
+		if limit > maxNodeListLimit {
+			limit = maxNodeListLimit
+		}
+
+		offset := 0
+		if v := r.URL.Query().Get("offset"); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 0 {
+				writeError(w, http.StatusBadRequest, errors.New("invalid offset"))
+				return
+			}
+			offset = n
+		}
+
 		filter := storage.NodeFilter{
 			DiscoverySource: storage.DiscoverySource(r.URL.Query().Get("discovery_source")),
+			Limit:           limit,
+			Offset:          offset,
 		}
 
 		nodes, err := store.ListNodes(r.Context(), filter)
@@ -87,16 +135,34 @@ func handleListNodes(store storage.Store) http.HandlerFunc {
 			return
 		}
 
+		total, err := store.CountNodes(r.Context(), filter)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+
+		nodeIDs := make([]uuid.UUID, len(nodes))
+		for i, n := range nodes {
+			nodeIDs[i] = n.ID
+		}
+		addrsByNode, err := store.ListNodeAddressesForNodes(r.Context(), nodeIDs)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+
 		public := make([]PublicNode, len(nodes))
 		for i, n := range nodes {
-			addrs, err := store.ListNodeAddresses(r.Context(), n.ID)
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, err)
-				return
-			}
-			public[i] = ScrubNode(n, addrs)
+			public[i] = ScrubNode(n, addrsByNode[n.ID])
 		}
-		writeJSON(w, http.StatusOK, public)
+
+		writeJSON(w, http.StatusOK, listNodesResponse{
+			Nodes:   public,
+			Total:   total,
+			Limit:   limit,
+			Offset:  offset,
+			HasMore: offset+len(nodes) < total,
+		})
 	}
 }
 
@@ -545,6 +611,18 @@ func handleGetNodeHistory(store storage.Store) http.HandlerFunc {
 	}
 }
 
+// defaultTopologyMaxNodes bounds the default GET /topology response to
+// the top 300 best-connected nodes by peer-degree. Rationale: an
+// unbounded topology response on a large network can run into the
+// megabytes (observed ~4.8MB unpaginated in production) — well past what
+// a client needs to render a useful graph. 300 nodes keeps the response
+// size manageable while still showing the well-connected core of the
+// network (the part mining-pool operators actually care about when
+// picking peers). Callers that genuinely want everything can pass
+// `?all=true`; callers that want a different explicit cap can pass
+// `?limit=N`.
+const defaultTopologyMaxNodes = 300
+
 // topologyResponse is the GET /topology response body.
 type topologyResponse struct {
 	Nodes []PublicNode       `json:"nodes"`
@@ -553,7 +631,39 @@ type topologyResponse struct {
 
 func handleTopology(store storage.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		nodes, edges, err := store.ListTopology(r.Context())
+		maxNodes := defaultTopologyMaxNodes
+
+		if v := r.URL.Query().Get("all"); v != "" {
+			all, err := strconv.ParseBool(v)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, errors.New("invalid all"))
+				return
+			}
+			if all {
+				maxNodes = 0
+			}
+		}
+
+		if v := r.URL.Query().Get("limit"); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n <= 0 {
+				writeError(w, http.StatusBadRequest, errors.New("invalid limit"))
+				return
+			}
+			maxNodes = n
+		}
+
+		nodes, edges, err := store.ListTopology(r.Context(), storage.TopologyFilter{MaxNodes: maxNodes})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+
+		nodeIDs := make([]uuid.UUID, len(nodes))
+		for i, n := range nodes {
+			nodeIDs[i] = n.ID
+		}
+		addrsByNode, err := store.ListNodeAddressesForNodes(r.Context(), nodeIDs)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -561,12 +671,7 @@ func handleTopology(store storage.Store) http.HandlerFunc {
 
 		public := make([]PublicNode, len(nodes))
 		for i, n := range nodes {
-			addrs, err := store.ListNodeAddresses(r.Context(), n.ID)
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, err)
-				return
-			}
-			public[i] = ScrubNode(n, addrs)
+			public[i] = ScrubNode(n, addrsByNode[n.ID])
 		}
 		// edges only carry from_node_id/to_node_id UUIDs (see
 		// storage.PeerEdge) — no address data, so no scrubbing needed.
