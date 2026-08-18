@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -21,6 +22,18 @@ import (
 // node is submitted via POST /nodes.
 const asyncCheckTimeout = 30 * time.Second
 
+// MaxPendingSubmissions caps the number of unreviewed ('pending')
+// submissions the review queue will hold at once — abuse mitigation
+// against unbounded queue growth from spam, distinct from the per-IP rate
+// limit (this caps total outstanding queue size regardless of how many
+// distinct source IPs contribute to it). 100 is a generous cap for a
+// human-reviewed queue (in normal operation it should rarely get anywhere
+// near this) while still bounding worst-case storage/listing cost. It's
+// an exported var, not a const, specifically so tests can temporarily
+// lower it (rather than actually creating 100 real rows to exercise the
+// cap) — see internal/api/api_test.go's queue-cap test.
+var MaxPendingSubmissions = 100
+
 // NewRouter returns the HTTP handler for the API. store persists topology
 // and health data; grpcClient and p2pClient are used to kick off an async,
 // non-blocking health check via each configured transport when a new node
@@ -29,16 +42,26 @@ const asyncCheckTimeout = 30 * time.Second
 func NewRouter(store storage.Store, grpcClient, p2pClient collector.NodeClient) http.Handler {
 	mux := http.NewServeMux()
 
+	// Created once and shared across every POST /nodes call (NewRouter
+	// itself is only called once, at process startup) — see
+	// internal/api/ratelimit.go for both types' reasoning.
+	limiter := newIPRateLimiter()
+	lockouts := newInvalidSubmissionTracker()
+
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
 
 	mux.HandleFunc("GET /nodes", handleListNodes(store))
-	mux.HandleFunc("POST /nodes", handleCreateNode(store, grpcClient, p2pClient))
+	mux.HandleFunc("POST /nodes", handleCreateNode(store, grpcClient, p2pClient, limiter, lockouts))
 	mux.HandleFunc("GET /nodes/{id}", handleGetNode(store))
 	mux.HandleFunc("GET /nodes/{id}/history", handleGetNodeHistory(store))
 	mux.HandleFunc("GET /topology", handleTopology(store))
 	mux.HandleFunc("GET /topology/top-peered", handleTopPeeredNodes(store))
+
+	mux.HandleFunc("GET /submissions", handleListSubmissions(store))
+	mux.HandleFunc("POST /submissions/{id}/approve", handleApproveSubmission(store, grpcClient, p2pClient))
+	mux.HandleFunc("POST /submissions/{id}/reject", handleRejectSubmission(store))
 
 	return mux
 }
@@ -102,7 +125,7 @@ func (p *flexPort) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func handleCreateNode(store storage.Store, grpcClient, p2pClient collector.NodeClient) http.HandlerFunc {
+func handleCreateNode(store storage.Store, grpcClient, p2pClient collector.NodeClient, limiter *ipRateLimiter, lockouts *invalidSubmissionTracker) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req createNodeRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -110,53 +133,252 @@ func handleCreateNode(store storage.Store, grpcClient, p2pClient collector.NodeC
 			return
 		}
 
+		ip := clientIP(r)
+
+		// Escalating lockout for repeatedly-invalid submitters is
+		// checked before anything else, including the flat rate
+		// limit — a locked-out source shouldn't even burn one of its
+		// rate-limit tokens re-attempting.
+		if locked, remaining := lockouts.IsLockedOut(ip); locked {
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", int(remaining.Seconds())))
+			writeError(w, http.StatusTooManyRequests, errors.New("this source has been temporarily blocked after repeated invalid submissions"))
+			return
+		}
+
+		if !limiter.Allow(ip) {
+			w.Header().Set("Retry-After", "3600")
+			writeError(w, http.StatusTooManyRequests, errors.New("too many submissions from this source, try again later"))
+			return
+		}
+
 		if req.Host == "" {
+			lockouts.RecordInvalidStrike(ip)
 			writeError(w, http.StatusBadRequest, errors.New("host is required"))
 			return
 		}
 		if req.Port < 1 || req.Port > 65535 {
+			lockouts.RecordInvalidStrike(ip)
 			writeError(w, http.StatusBadRequest, errors.New("port must be between 1 and 65535"))
 			return
 		}
 
-		tags := map[string]any{}
-		if req.OwnerTag != "" {
-			tags["owner"] = req.OwnerTag
+		// Basic SSRF hardening: reject private/reserved IPs (this
+		// service's own async health-check/probe machinery would
+		// otherwise dial whatever's submitted here) and anything that
+		// isn't a syntactically plausible public IP or .onion address.
+		// See validateSubmittedHost's doc comment for the exact rules.
+		if err := validateSubmittedHost(req.Host); err != nil {
+			lockouts.RecordInvalidStrike(ip)
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+
+		address := fmt.Sprintf("%s:%d", req.Host, req.Port)
+
+		// A public submission of an address that's already publicly
+		// opted-in (registry_submitted or both) must NOT be allowed to
+		// silently merge into the existing node — that would let anyone
+		// re-submit someone else's already-registered address and bump
+		// its last_seen/merge tags/overwrite its label with zero
+		// ownership check. Reject outright rather than queuing it for
+		// review: there's nothing to review, the address already has an
+		// owner of record. This is a well-formed, merely-conflicting
+		// submission (not bad-faith malformed input), so no invalid
+		// strike is recorded for it.
+		optedIn, err := store.IsAddressPubliclyOptedIn(r.Context(), address)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if optedIn {
+			writeError(w, http.StatusConflict, errors.New("this address is already publicly registered — contact the operator to update it"))
+			return
+		}
+
+		// Hard cap on unreviewed queue size — a capacity problem, not a
+		// fault of this particular submission, so no invalid strike
+		// either.
+		pendingCount, err := store.CountPendingSubmissions(r.Context())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if pendingCount >= MaxPendingSubmissions {
+			writeError(w, http.StatusServiceUnavailable, errors.New("submission queue is full, try again later"))
+			return
 		}
 
 		var label *string
 		if req.Label != "" {
 			label = &req.Label
 		}
+		var ownerTag *string
+		if req.OwnerTag != "" {
+			ownerTag = &req.OwnerTag
+		}
 
-		// A registry submission is address-only: the submitter's pubkey is
-		// unknown until the async health check kicked off below actually
-		// probes it, so this creates/updates a placeholder row (or bumps
-		// an already-confirmed row for this address) rather than a
-		// confirmed node.
-		address := fmt.Sprintf("%s:%d", req.Host, req.Port)
-		node, err := store.UpsertDiscoveredNode(r.Context(), address, storage.DiscoverySourceRegistry, tags, label)
+		// Submissions no longer auto-publish: they queue for human
+		// review (see storage.PendingSubmission and
+		// handleApproveSubmission/handleRejectSubmission below).
+		// UpsertDiscoveredNode and the async health-check kickoff are
+		// now deferred to approval time.
+		submission, err := store.CreatePendingSubmission(r.Context(), address, label, ownerTag)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
 
-		// Kick off an async health check so newly submitted nodes get
-		// checked promptly rather than waiting for the collector's next
-		// full poll cycle. This is intentionally non-blocking: the POST
-		// response below does not wait on the network call, and there is
-		// no request left to report the outcome to, so errors are
-		// swallowed after logging is left to collector.PollOnce's own
-		// RecordHealthCheck call (an unreachable result is still
-		// recorded). PollOnce attempts grpcClient and p2pClient
-		// independently, skipping whichever is nil.
+		// Best-effort, non-blocking connectivity probe for the human
+		// reviewer's benefit — launched via `go` and never awaited, so
+		// it cannot delay this response. Uses its own
+		// context.Background()-derived timeout (see probeSubmission's
+		// doc comment) since r.Context() is canceled once this handler
+		// returns.
+		go probeSubmission(store, grpcClient, p2pClient, submission.ID, address)
+
+		writeJSON(w, http.StatusAccepted, submission)
+	}
+}
+
+func handleListSubmissions(store storage.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		status := r.URL.Query().Get("status")
+
+		submissions, err := store.ListPendingSubmissions(r.Context(), status)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, submissions)
+	}
+}
+
+// approveSubmissionResponse is the POST /submissions/{id}/approve response
+// body: the resulting promoted node alongside the now-approved
+// submission.
+type approveSubmissionResponse struct {
+	Node       storage.Node              `json:"node"`
+	Submission storage.PendingSubmission `json:"submission"`
+}
+
+func handleApproveSubmission(store storage.Store, grpcClient, p2pClient collector.NodeClient) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := uuid.Parse(r.PathValue("id"))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, errors.New("invalid submission id"))
+			return
+		}
+
+		submission, err := store.GetPendingSubmission(r.Context(), id)
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				writeError(w, http.StatusNotFound, errors.New("submission not found"))
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if submission.Status != storage.SubmissionStatusPending {
+			writeError(w, http.StatusConflict, fmt.Errorf("submission already reviewed (status=%s)", submission.Status))
+			return
+		}
+
+		// Re-check opt-in status now, in case it changed since the
+		// submission was originally queued (e.g. another submission for
+		// the same address was approved in the meantime). If the
+		// address has since become publicly opted-in, this approval is
+		// rejected without mutating pending_submissions — it's left
+		// pending so a human makes an explicit decision (reject it with
+		// an accurate reason, since auto-rejecting on the reviewer's
+		// behalf would hide why) rather than this silently flipping to
+		// rejected on its own.
+		optedIn, err := store.IsAddressPubliclyOptedIn(r.Context(), submission.Address)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if optedIn {
+			writeError(w, http.StatusConflict, errors.New("this address has since become publicly registered — reject this submission instead of approving it"))
+			return
+		}
+
+		tags := map[string]any{}
+		if submission.OwnerTag != nil && *submission.OwnerTag != "" {
+			tags["owner"] = *submission.OwnerTag
+		}
+
+		node, err := store.UpsertDiscoveredNode(r.Context(), submission.Address, storage.DiscoverySourceRegistry, tags, submission.Label)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+
+		if err := store.ApprovePendingSubmission(r.Context(), id, node.ID); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		submission.Status = storage.SubmissionStatusApproved
+		submission.PromotedNodeID = &node.ID
+
+		// Kick off an async health check, same pattern (and reasoning)
+		// as the old handleCreateNode used to, just deferred to
+		// approval time now.
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), asyncCheckTimeout)
 			defer cancel()
 			_ = collector.PollOnce(ctx, grpcClient, p2pClient, store, node)
 		}()
 
-		writeJSON(w, http.StatusCreated, node)
+		writeJSON(w, http.StatusOK, approveSubmissionResponse{Node: node, Submission: submission})
+	}
+}
+
+// rejectSubmissionRequest is the optional POST /submissions/{id}/reject
+// request body.
+type rejectSubmissionRequest struct {
+	Reason string `json:"reason"`
+}
+
+func handleRejectSubmission(store storage.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := uuid.Parse(r.PathValue("id"))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, errors.New("invalid submission id"))
+			return
+		}
+
+		var req rejectSubmissionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid JSON body: %w", err))
+			return
+		}
+
+		submission, err := store.GetPendingSubmission(r.Context(), id)
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				writeError(w, http.StatusNotFound, errors.New("submission not found"))
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if submission.Status != storage.SubmissionStatusPending {
+			writeError(w, http.StatusConflict, fmt.Errorf("submission already reviewed (status=%s)", submission.Status))
+			return
+		}
+
+		var reason *string
+		if req.Reason != "" {
+			reason = &req.Reason
+		}
+		if err := store.RejectPendingSubmission(r.Context(), id, reason); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		submission.Status = storage.SubmissionStatusRejected
+		submission.RejectionReason = reason
+
+		writeJSON(w, http.StatusOK, submission)
 	}
 }
 

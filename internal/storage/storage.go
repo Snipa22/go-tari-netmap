@@ -120,6 +120,54 @@ type Store interface {
 	// and the number of nodes that value was derived from. Returns
 	// (nil, 0, nil) if no health checks with a non-nil height exist yet.
 	NetworkHeight(ctx context.Context) (*int64, int, error)
+
+	// IsAddressPubliclyOptedIn reports whether address already belongs
+	// to a node whose discovery_source is registry_submitted or both —
+	// i.e. an address whose owner has already opted in to public
+	// listing. This is the check used both when a new submission is
+	// created (to block duplicate opt-in submissions) and again at
+	// approval time (in case the address became opted-in in the
+	// meantime, between submission and review).
+	IsAddressPubliclyOptedIn(ctx context.Context, address string) (bool, error)
+
+	// CreatePendingSubmission records a new public node-submission for
+	// review. If a PENDING submission for this exact address already
+	// exists, its label/owner_tag are updated in place and its
+	// submitted_at is bumped, rather than creating a second row (see
+	// this method's implementation for why).
+	CreatePendingSubmission(ctx context.Context, address string, label, ownerTag *string) (PendingSubmission, error)
+
+	// ListPendingSubmissions returns submissions with the given exact
+	// status. An empty status defaults to "pending" (the common case:
+	// the review queue).
+	ListPendingSubmissions(ctx context.Context, status string) ([]PendingSubmission, error)
+
+	// GetPendingSubmission returns a single submission by ID. Returns
+	// ErrNotFound if no such submission exists.
+	GetPendingSubmission(ctx context.Context, id uuid.UUID) (PendingSubmission, error)
+
+	// ApprovePendingSubmission marks submission id as approved, setting
+	// reviewed_at and promoted_node_id. Returns an error if the
+	// submission is not currently "pending" (a decision, once made,
+	// can't be re-made).
+	ApprovePendingSubmission(ctx context.Context, id uuid.UUID, promotedNodeID uuid.UUID) error
+
+	// RejectPendingSubmission marks submission id as rejected, setting
+	// reviewed_at and rejection_reason (may be nil). Returns an error if
+	// the submission is not currently "pending".
+	RejectPendingSubmission(ctx context.Context, id uuid.UUID, reason *string) error
+
+	// RecordSubmissionProbeResult records the outcome of a best-effort
+	// connectivity probe run against a still-pending submission at
+	// creation time. It intentionally only ever touches
+	// pending_submissions — never node_health or nodes — since the
+	// submission isn't approved.
+	RecordSubmissionProbeResult(ctx context.Context, id uuid.UUID, reachable bool) error
+
+	// CountPendingSubmissions returns the number of submissions currently
+	// in the 'pending' state, used to enforce a hard cap on unreviewed
+	// queue size (abuse-mitigation: prevents unbounded growth from spam).
+	CountPendingSubmissions(ctx context.Context) (int, error)
 }
 
 // ErrNotFound is returned by GetNode when no node with the given ID exists.
@@ -850,4 +898,202 @@ func (s *pgStore) NetworkHeight(ctx context.Context) (*int64, int, error) {
 		return nil, 0, fmt.Errorf("storage: network height: %w", err)
 	}
 	return &height, count, nil
+}
+
+// pendingSubmissionColumns is the column list, in order, matching
+// scanPendingSubmission's Scan calls.
+const pendingSubmissionColumns = "id, address, label, owner_tag, status, submitted_at, reviewed_at, rejection_reason, promoted_node_id, probe_attempted_at, probe_reachable"
+
+// scanPendingSubmission scans one pendingSubmissionColumns-shaped row into
+// a PendingSubmission.
+func scanPendingSubmission(row pgx.Row) (PendingSubmission, error) {
+	var ps PendingSubmission
+	if err := row.Scan(
+		&ps.ID, &ps.Address, &ps.Label, &ps.OwnerTag, &ps.Status,
+		&ps.SubmittedAt, &ps.ReviewedAt, &ps.RejectionReason, &ps.PromotedNodeID,
+		&ps.ProbeAttemptedAt, &ps.ProbeReachable,
+	); err != nil {
+		return PendingSubmission{}, err
+	}
+	return ps, nil
+}
+
+// IsAddressPubliclyOptedIn reports whether address already belongs to a
+// node whose discovery_source is registry_submitted or both. It joins
+// node_addresses to nodes rather than checking nodes.address directly, so
+// it also catches addresses recorded as a secondary node_addresses row
+// (see UpsertConfirmedNode's case (b): a node can have multiple
+// simultaneously-valid addresses).
+func (s *pgStore) IsAddressPubliclyOptedIn(ctx context.Context, address string) (bool, error) {
+	var optedIn bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM node_addresses na
+			JOIN nodes n ON n.id = na.node_id
+			WHERE na.address = $1
+			  AND n.discovery_source IN ('registry_submitted', 'both')
+		)
+	`, address).Scan(&optedIn)
+	if err != nil {
+		return false, fmt.Errorf("storage: is address publicly opted in: %w", err)
+	}
+	return optedIn, nil
+}
+
+// CreatePendingSubmission records a new public node-submission for
+// review. If a PENDING submission for this exact address already exists,
+// this UPDATEs that row's label/owner_tag and bumps its submitted_at
+// instead of inserting a duplicate. This "update in place" behavior
+// (rather than rejecting the second submission as a duplicate) is
+// deliberate: it keeps the API idempotent-ish for a legitimate
+// re-submitter who's still waiting on review (e.g. they made a typo in
+// the label and just want to fix it), and the partial unique index on
+// (address) WHERE status = 'pending' already guarantees no two PENDING
+// rows can exist for the same address at the database level — so the
+// application-level path has to handle the "already pending" case
+// cleanly one way or another, rather than surfacing a raw constraint
+// violation to the caller.
+func (s *pgStore) CreatePendingSubmission(ctx context.Context, address string, label, ownerTag *string) (PendingSubmission, error) {
+	if address == "" {
+		return PendingSubmission{}, fmt.Errorf("storage: address is required")
+	}
+
+	row := s.pool.QueryRow(ctx, `
+		INSERT INTO pending_submissions (address, label, owner_tag, status, submitted_at)
+		VALUES ($1, $2, $3, 'pending', now())
+		ON CONFLICT (address) WHERE status = 'pending'
+		DO UPDATE SET label = $2, owner_tag = $3, submitted_at = now()
+		RETURNING `+pendingSubmissionColumns, address, label, ownerTag)
+	ps, err := scanPendingSubmission(row)
+	if err != nil {
+		return PendingSubmission{}, fmt.Errorf("storage: create pending submission: %w", err)
+	}
+	return ps, nil
+}
+
+// ListPendingSubmissions returns submissions with the given exact status,
+// newest-submitted first. An empty status defaults to "pending".
+func (s *pgStore) ListPendingSubmissions(ctx context.Context, status string) ([]PendingSubmission, error) {
+	if status == "" {
+		status = SubmissionStatusPending
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+pendingSubmissionColumns+`
+		FROM pending_submissions
+		WHERE status = $1
+		ORDER BY submitted_at DESC
+	`, status)
+	if err != nil {
+		return nil, fmt.Errorf("storage: list pending submissions: %w", err)
+	}
+	defer rows.Close()
+
+	submissions := []PendingSubmission{}
+	for rows.Next() {
+		ps, err := scanPendingSubmission(rows)
+		if err != nil {
+			return nil, fmt.Errorf("storage: scan pending submission: %w", err)
+		}
+		submissions = append(submissions, ps)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage: list pending submissions: %w", err)
+	}
+	return submissions, nil
+}
+
+// GetPendingSubmission returns a single submission by ID, or ErrNotFound
+// if no such submission exists.
+func (s *pgStore) GetPendingSubmission(ctx context.Context, id uuid.UUID) (PendingSubmission, error) {
+	row := s.pool.QueryRow(ctx, `SELECT `+pendingSubmissionColumns+` FROM pending_submissions WHERE id = $1`, id)
+	ps, err := scanPendingSubmission(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return PendingSubmission{}, ErrNotFound
+		}
+		return PendingSubmission{}, fmt.Errorf("storage: get pending submission: %w", err)
+	}
+	return ps, nil
+}
+
+// ApprovePendingSubmission marks submission id as approved, setting
+// reviewed_at and promoted_node_id. It errors if the submission is not
+// currently "pending" — the WHERE status = 'pending' clause means the
+// UPDATE affects zero rows in that case, which this method detects via
+// RowsAffected and reports as an error rather than silently succeeding.
+func (s *pgStore) ApprovePendingSubmission(ctx context.Context, id uuid.UUID, promotedNodeID uuid.UUID) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE pending_submissions SET
+			status = 'approved',
+			reviewed_at = now(),
+			promoted_node_id = $2
+		WHERE id = $1 AND status = 'pending'
+	`, id, promotedNodeID)
+	if err != nil {
+		return fmt.Errorf("storage: approve pending submission: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		if _, err := s.GetPendingSubmission(ctx, id); err != nil {
+			return err
+		}
+		return fmt.Errorf("storage: submission %s is not pending", id)
+	}
+	return nil
+}
+
+// RecordSubmissionProbeResult records the outcome of a best-effort
+// connectivity probe run against a still-pending submission at creation
+// time. Unlike Approve/RejectPendingSubmission, a plain `WHERE id = $1`
+// update with no status guard and no error on zero rows affected is
+// deliberate here: by the time the async probe finishes, the submission
+// may have already been approved or rejected by a human reviewer — that's
+// an acceptable, harmless race (the probe result is purely informational
+// for the reviewer while the row was still pending), not something the
+// caller needs to know about or handle.
+func (s *pgStore) RecordSubmissionProbeResult(ctx context.Context, id uuid.UUID, reachable bool) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE pending_submissions SET
+			probe_attempted_at = now(),
+			probe_reachable = $2
+		WHERE id = $1
+	`, id, reachable)
+	if err != nil {
+		return fmt.Errorf("storage: record submission probe result: %w", err)
+	}
+	return nil
+}
+
+// CountPendingSubmissions returns the number of submissions currently in
+// the 'pending' state.
+func (s *pgStore) CountPendingSubmissions(ctx context.Context) (int, error) {
+	var count int
+	err := s.pool.QueryRow(ctx, `SELECT count(*) FROM pending_submissions WHERE status = 'pending'`).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("storage: count pending submissions: %w", err)
+	}
+	return count, nil
+}
+
+// RejectPendingSubmission marks submission id as rejected, setting
+// reviewed_at and rejection_reason. Same "must currently be pending"
+// guard as ApprovePendingSubmission.
+func (s *pgStore) RejectPendingSubmission(ctx context.Context, id uuid.UUID, reason *string) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE pending_submissions SET
+			status = 'rejected',
+			reviewed_at = now(),
+			rejection_reason = $2
+		WHERE id = $1 AND status = 'pending'
+	`, id, reason)
+	if err != nil {
+		return fmt.Errorf("storage: reject pending submission: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		if _, err := s.GetPendingSubmission(ctx, id); err != nil {
+			return err
+		}
+		return fmt.Errorf("storage: submission %s is not pending", id)
+	}
+	return nil
 }

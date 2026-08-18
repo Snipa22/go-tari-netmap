@@ -127,3 +127,41 @@ type HealthCheckInput struct {
 	C29Hashrate    *float64
 	Sha3xHashrate  *float64
 }
+
+// PendingSubmission is one row of the public node-submission review
+// queue (see 0007_submission_queue.sql). A POST /nodes submission for an
+// address that isn't already publicly opted-in creates one of these
+// instead of directly touching the nodes table; a human reviewer then
+// approves (promoting it into a real node via UpsertDiscoveredNode) or
+// rejects it. Status is one of "pending", "approved", "rejected".
+type PendingSubmission struct {
+	ID              uuid.UUID  `json:"id"`
+	Address         string     `json:"address"`
+	Label           *string    `json:"label,omitempty"`
+	OwnerTag        *string    `json:"owner_tag,omitempty"`
+	Status          string     `json:"status"`
+	SubmittedAt     time.Time  `json:"submitted_at"`
+	ReviewedAt      *time.Time `json:"reviewed_at,omitempty"`
+	RejectionReason *string    `json:"rejection_reason,omitempty"`
+	PromotedNodeID  *uuid.UUID `json:"promoted_node_id,omitempty"`
+
+	// ProbeAttemptedAt/ProbeReachable record the outcome of a best-effort,
+	// pre-approval connectivity probe (see internal/api/probe.go). Both
+	// are nil until the async probe finishes; ProbeReachable is then
+	// true/false. This is informational only for the human reviewer —
+	// it is never written to node_health/nodes (see 0008's migration
+	// comment for why).
+	ProbeAttemptedAt *time.Time `json:"probe_attempted_at,omitempty"`
+	ProbeReachable   *bool      `json:"probe_reachable,omitempty"`
+}
+
+// Pending submission status values. Kept as plain string constants
+// (rather than a distinct named type like DiscoverySource/ProbeSource)
+// since the CHECK constraint in 0007_submission_queue.sql is the real
+// source of truth for valid values and nothing outside this package
+// needs to branch on the type.
+const (
+	SubmissionStatusPending  = "pending"
+	SubmissionStatusApproved = "approved"
+	SubmissionStatusRejected = "rejected"
+)

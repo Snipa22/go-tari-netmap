@@ -30,6 +30,16 @@ const PollIntervalGeneric = 2 * time.Hour
 // actual desired cadence before this ships.
 const PollIntervalPoolOwned = 5 * time.Minute
 
+// PollIntervalUnconfirmed is the poll interval for unconfirmed placeholder
+// nodes (Node.PublicKey == nil), discovered via peer-walk but not yet
+// directly probed. These are polled more frequently than
+// PollIntervalGeneric so that a successful direct probe — and the
+// resulting merge into the real confirmed node it belongs to (e.g. when
+// the same real node advertises both a clearnet and onion address) —
+// happens sooner, without polling so aggressively that it violates
+// node-politeness norms.
+const PollIntervalUnconfirmed = 15 * time.Minute
+
 // DiscoveryIntervalGeneric is the minimum interval between discovery-walk
 // dials of an already-known generic node. Enforced for the same
 // politeness reasons as PollIntervalGeneric.
@@ -505,9 +515,12 @@ func pollOnceWithSource(ctx context.Context, client NodeClient, store storage.St
 	})
 }
 
-// pollInterval returns the poll cadence for n based on whether it is
-// tagged pool-owned.
+// pollInterval returns the poll cadence for n based on whether it is an
+// unconfirmed placeholder node or tagged pool-owned.
 func (c *Collector) pollInterval(n storage.Node) time.Duration {
+	if n.PublicKey == nil {
+		return PollIntervalUnconfirmed
+	}
 	if isPoolOwned(n) {
 		return PollIntervalPoolOwned
 	}
