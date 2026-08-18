@@ -19,8 +19,10 @@
   <main class="topology-main">
     <p class="tagline">
       Peer topology graph. Only the top-peered CONFIRMED nodes are shown
-      on load — click a node to reveal its known peers, including
-      unconfirmed ones. Node labels show a truncated, non-identifying
+      on load — click a node to reveal its known peers. Unconfirmed peers
+      are suppressed from this view entirely, both on load and on
+      expand, so a real known edge to an unconfirmed peer intentionally
+      won't appear here. Node labels show a truncated, non-identifying
       pubkey prefix (or "unconfirmed") — never a real address, even for
       nodes that have opted in to showing an address on the dashboard.
     </p>
@@ -145,9 +147,10 @@
       // expandNode fetches nodeId's known peer edges and neighbor nodes
       // (GET /api/nodes/{id}/edges) and merges any not-yet-rendered ones
       // into the graph in place — this is what powers click-to-expand.
-      // Neighbor nodes returned here legitimately include unconfirmed
-      // ones (no public_key), rendered with the existing unconfirmed
-      // styling; that's intentional, not a bug.
+      // The API now filters that response to confirmed neighbors only
+      // (unconfirmed neighbors, and any edge to one, are excluded
+      // server-side), so every node this returns already has a
+      // public_key — no client-side filtering needed here.
       function expandNode(nodeId) {
         statusEl.textContent = 'Loading neighbors\u2026';
 
