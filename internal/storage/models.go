@@ -144,6 +144,15 @@ type PendingSubmission struct {
 	ReviewedAt      *time.Time `json:"reviewed_at,omitempty"`
 	RejectionReason *string    `json:"rejection_reason,omitempty"`
 	PromotedNodeID  *uuid.UUID `json:"promoted_node_id,omitempty"`
+
+	// ProbeAttemptedAt/ProbeReachable record the outcome of a best-effort,
+	// pre-approval connectivity probe (see internal/api/probe.go). Both
+	// are nil until the async probe finishes; ProbeReachable is then
+	// true/false. This is informational only for the human reviewer —
+	// it is never written to node_health/nodes (see 0008's migration
+	// comment for why).
+	ProbeAttemptedAt *time.Time `json:"probe_attempted_at,omitempty"`
+	ProbeReachable   *bool      `json:"probe_reachable,omitempty"`
 }
 
 // Pending submission status values. Kept as plain string constants

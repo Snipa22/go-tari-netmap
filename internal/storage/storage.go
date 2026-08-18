@@ -156,6 +156,18 @@ type Store interface {
 	// reviewed_at and rejection_reason (may be nil). Returns an error if
 	// the submission is not currently "pending".
 	RejectPendingSubmission(ctx context.Context, id uuid.UUID, reason *string) error
+
+	// RecordSubmissionProbeResult records the outcome of a best-effort
+	// connectivity probe run against a still-pending submission at
+	// creation time. It intentionally only ever touches
+	// pending_submissions — never node_health or nodes — since the
+	// submission isn't approved.
+	RecordSubmissionProbeResult(ctx context.Context, id uuid.UUID, reachable bool) error
+
+	// CountPendingSubmissions returns the number of submissions currently
+	// in the 'pending' state, used to enforce a hard cap on unreviewed
+	// queue size (abuse-mitigation: prevents unbounded growth from spam).
+	CountPendingSubmissions(ctx context.Context) (int, error)
 }
 
 // ErrNotFound is returned by GetNode when no node with the given ID exists.
@@ -890,7 +902,7 @@ func (s *pgStore) NetworkHeight(ctx context.Context) (*int64, int, error) {
 
 // pendingSubmissionColumns is the column list, in order, matching
 // scanPendingSubmission's Scan calls.
-const pendingSubmissionColumns = "id, address, label, owner_tag, status, submitted_at, reviewed_at, rejection_reason, promoted_node_id"
+const pendingSubmissionColumns = "id, address, label, owner_tag, status, submitted_at, reviewed_at, rejection_reason, promoted_node_id, probe_attempted_at, probe_reachable"
 
 // scanPendingSubmission scans one pendingSubmissionColumns-shaped row into
 // a PendingSubmission.
@@ -899,6 +911,7 @@ func scanPendingSubmission(row pgx.Row) (PendingSubmission, error) {
 	if err := row.Scan(
 		&ps.ID, &ps.Address, &ps.Label, &ps.OwnerTag, &ps.Status,
 		&ps.SubmittedAt, &ps.ReviewedAt, &ps.RejectionReason, &ps.PromotedNodeID,
+		&ps.ProbeAttemptedAt, &ps.ProbeReachable,
 	); err != nil {
 		return PendingSubmission{}, err
 	}
@@ -1027,6 +1040,39 @@ func (s *pgStore) ApprovePendingSubmission(ctx context.Context, id uuid.UUID, pr
 		return fmt.Errorf("storage: submission %s is not pending", id)
 	}
 	return nil
+}
+
+// RecordSubmissionProbeResult records the outcome of a best-effort
+// connectivity probe run against a still-pending submission at creation
+// time. Unlike Approve/RejectPendingSubmission, a plain `WHERE id = $1`
+// update with no status guard and no error on zero rows affected is
+// deliberate here: by the time the async probe finishes, the submission
+// may have already been approved or rejected by a human reviewer — that's
+// an acceptable, harmless race (the probe result is purely informational
+// for the reviewer while the row was still pending), not something the
+// caller needs to know about or handle.
+func (s *pgStore) RecordSubmissionProbeResult(ctx context.Context, id uuid.UUID, reachable bool) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE pending_submissions SET
+			probe_attempted_at = now(),
+			probe_reachable = $2
+		WHERE id = $1
+	`, id, reachable)
+	if err != nil {
+		return fmt.Errorf("storage: record submission probe result: %w", err)
+	}
+	return nil
+}
+
+// CountPendingSubmissions returns the number of submissions currently in
+// the 'pending' state.
+func (s *pgStore) CountPendingSubmissions(ctx context.Context) (int, error) {
+	var count int
+	err := s.pool.QueryRow(ctx, `SELECT count(*) FROM pending_submissions WHERE status = 'pending'`).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("storage: count pending submissions: %w", err)
+	}
+	return count, nil
 }
 
 // RejectPendingSubmission marks submission id as rejected, setting
