@@ -1,0 +1,370 @@
+/* go-tari-netmap dashboard stylesheet.
+ *
+ * Single plain CSS file, no framework, no build step. Dark theme aimed at
+ * an ops dashboard used by mining-pool operators picking peers.
+ */
+
+:root {
+  color-scheme: dark;
+
+  --bg: #10141a;
+  --bg-elevated: #171c24;
+  --bg-card: #1b212b;
+  --border: #2a323f;
+  --text: #e4e8ee;
+  --text-muted: #93a0b3;
+  --accent: #5aa9ff;
+  --accent-soft: rgba(90, 169, 255, 0.15);
+  --ok: #4bd18a;
+  --warn: #e6b455;
+  --danger: #f0685a;
+
+  --badge-unconfirmed-bg: rgba(230, 180, 85, 0.16);
+  --badge-unconfirmed-fg: #e6b455;
+  --badge-clearnet-bg: rgba(90, 169, 255, 0.16);
+  --badge-clearnet-fg: #5aa9ff;
+  --badge-onion-bg: rgba(155, 122, 230, 0.18);
+  --badge-onion-fg: #b79bf0;
+  --badge-registry-bg: rgba(75, 209, 138, 0.16);
+  --badge-registry-fg: #4bd18a;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif,
+    "Apple Color Emoji", "Segoe UI Emoji";
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+code,
+.mono {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+/* Header / nav */
+
+header.site-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 32px;
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border);
+}
+
+header.site-header .site-title {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+header.site-header .site-title a {
+  color: var(--text);
+}
+
+header.site-header nav {
+  display: flex;
+  gap: 20px;
+}
+
+header.site-header nav a {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+header.site-header nav a:hover {
+  color: var(--text);
+  text-decoration: none;
+}
+
+header.site-header nav a.nav-disabled {
+  color: #4c5566;
+  cursor: default;
+  pointer-events: none;
+}
+
+main {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 24px 32px 64px;
+}
+
+p.tagline {
+  color: var(--text-muted);
+  margin-top: -8px;
+  margin-bottom: 28px;
+}
+
+section {
+  margin-bottom: 40px;
+}
+
+section > h2 {
+  font-size: 16px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  margin-bottom: 14px;
+}
+
+/* Summary cards */
+
+.card-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+}
+
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px 20px;
+  min-width: 150px;
+  flex: 1 1 150px;
+}
+
+.card .card-label {
+  color: var(--text-muted);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 6px;
+}
+
+.card .card-value {
+  font-size: 26px;
+  font-weight: 600;
+}
+
+.card .card-sub {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin-top: 4px;
+}
+
+/* Registration form */
+
+form.node-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: flex-end;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 18px 20px;
+}
+
+form.node-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+form.node-form input {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 8px 10px;
+  font-size: 14px;
+  min-width: 140px;
+}
+
+form.node-form input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+form.node-form button {
+  background: var(--accent);
+  color: #0a1420;
+  border: none;
+  border-radius: 6px;
+  padding: 9px 18px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  height: 38px;
+}
+
+form.node-form button:hover {
+  filter: brightness(1.08);
+}
+
+#submit-result {
+  margin-top: 12px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 14px;
+  color: var(--text-muted);
+  font-size: 13px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Tables */
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+thead th {
+  text-align: left;
+  background: var(--bg-elevated);
+  color: var(--text-muted);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+tbody td {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+
+tbody tr:last-child td {
+  border-bottom: none;
+}
+
+tbody tr:nth-child(even) {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+tbody tr:hover {
+  background: var(--accent-soft);
+}
+
+/* Badges */
+
+.badge {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 3px 8px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.badge + .badge {
+  margin-left: 4px;
+}
+
+.badge-unconfirmed {
+  background: var(--badge-unconfirmed-bg);
+  color: var(--badge-unconfirmed-fg);
+}
+
+.badge-clearnet {
+  background: var(--badge-clearnet-bg);
+  color: var(--badge-clearnet-fg);
+}
+
+.badge-onion {
+  background: var(--badge-onion-bg);
+  color: var(--badge-onion-fg);
+}
+
+.badge-registry {
+  background: var(--badge-registry-bg);
+  color: var(--badge-registry-fg);
+}
+
+/* Identity + capability display helpers */
+
+.pubkey {
+  cursor: help;
+  border-bottom: 1px dotted var(--text-muted);
+}
+
+.capabilities {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.public-address {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 13px;
+}
+
+.empty-note {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* Node detail page */
+
+.detail-summary {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 18px 22px;
+}
+
+.detail-summary dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 6px 18px;
+  margin: 0;
+}
+
+.detail-summary dt {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.detail-summary dd {
+  margin: 0;
+}
+
+.back-link {
+  display: inline-block;
+  margin-bottom: 18px;
+  color: var(--text-muted);
+}
+
+h1 {
+  margin: 0 0 6px;
+  font-size: 24px;
+}
+
+h1 .badge {
+  vertical-align: middle;
+  margin-left: 8px;
+}

@@ -3,63 +3,161 @@
 <head>
   <meta charset="utf-8">
   <title>go-tari-netmap</title>
+  <link rel="stylesheet" href="/static/style.css">
   <script src="https://unpkg.com/htmx.org@2"></script>
   <script src="https://unpkg.com/htmx.org@2/dist/ext/json-enc.js"></script>
 </head>
 <body>
-  <h1>go-tari-netmap</h1>
-  <p>Tari network peer-topology + node-health mapping for mining-pool operators picking peers.</p>
+  <header class="site-header">
+    <div class="site-title"><a href="/">go-tari-netmap</a></div>
+    <nav>
+      <a href="/">Dashboard</a>
+      <a class="nav-disabled" href="#" aria-disabled="true" title="Coming soon">Topology</a>
+    </nav>
+  </header>
 
-  <section>
-    <h2>Summary</h2>
-    <ul>
-      <li>Total nodes: {{.Counts.Total}}</li>
-      <li>p2p_discovered: {{.Counts.P2P}}</li>
-      <li>registry_submitted: {{.Counts.Registry}}</li>
-      <li>both: {{.Counts.Both}}</li>
-    </ul>
-  </section>
+  <main>
+    <p class="tagline">Tari network peer-topology + node-health mapping for mining-pool operators picking peers.</p>
 
-  <section>
-    <h2>Submit a node</h2>
-    <form hx-ext="json-enc" hx-post="/api/nodes" hx-target="#submit-result" hx-swap="innerHTML">
-      <label>Host <input type="text" name="host" required></label>
-      <label>Port <input type="number" name="port" min="1" max="65535" required></label>
-      <label>Label (optional) <input type="text" name="label"></label>
-      <label>Owner tag (optional) <input type="text" name="owner_tag"></label>
-      <button type="submit">Submit</button>
-    </form>
-    <pre id="submit-result"></pre>
-  </section>
+    <section>
+      <h2>Summary</h2>
+      <div class="card-grid">
+        <div class="card">
+          <div class="card-label">Total nodes</div>
+          <div class="card-value">{{.Counts.Total}}</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Confirmed</div>
+          <div class="card-value">{{.Counts.Confirmed}}</div>
+          <div class="card-sub">{{.Counts.Unconfirmed}} unconfirmed</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Onion-capable</div>
+          <div class="card-value">{{.Counts.OnionCapable}}</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Clearnet-only</div>
+          <div class="card-value">{{.Counts.ClearnetOnly}}</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Network height</div>
+          {{if .NetworkHeight}}
+          <div class="card-value">{{.NetworkHeight}}</div>
+          <div class="card-sub">(from {{.NetworkHeightNodeCount}} nodes)</div>
+          {{else}}
+          <div class="card-value">unknown</div>
+          {{end}}
+        </div>
+      </div>
+    </section>
 
-  <section>
-    <h2>Nodes</h2>
-    <table border="1" cellpadding="4">
-      <thead>
-        <tr>
-          <th>Address</th>
-          <th>Discovery source</th>
-          <th>Tags</th>
-          <th>Last seen</th>
-          <th>Reachable</th>
-          <th>Height</th>
-        </tr>
-      </thead>
-      <tbody>
-        {{range .Nodes}}
-        <tr>
-          <td><a href="/nodes/{{.ID}}">{{.Address}}</a></td>
-          <td>{{.DiscoverySource}}</td>
-          <td>{{.Tags}}</td>
-          <td>{{.LastSeen}}</td>
-          <td>{{if .LatestHealth}}{{.LatestHealth.Reachable}}{{else}}—{{end}}</td>
-          <td>{{if .LatestHealth}}{{if .LatestHealth.Height}}{{.LatestHealth.Height}}{{else}}—{{end}}{{else}}—{{end}}</td>
-        </tr>
-        {{else}}
-        <tr><td colspan="6">No nodes known yet.</td></tr>
-        {{end}}
-      </tbody>
-    </table>
-  </section>
+    <section>
+      <h2>Submit a node</h2>
+      <form class="node-form" hx-ext="json-enc" hx-post="/api/nodes" hx-target="#submit-result" hx-swap="innerHTML">
+        <label>Host <input type="text" name="host" required></label>
+        <label>Port <input type="number" name="port" min="1" max="65535" required></label>
+        <label>Label (optional) <input type="text" name="label"></label>
+        <label>Owner tag (optional) <input type="text" name="owner_tag"></label>
+        <button type="submit">Submit</button>
+      </form>
+      <pre id="submit-result"></pre>
+    </section>
+
+    <section>
+      <h2>Top peered</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Identity</th>
+            <th>Capabilities</th>
+            <th>Address</th>
+            <th>Degree</th>
+            <th>In</th>
+            <th>Out</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{range .TopPeered}}
+          <tr>
+            <td>
+              {{if .Identity.Confirmed}}
+              <span class="pubkey" title="{{.Identity.FullHex}}">{{.Identity.ShortHex}}</span>
+              {{else}}
+              <span class="badge badge-unconfirmed">unconfirmed</span>
+              {{end}}
+            </td>
+            <td>
+              <span class="capabilities">
+                {{if or .Capabilities.HasIPv4 .Capabilities.HasIPv6}}<span class="badge badge-clearnet">clearnet</span>{{end}}
+                {{if .Capabilities.HasOnion}}<span class="badge badge-onion">onion</span>{{end}}
+              </span>
+            </td>
+            <td>
+              {{if .PublicAddress}}
+              <span class="public-address">{{.PublicAddress}}</span>
+              <span class="badge badge-registry">opted-in</span>
+              {{end}}
+            </td>
+            <td>{{.Degree}}</td>
+            <td>{{.InDegree}}</td>
+            <td>{{.OutDegree}}</td>
+          </tr>
+          {{else}}
+          <tr><td colspan="6" class="empty-note">No peer connections observed in the last hour.</td></tr>
+          {{end}}
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>Nodes</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Identity</th>
+            <th>Capabilities</th>
+            <th>Address</th>
+            <th>Discovery source</th>
+            <th>Last seen</th>
+            <th>Reachable</th>
+            <th>Height</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{range .Nodes}}
+          <tr>
+            <td>
+              <a href="/nodes/{{.ID}}">
+                {{if .Identity.Confirmed}}
+                <span class="pubkey" title="{{.Identity.FullHex}}">{{.Identity.ShortHex}}</span>
+                {{else}}
+                <span class="badge badge-unconfirmed">unconfirmed</span>
+                {{end}}
+              </a>
+            </td>
+            <td>
+              <span class="capabilities">
+                {{if or .Capabilities.HasIPv4 .Capabilities.HasIPv6}}<span class="badge badge-clearnet">clearnet</span>{{end}}
+                {{if .Capabilities.HasOnion}}<span class="badge badge-onion">onion</span>{{end}}
+              </span>
+            </td>
+            <td>
+              {{if .PublicAddress}}
+              <span class="public-address">{{.PublicAddress}}</span>
+              <span class="badge badge-registry">opted-in</span>
+              {{end}}
+            </td>
+            <td>{{.DiscoverySource}}</td>
+            <td>{{.LastSeen}}</td>
+            <td>{{if .LatestHealth}}{{.LatestHealth.Reachable}}{{else}}—{{end}}</td>
+            <td>{{if .LatestHealth}}{{if .LatestHealth.Height}}{{.LatestHealth.Height}}{{else}}—{{end}}{{else}}—{{end}}</td>
+          </tr>
+          {{else}}
+          <tr><td colspan="7" class="empty-note">No nodes known yet.</td></tr>
+          {{end}}
+        </tbody>
+      </table>
+    </section>
+  </main>
 </body>
 </html>
