@@ -7,6 +7,7 @@ import (
 	"embed"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"html/template"
 	"net/http"
 	"time"
@@ -133,6 +134,7 @@ type dashboardData struct {
 	NetworkHeight          *int64
 	NetworkHeightNodeCount int
 	TopPeered              []topPeeredRow
+	TopPeeredWindowLabel   string
 }
 
 // peerEdgeRow is one row of a node detail page's "peer connections" table:
@@ -170,6 +172,41 @@ const topPeeredLimit = 10
 // nodeEdgesLimit caps the number of rows shown in a node detail page's
 // "peer connections" table.
 const nodeEdgesLimit = 50
+
+// windowLabel formats a lookback duration like topPeeredWindow into a
+// short human string (e.g. "(last 1h)") for display next to a panel
+// header, so the label stays in sync with the constant instead of being
+// hardcoded separately. Unlike time.Duration.String() (which would
+// render 1*time.Hour as "1h0m0s"), this drops zero-valued trailing
+// units.
+func windowLabel(d time.Duration) string {
+	return "(last " + formatDuration(d) + ")"
+}
+
+// formatDuration renders d as a compact "1h", "30m", "1h30m"-style
+// string, omitting any zero-valued hours/minutes/seconds components.
+func formatDuration(d time.Duration) string {
+	if d <= 0 {
+		return "0s"
+	}
+	h := d / time.Hour
+	d -= h * time.Hour
+	m := d / time.Minute
+	d -= m * time.Minute
+	s := d / time.Second
+
+	out := ""
+	if h > 0 {
+		out += fmt.Sprintf("%dh", h)
+	}
+	if m > 0 {
+		out += fmt.Sprintf("%dm", m)
+	}
+	if s > 0 {
+		out += fmt.Sprintf("%ds", s)
+	}
+	return out
+}
 
 // NewHandler returns an http.Handler serving the dashboard: a homepage
 // summary + node table (with a registry-submission form posted via htmx
@@ -218,7 +255,7 @@ func handleDashboard(tmpl *template.Template, store storage.Store) http.HandlerF
 			return
 		}
 
-		data := dashboardData{}
+		data := dashboardData{TopPeeredWindowLabel: windowLabel(topPeeredWindow)}
 		for _, n := range nodes {
 			data.Counts.Total++
 			switch n.DiscoverySource {
