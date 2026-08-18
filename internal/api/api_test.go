@@ -3,6 +3,7 @@ package api_test
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -2204,4 +2205,202 @@ func TestNonAdminAPIRoutesRemainUnauthenticated(t *testing.T) {
 	createBody := `{"host":"198.51.100.99","port":18142,"label":"regression check","owner_tag":"pool-y"}`
 	resp, err = http.Post(srv.URL+"/nodes", "application/json", bytes.NewBufferString(createBody))
 	assertStatus("POST /nodes", http.StatusAccepted, resp, err)
+
+	resp, err = http.Get(srv.URL + "/nodes/seeds")
+	assertStatus("GET /nodes/seeds", http.StatusOK, resp, err)
+	resp, err = http.Get(srv.URL + "/config/peer-seeds")
+	assertStatus("GET /config/peer-seeds", http.StatusOK, resp, err)
+}
+
+// alexPubkeyHex/alexIPv4Addr/alexOnionAddr are the literal real-world
+// dual-stack example given in SEED_CONFIG_SPEC.md, reused by both
+// TestListSeedCandidatesEndpoint and TestConfigPeerSeedsEndpoint so the
+// two endpoints are proven consistent against the exact same fixture.
+const (
+	alexPubkeyHex = "a841efcd8bc47d3db9e658f5da4d6858b6cbd387812d84f9f7a98e8cc871a85e"
+	alexIPv4Addr  = "23.226.69.178:18189"
+	alexOnionAddr = "wyow2dp6w2ff4u2kebklkmbzwlixyhjtza5bf3pt3oxnps5hcjn76iyd.onion:18141"
+)
+
+// seedAlexDualStackCandidate creates an opted-in (registry_submitted),
+// recently-healthy, dual-stack (IPv4 + onion) confirmed node using the
+// literal example from SEED_CONFIG_SPEC.md, plus a NOT-opted-in
+// (p2p_discovered) healthy node that must never show up in either
+// endpoint's output.
+func seedAlexDualStackCandidate(t *testing.T, store storage.Store) (nodeID uuid.UUID) {
+	t.Helper()
+	ctx := context.Background()
+
+	pubkey, err := hex.DecodeString(alexPubkeyHex)
+	if err != nil {
+		t.Fatalf("decode pubkey: %v", err)
+	}
+
+	n, err := store.UpsertConfirmedNode(ctx, alexIPv4Addr, pubkey, storage.DiscoverySourceRegistry)
+	if err != nil {
+		t.Fatalf("upsert confirmed ipv4: %v", err)
+	}
+	if _, err := store.UpsertConfirmedNode(ctx, alexOnionAddr, pubkey, storage.DiscoverySourceRegistry); err != nil {
+		t.Fatalf("upsert confirmed onion: %v", err)
+	}
+	if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{NodeID: n.ID, Reachable: true, ProbeSource: storage.ProbeSourceGRPC}); err != nil {
+		t.Fatalf("record health: %v", err)
+	}
+
+	p2pNode, err := store.UpsertConfirmedNode(ctx, "9.9.9.9:18189", []byte("not-opted-in-pubkey"), storage.DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("upsert p2p node: %v", err)
+	}
+	if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{NodeID: p2pNode.ID, Reachable: true, ProbeSource: storage.ProbeSourceGRPC}); err != nil {
+		t.Fatalf("record health p2p: %v", err)
+	}
+
+	return n.ID
+}
+
+// TestListSeedCandidatesEndpoint asserts GET /nodes/seeds returns
+// exactly the opted-in + recently-healthy candidate (not the
+// not-opted-in one), with a hex-encoded (not base64) public key and both
+// of its real addresses.
+func TestListSeedCandidatesEndpoint(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	seedAlexDualStackCandidate(t, store)
+
+	resp, err := http.Get(srv.URL + "/nodes/seeds")
+	if err != nil {
+		t.Fatalf("GET /nodes/seeds: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	var got struct {
+		Candidates []api.PublicSeedCandidate `json:"candidates"`
+		Since      string                    `json:"since"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Since == "" {
+		t.Errorf("since = %q, want non-empty", got.Since)
+	}
+	if len(got.Candidates) != 1 {
+		t.Fatalf("len(candidates) = %d, want 1 (only the opted-in node), got %+v", len(got.Candidates), got.Candidates)
+	}
+
+	c := got.Candidates[0]
+	if c.PublicKey != alexPubkeyHex {
+		t.Errorf("public_key = %q, want hex %q", c.PublicKey, alexPubkeyHex)
+	}
+	addrSet := map[string]bool{}
+	for _, a := range c.Addresses {
+		addrSet[a] = true
+	}
+	if !addrSet[alexIPv4Addr] || !addrSet[alexOnionAddr] {
+		t.Errorf("addresses = %+v, want both %q and %q", c.Addresses, alexIPv4Addr, alexOnionAddr)
+	}
+}
+
+// TestListSeedCandidatesEndpointSinceOverride asserts the `?since=`
+// query param actually narrows/widens the health-recency window, using
+// the same time.ParseDuration validation convention as
+// handleTopPeeredNodes.
+func TestListSeedCandidatesEndpointSinceOverride(t *testing.T) {
+	srv, _ := newTestServer(t, nil)
+
+	resp, err := http.Get(srv.URL + "/nodes/seeds?since=notaduration")
+	if err != nil {
+		t.Fatalf("GET /nodes/seeds: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d for invalid since", resp.StatusCode, http.StatusBadRequest)
+	}
+
+	resp2, err := http.Get(srv.URL + "/nodes/seeds?since=30m")
+	if err != nil {
+		t.Fatalf("GET /nodes/seeds?since=30m: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp2.StatusCode, http.StatusOK)
+	}
+	var got struct {
+		Since string `json:"since"`
+	}
+	if err := json.NewDecoder(resp2.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Since != "30m0s" {
+		t.Errorf("since = %q, want %q", got.Since, "30m0s")
+	}
+}
+
+// TestConfigPeerSeedsEndpoint asserts GET /config/peer-seeds emits real
+// Tari config.toml text with byte-for-byte correct peer_seeds lines for
+// the literal dual-stack example from SEED_CONFIG_SPEC.md, under a
+// network-scoped header when ?network= is given, and never mentions the
+// not-opted-in node.
+func TestConfigPeerSeedsEndpoint(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	seedAlexDualStackCandidate(t, store)
+
+	resp, err := http.Get(srv.URL + "/config/peer-seeds?network=esmeralda")
+	if err != nil {
+		t.Fatalf("GET /config/peer-seeds: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Errorf("Content-Type = %q, want text/plain prefix", ct)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	text := string(body)
+
+	if !strings.Contains(text, "[esmeralda.p2p.seeds]") {
+		t.Errorf("body missing network-scoped header:\n%s", text)
+	}
+	if !strings.Contains(text, "peer_seeds = [") {
+		t.Errorf("body missing peer_seeds array:\n%s", text)
+	}
+
+	wantIPv4Line := fmt.Sprintf(`"%s::/ip4/23.226.69.178/tcp/18189"`, alexPubkeyHex)
+	wantOnionLine := fmt.Sprintf(`"%s::/onion3/wyow2dp6w2ff4u2kebklkmbzwlixyhjtza5bf3pt3oxnps5hcjn76iyd:18141"`, alexPubkeyHex)
+	if !strings.Contains(text, wantIPv4Line) {
+		t.Errorf("body missing expected ipv4 peer_seeds line %q:\n%s", wantIPv4Line, text)
+	}
+	if !strings.Contains(text, wantOnionLine) {
+		t.Errorf("body missing expected onion peer_seeds line %q:\n%s", wantOnionLine, text)
+	}
+	if strings.Contains(text, "not-opted-in-pubkey") || strings.Contains(text, "9.9.9.9") {
+		t.Errorf("body must not mention the not-opted-in node:\n%s", text)
+	}
+}
+
+// TestConfigPeerSeedsEndpointGenericHeaderWithoutNetwork asserts the
+// header falls back to the generic, network-less `[p2p.seeds]` form
+// when `?network=` is omitted.
+func TestConfigPeerSeedsEndpointGenericHeaderWithoutNetwork(t *testing.T) {
+	srv, _ := newTestServer(t, nil)
+
+	resp, err := http.Get(srv.URL + "/config/peer-seeds")
+	if err != nil {
+		t.Fatalf("GET /config/peer-seeds: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	text := string(body)
+	if !strings.Contains(text, "[p2p.seeds]\n") {
+		t.Errorf("body missing generic header:\n%s", text)
+	}
 }

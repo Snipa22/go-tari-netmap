@@ -1194,6 +1194,122 @@ func TestUpsertConfirmedNodeAddsAddressToKnownPubkey(t *testing.T) {
 	}
 }
 
+// TestListSeedCandidates exercises ListSeedCandidates' full gating logic
+// against four scenarios:
+//
+//   - n1: opted-in (registry_submitted) + healthy, recently observed ->
+//     INCLUDED.
+//   - n2: opted-in (both) but its only health-check row is STALE (older
+//     than the queried window) -> EXCLUDED.
+//   - n3: healthy, recently observed, but NOT opted-in
+//     (p2p_discovered) -> EXCLUDED (the opt-in gate alone rules it out).
+//   - n4: opted-in + healthy recent + MULTIPLE addresses under the same
+//     pubkey -> INCLUDED, with both addresses present.
+//
+// Plus a fifth case proving a placeholder (no public_key) that is
+// otherwise opted-in and healthy is still excluded, since it can't
+// produce a peer_seeds line without a real pubkey.
+func TestListSeedCandidates(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	ps := store.(*pgStore)
+
+	pubkey1 := []byte("seed-pubkey-1")
+	n1, err := store.UpsertConfirmedNode(ctx, "seed1:18189", pubkey1, DiscoverySourceRegistry)
+	if err != nil {
+		t.Fatalf("upsert n1: %v", err)
+	}
+	if err := store.RecordHealthCheck(ctx, HealthCheckInput{NodeID: n1.ID, Reachable: true, ProbeSource: ProbeSourceGRPC}); err != nil {
+		t.Fatalf("record health n1: %v", err)
+	}
+
+	pubkey2 := []byte("seed-pubkey-2")
+	n2, err := store.UpsertConfirmedNode(ctx, "seed2:18189", pubkey2, DiscoverySourceBoth)
+	if err != nil {
+		t.Fatalf("upsert n2: %v", err)
+	}
+	if _, err := ps.pool.Exec(ctx, `
+		INSERT INTO node_health (node_id, ts, reachable, probe_source)
+		VALUES ($1, now() - interval '10 hours', true, 'grpc')
+	`, n2.ID); err != nil {
+		t.Fatalf("insert stale health n2: %v", err)
+	}
+
+	pubkey3 := []byte("seed-pubkey-3")
+	n3, err := store.UpsertConfirmedNode(ctx, "seed3:18189", pubkey3, DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("upsert n3: %v", err)
+	}
+	if err := store.RecordHealthCheck(ctx, HealthCheckInput{NodeID: n3.ID, Reachable: true, ProbeSource: ProbeSourceGRPC}); err != nil {
+		t.Fatalf("record health n3: %v", err)
+	}
+
+	pubkey4 := []byte("seed-pubkey-4")
+	n4, err := store.UpsertConfirmedNode(ctx, "seed4a:18189", pubkey4, DiscoverySourceRegistry)
+	if err != nil {
+		t.Fatalf("upsert n4a: %v", err)
+	}
+	if _, err := store.UpsertConfirmedNode(ctx, "seed4b:18141", pubkey4, DiscoverySourceRegistry); err != nil {
+		t.Fatalf("upsert n4b: %v", err)
+	}
+	if err := store.RecordHealthCheck(ctx, HealthCheckInput{NodeID: n4.ID, Reachable: true, ProbeSource: ProbeSourceGRPC}); err != nil {
+		t.Fatalf("record health n4: %v", err)
+	}
+
+	// A placeholder (no public_key) that's opted-in and healthy must
+	// also be excluded — it can't produce a peer_seeds line.
+	placeholder, err := store.UpsertDiscoveredNode(ctx, "placeholder:18189", DiscoverySourceRegistry, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert placeholder: %v", err)
+	}
+	if err := store.RecordHealthCheck(ctx, HealthCheckInput{NodeID: placeholder.ID, Reachable: true, ProbeSource: ProbeSourceGRPC}); err != nil {
+		t.Fatalf("record health placeholder: %v", err)
+	}
+
+	got, err := store.ListSeedCandidates(ctx, 3*time.Hour)
+	if err != nil {
+		t.Fatalf("list seed candidates: %v", err)
+	}
+
+	byID := map[uuid.UUID]SeedCandidate{}
+	for _, c := range got {
+		byID[c.NodeID] = c
+	}
+
+	if _, ok := byID[n1.ID]; !ok {
+		t.Errorf("expected n1 (opted-in + healthy recent) to be included, got %+v", got)
+	}
+	if _, ok := byID[n2.ID]; ok {
+		t.Errorf("expected n2 (opted-in + stale health) to be EXCLUDED, got %+v", got)
+	}
+	if _, ok := byID[n3.ID]; ok {
+		t.Errorf("expected n3 (not opted-in) to be EXCLUDED, got %+v", got)
+	}
+	c4, ok := byID[n4.ID]
+	if !ok {
+		t.Fatalf("expected n4 (opted-in + healthy + multi-address) to be included, got %+v", got)
+	}
+	if len(c4.Addresses) != 2 {
+		t.Fatalf("n4 addresses = %+v, want 2", c4.Addresses)
+	}
+	addrSet := map[string]bool{}
+	for _, a := range c4.Addresses {
+		addrSet[a] = true
+	}
+	if !addrSet["seed4a:18189"] || !addrSet["seed4b:18141"] {
+		t.Errorf("n4 addresses = %+v, want seed4a:18189 and seed4b:18141", c4.Addresses)
+	}
+	if !bytes.Equal(c4.PublicKey, pubkey4) {
+		t.Errorf("n4 public key = %x, want %x", c4.PublicKey, pubkey4)
+	}
+	if _, ok := byID[placeholder.ID]; ok {
+		t.Errorf("expected placeholder (no public_key) to be EXCLUDED, got %+v", got)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len(got) = %d, want 2 (n1 and n4 only), got %+v", len(got), got)
+	}
+}
+
 // TestUpsertConfirmedNodeMergesPlaceholderIntoConfirmedNode is case (d) of
 // UpsertConfirmedNode, and the most important new test in this task: two
 // independent placeholders (A, B), each already carrying its own
