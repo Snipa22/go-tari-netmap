@@ -176,6 +176,277 @@ func TestListNodesFilter(t *testing.T) {
 	}
 }
 
+// TestListNodesPagination verifies that NodeFilter.Limit/Offset apply
+// real SQL-level pagination (a correct page, in the same address-sorted
+// order ListNodes always uses), and that a zero-value filter still
+// returns everything unpaginated.
+func TestListNodesPagination(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	// Addresses are named so that address-sort order (ListNodes' ORDER
+	// BY address) is n1..n5.
+	want := []string{"n1:1", "n2:1", "n3:1", "n4:1", "n5:1"}
+	for _, addr := range want {
+		if _, err := store.UpsertDiscoveredNode(ctx, addr, DiscoverySourceP2P, nil, nil); err != nil {
+			t.Fatalf("upsert %s: %v", addr, err)
+		}
+	}
+
+	// Zero-value filter: unpaginated, all 5.
+	all, err := store.ListNodes(ctx, NodeFilter{})
+	if err != nil {
+		t.Fatalf("list all: %v", err)
+	}
+	if len(all) != 5 {
+		t.Fatalf("len(all) = %d, want 5", len(all))
+	}
+
+	// Page size 2, page 2 (offset 2) should be n3, n4.
+	page2, err := store.ListNodes(ctx, NodeFilter{Limit: 2, Offset: 2})
+	if err != nil {
+		t.Fatalf("list page 2: %v", err)
+	}
+	if len(page2) != 2 {
+		t.Fatalf("len(page2) = %d, want 2", len(page2))
+	}
+	if page2[0].Address != "n3:1" || page2[1].Address != "n4:1" {
+		t.Fatalf("page2 = [%s, %s], want [n3:1, n4:1]", page2[0].Address, page2[1].Address)
+	}
+
+	// Last page (page 3, offset 4) should be just n5 (partial page).
+	page3, err := store.ListNodes(ctx, NodeFilter{Limit: 2, Offset: 4})
+	if err != nil {
+		t.Fatalf("list page 3: %v", err)
+	}
+	if len(page3) != 1 || page3[0].Address != "n5:1" {
+		t.Fatalf("page3 = %+v, want just n5:1", page3)
+	}
+
+	// Offset past the end returns an empty page, not an error.
+	pastEnd, err := store.ListNodes(ctx, NodeFilter{Limit: 2, Offset: 10})
+	if err != nil {
+		t.Fatalf("list past end: %v", err)
+	}
+	if len(pastEnd) != 0 {
+		t.Fatalf("len(pastEnd) = %d, want 0", len(pastEnd))
+	}
+}
+
+// TestCountNodes verifies CountNodes returns the correct total, ignoring
+// Limit/Offset entirely, and respects DiscoverySource filtering the same
+// way ListNodes does.
+func TestCountNodes(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	if _, err := store.UpsertDiscoveredNode(ctx, "a:1", DiscoverySourceP2P, nil, nil); err != nil {
+		t.Fatalf("upsert a: %v", err)
+	}
+	if _, err := store.UpsertDiscoveredNode(ctx, "b:2", DiscoverySourceP2P, nil, nil); err != nil {
+		t.Fatalf("upsert b: %v", err)
+	}
+	if _, err := store.UpsertDiscoveredNode(ctx, "c:3", DiscoverySourceRegistry, nil, nil); err != nil {
+		t.Fatalf("upsert c: %v", err)
+	}
+
+	total, err := store.CountNodes(ctx, NodeFilter{})
+	if err != nil {
+		t.Fatalf("count all: %v", err)
+	}
+	if total != 3 {
+		t.Fatalf("total = %d, want 3", total)
+	}
+
+	// Limit/Offset must be ignored by CountNodes -- passing them
+	// shouldn't change the total.
+	totalWithLimitOffset, err := store.CountNodes(ctx, NodeFilter{Limit: 1, Offset: 1})
+	if err != nil {
+		t.Fatalf("count all with limit/offset: %v", err)
+	}
+	if totalWithLimitOffset != 3 {
+		t.Fatalf("totalWithLimitOffset = %d, want 3 (Limit/Offset must be ignored)", totalWithLimitOffset)
+	}
+
+	p2pCount, err := store.CountNodes(ctx, NodeFilter{DiscoverySource: DiscoverySourceP2P})
+	if err != nil {
+		t.Fatalf("count p2p: %v", err)
+	}
+	if p2pCount != 2 {
+		t.Fatalf("p2pCount = %d, want 2", p2pCount)
+	}
+}
+
+// TestListNodeAddressesForNodes verifies the batch address lookup
+// returns correct per-node addresses for a set of node IDs, including a
+// node with zero addresses getting an empty-slice map entry (not a
+// missing key, not an error), and that an empty input returns an empty
+// map without erroring.
+func TestListNodeAddressesForNodes(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	withAddr, err := store.UpsertDiscoveredNode(ctx, "a:1", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert a: %v", err)
+	}
+	pubkey := []byte("multi-addr-pubkey")
+	multiAddr, err := store.UpsertConfirmedNode(ctx, "b:1", pubkey, DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("upsert confirmed b: %v", err)
+	}
+	if _, err := store.UpsertConfirmedNode(ctx, "b:2", pubkey, DiscoverySourceP2P); err != nil {
+		t.Fatalf("upsert confirmed b2: %v", err)
+	}
+
+	// A node row with no node_addresses row at all (bypasses the normal
+	// upsert path, which always ensures one) to exercise the "zero
+	// addresses" case.
+	ps := store.(*pgStore)
+	var noAddrID uuid.UUID
+	if err := ps.pool.QueryRow(ctx, `
+		INSERT INTO nodes (address, discovery_source, tags, first_seen, last_seen)
+		VALUES ('noaddr:1', 'p2p_discovered', '{}'::jsonb, now(), now())
+		RETURNING id
+	`).Scan(&noAddrID); err != nil {
+		t.Fatalf("insert no-address node: %v", err)
+	}
+	if _, err := ps.pool.Exec(ctx, `DELETE FROM node_addresses WHERE node_id = $1`, noAddrID); err != nil {
+		t.Fatalf("delete node_addresses: %v", err)
+	}
+
+	got, err := store.ListNodeAddressesForNodes(ctx, []uuid.UUID{withAddr.ID, multiAddr.ID, noAddrID})
+	if err != nil {
+		t.Fatalf("list node addresses for nodes: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("len(got) = %d, want 3 entries (one per input id)", len(got))
+	}
+
+	if addrs, ok := got[withAddr.ID]; !ok || len(addrs) != 1 || addrs[0].Address != "a:1" {
+		t.Fatalf("got[withAddr.ID] = %+v (ok=%v), want just a:1", addrs, ok)
+	}
+
+	if addrs, ok := got[multiAddr.ID]; !ok || len(addrs) != 2 {
+		t.Fatalf("got[multiAddr.ID] = %+v (ok=%v), want 2 addresses (b:1, b:2)", addrs, ok)
+	}
+
+	addrs, ok := got[noAddrID]
+	if !ok {
+		t.Fatalf("got[noAddrID] missing key, want present with an empty slice")
+	}
+	if addrs == nil {
+		t.Fatalf("got[noAddrID] = nil, want a non-nil empty slice")
+	}
+	if len(addrs) != 0 {
+		t.Fatalf("got[noAddrID] = %+v, want empty", addrs)
+	}
+
+	empty, err := store.ListNodeAddressesForNodes(ctx, nil)
+	if err != nil {
+		t.Fatalf("list node addresses for nodes (empty input): %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("len(empty) = %d, want 0", len(empty))
+	}
+}
+
+// TestListTopologyMaxNodesCap verifies that ListTopology with a
+// TopologyFilter.MaxNodes cap returns a bounded, edge-consistent (no
+// dangling edges to nodes outside the returned set) subgraph, keeping
+// the top-N by (undirected) degree.
+func TestListTopologyMaxNodesCap(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	// hub: degree 3 (edges to leaf1, leaf2, leaf3).
+	// leaf1: degree 2 (hub, leaf2).
+	// leaf2: degree 2 (hub, leaf1).
+	// leaf3: degree 1 (hub).
+	// isolated: degree 0, no edges at all.
+	hub, err := store.UpsertDiscoveredNode(ctx, "hub:1", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert hub: %v", err)
+	}
+	leaf1, err := store.UpsertDiscoveredNode(ctx, "leaf1:1", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert leaf1: %v", err)
+	}
+	leaf2, err := store.UpsertDiscoveredNode(ctx, "leaf2:1", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert leaf2: %v", err)
+	}
+	leaf3, err := store.UpsertDiscoveredNode(ctx, "leaf3:1", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert leaf3: %v", err)
+	}
+	if _, err := store.UpsertDiscoveredNode(ctx, "isolated:1", DiscoverySourceP2P, nil, nil); err != nil {
+		t.Fatalf("upsert isolated: %v", err)
+	}
+
+	for _, e := range []struct{ from, to uuid.UUID }{
+		{hub.ID, leaf1.ID},
+		{hub.ID, leaf2.ID},
+		{leaf3.ID, hub.ID},
+		{leaf1.ID, leaf2.ID},
+	} {
+		if err := store.RecordPeerEdgeObservation(ctx, e.from, e.to); err != nil {
+			t.Fatalf("record edge observation %v -> %v: %v", e.from, e.to, err)
+		}
+	}
+
+	// MaxNodes=3: the top 3 by degree must be hub (3), then leaf1 and
+	// leaf2 (2 each) -- leaf3 (1) and isolated (0) must NOT be included.
+	nodes, edges, err := store.ListTopology(ctx, TopologyFilter{MaxNodes: 3})
+	if err != nil {
+		t.Fatalf("list topology (capped): %v", err)
+	}
+	if len(nodes) != 3 {
+		t.Fatalf("len(nodes) = %d, want 3", len(nodes))
+	}
+	gotIDs := map[uuid.UUID]bool{}
+	for _, n := range nodes {
+		gotIDs[n.ID] = true
+	}
+	if !gotIDs[hub.ID] || !gotIDs[leaf1.ID] || !gotIDs[leaf2.ID] {
+		t.Fatalf("nodes = %+v, want hub+leaf1+leaf2", nodes)
+	}
+	if gotIDs[leaf3.ID] {
+		t.Errorf("nodes contains leaf3 (degree 1), want excluded in favor of higher-degree nodes")
+	}
+
+	// Edge consistency: every edge's endpoints must both be in the
+	// returned node set. leaf3's edge to hub must be excluded since
+	// leaf3 itself isn't in the capped set (no dangling edges).
+	for _, e := range edges {
+		if !gotIDs[e.FromNodeID] || !gotIDs[e.ToNodeID] {
+			t.Errorf("edge %+v has an endpoint outside the returned node set %v", e, gotIDs)
+		}
+	}
+	// Expect exactly 3 edges among {hub, leaf1, leaf2}: hub->leaf1,
+	// hub->leaf2, leaf1->leaf2.
+	if len(edges) != 3 {
+		t.Fatalf("len(edges) = %d, want 3 (edges among hub/leaf1/leaf2 only)", len(edges))
+	}
+
+	// MaxNodes larger than the whole population: same node/edge counts
+	// as the unbounded call.
+	uncappedNodes, uncappedEdges, err := store.ListTopology(ctx, TopologyFilter{})
+	if err != nil {
+		t.Fatalf("list topology (uncapped): %v", err)
+	}
+	bigCapNodes, bigCapEdges, err := store.ListTopology(ctx, TopologyFilter{MaxNodes: 100})
+	if err != nil {
+		t.Fatalf("list topology (large cap): %v", err)
+	}
+	if len(bigCapNodes) != len(uncappedNodes) {
+		t.Fatalf("len(bigCapNodes) = %d, want %d (same as uncapped)", len(bigCapNodes), len(uncappedNodes))
+	}
+	if len(bigCapEdges) != len(uncappedEdges) {
+		t.Fatalf("len(bigCapEdges) = %d, want %d (same as uncapped)", len(bigCapEdges), len(uncappedEdges))
+	}
+}
+
 func TestGetNodeNotFound(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -315,7 +586,7 @@ func TestPeerEdgesAndTopology(t *testing.T) {
 		t.Fatalf("record edge observation again: %v", err)
 	}
 
-	nodes, edges, err := store.ListTopology(ctx)
+	nodes, edges, err := store.ListTopology(ctx, TopologyFilter{})
 	if err != nil {
 		t.Fatalf("list topology: %v", err)
 	}

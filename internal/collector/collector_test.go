@@ -167,7 +167,7 @@ func TestDiscoverWalksAndDedupes(t *testing.T) {
 		}
 	}
 
-	_, edges, err := store.ListTopology(ctx)
+	_, edges, err := store.ListTopology(ctx, storage.TopologyFilter{})
 	if err != nil {
 		t.Fatalf("list topology: %v", err)
 	}
