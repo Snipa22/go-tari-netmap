@@ -15,14 +15,15 @@ import (
 // JSON API. It is the single source of truth for what a node looks like to
 // an API caller: real address strings (IPv4/IPv6/onion) are NEVER included
 // for a node discovered purely by walking the peer graph
-// (storage.DiscoverySourceP2P) — Address is nil in that case. Only nodes
+// (storage.DiscoverySourceP2P) — Addresses is nil in that case. Only nodes
 // whose owner opted in via the public registry-submission endpoint
 // (storage.DiscoverySourceRegistry or storage.DiscoverySourceBoth) have
-// Address populated. The HasIPv4/HasIPv6/HasOnion capability booleans are
-// always populated regardless of opt-in status, since knowing a node has
-// (say) an onion address doesn't reveal what that address actually is.
+// Addresses populated, with every known address string for that node (not
+// just one). The HasIPv4/HasIPv6/HasOnion capability booleans are always
+// populated regardless of opt-in status, since knowing a node has (say) an
+// onion address doesn't reveal what that address actually is.
 //
-// Node identity is PublicKey, not Address — Address (when present) is
+// Node identity is PublicKey, not Addresses — Addresses (when present) is
 // informational, not an identifier. A nil/empty PublicKey means the node is
 // an unconfirmed placeholder (discovered by address alone, not yet
 // successfully probed to confirm its real pubkey), not an error.
@@ -37,7 +38,7 @@ type PublicNode struct {
 	HasIPv4         bool                    `json:"has_ipv4"`
 	HasIPv6         bool                    `json:"has_ipv6"`
 	HasOnion        bool                    `json:"has_onion"`
-	Address         *string                 `json:"address,omitempty"`
+	Addresses       []string                `json:"addresses,omitempty"`
 }
 
 // PublicNodeDegree is the privacy-scrubbed view of a storage.NodeDegree
@@ -50,7 +51,7 @@ type PublicNodeDegree struct {
 	HasIPv4   bool      `json:"has_ipv4"`
 	HasIPv6   bool      `json:"has_ipv6"`
 	HasOnion  bool      `json:"has_onion"`
-	Address   *string   `json:"address,omitempty"`
+	Addresses []string  `json:"addresses,omitempty"`
 	Degree    int       `json:"degree"`
 	InDegree  int       `json:"in_degree"`
 	OutDegree int       `json:"out_degree"`
@@ -112,19 +113,6 @@ func addressStrings(n storage.Node, addrs []storage.NodeAddress) []string {
 	return out
 }
 
-// primaryAddress picks the single address to expose for n when it's
-// opted in (see PublicNode.Address doc comment): n.Address if set,
-// otherwise the first entry of addrs, otherwise "" (no known address).
-func primaryAddress(n storage.Node, addrs []storage.NodeAddress) string {
-	if n.Address != "" {
-		return n.Address
-	}
-	if len(addrs) > 0 {
-		return addrs[0].Address
-	}
-	return ""
-}
-
 // ScrubNode builds the PublicNode view of n given its known addresses
 // addrs (pass the result of Store.ListNodeAddresses; an empty/nil slice is
 // fine and falls back to n.Address for capability classification). This is
@@ -154,9 +142,7 @@ func ScrubNode(n storage.Node, addrs []storage.NodeAddress) PublicNode {
 	}
 
 	if n.DiscoverySource == storage.DiscoverySourceRegistry || n.DiscoverySource == storage.DiscoverySourceBoth {
-		if addr := primaryAddress(n, addrs); addr != "" {
-			pn.Address = &addr
-		}
+		pn.Addresses = addressStrings(n, addrs)
 	}
 
 	return pn
@@ -185,7 +171,7 @@ func ScrubNodeDegree(ctx context.Context, store storage.Store, nd storage.NodeDe
 		HasIPv4:   pn.HasIPv4,
 		HasIPv6:   pn.HasIPv6,
 		HasOnion:  pn.HasOnion,
-		Address:   pn.Address,
+		Addresses: pn.Addresses,
 		Degree:    nd.Degree,
 		InDegree:  nd.InDegree,
 		OutDegree: nd.OutDegree,
