@@ -37,8 +37,10 @@ type p2pProbeFuncs interface {
 	// recovered directly from the handshake rather than claimed by a
 	// third party. See GetInfo's doc comment for why this is a second,
 	// independent probe/dial from probeChainMetadata rather than
-	// something bolted onto ChainMetadataInfo.
-	probeIdentity(ctx context.Context, addr string) (*p2p.PeerInfo, error)
+	// something bolted onto ChainMetadataInfo. It also takes
+	// ProbeOptions for SOCKS support, same reasoning as the other two
+	// probes.
+	probeIdentity(ctx context.Context, addr string, opts p2p.ProbeOptions) (*p2p.PeerInfo, error)
 }
 
 // realP2PProbeFuncs is the default p2pProbeFuncs implementation, backed by
@@ -53,8 +55,8 @@ func (realP2PProbeFuncs) probeGetPeers(ctx context.Context, addr string, req rpc
 	return p2p.ProbeGetPeersWithOptions(ctx, addr, req, opts)
 }
 
-func (realP2PProbeFuncs) probeIdentity(ctx context.Context, addr string) (*p2p.PeerInfo, error) {
-	return p2p.Probe(ctx, addr)
+func (realP2PProbeFuncs) probeIdentity(ctx context.Context, addr string, opts p2p.ProbeOptions) (*p2p.PeerInfo, error) {
+	return p2p.ProbeWithOptions(ctx, addr, opts)
 }
 
 // p2pNodeClient is the real go-tari-lib/p2p-backed NodeClient
@@ -70,12 +72,13 @@ type p2pNodeClient struct {
 
 	// socksProxyAddr, if non-empty, is the "host:port" address of a
 	// SOCKS5 proxy (e.g. a local Tor daemon's SocksPort) passed through
-	// to probeChainMetadata/probeGetPeers via p2p.ProbeOptions, letting
-	// this client reach `.onion` Tari peers. The zero value (empty
-	// string) preserves the exact pre-existing zero-config behavior —
-	// see NewP2PClient/NewP2PClientWithSocksProxy. probeIdentity is
-	// deliberately NOT given this treatment (out of scope for this
-	// field, see GetInfo's doc comment).
+	// to probeChainMetadata/probeGetPeers/probeIdentity via
+	// p2p.ProbeOptions, letting this client reach `.onion` Tari peers.
+	// The zero value (empty string) preserves the exact pre-existing
+	// zero-config behavior — see NewP2PClient/NewP2PClientWithSocksProxy.
+	// probeIdentity is given this same treatment as
+	// probeChainMetadata/probeGetPeers, for the same reason (reaching
+	// onion peers) — see GetInfo's doc comment.
 	socksProxyAddr string
 }
 
@@ -89,11 +92,12 @@ func NewP2PClient() NodeClient {
 }
 
 // NewP2PClientWithSocksProxy returns a NodeClient identical to
-// NewP2PClient's, except probeChainMetadata/probeGetPeers calls are given
-// proxyAddr (a SOCKS5 proxy "host:port", e.g. a local Tor daemon's
-// SocksPort) via p2p.ProbeOptions.SocksProxyAddr, letting this client
-// reach `.onion` Tari peers. proxyAddr has no effect on non-`.onion`
-// addresses — see p2p.ProbeOptions's doc comment in go-tari-lib.
+// NewP2PClient's, except probeChainMetadata/probeGetPeers/probeIdentity
+// calls are given proxyAddr (a SOCKS5 proxy "host:port", e.g. a local Tor
+// daemon's SocksPort) via p2p.ProbeOptions.SocksProxyAddr, letting this
+// client reach `.onion` Tari peers. proxyAddr has no effect on
+// non-`.onion` addresses — see p2p.ProbeOptions's doc comment in
+// go-tari-lib.
 func NewP2PClientWithSocksProxy(proxyAddr string) NodeClient {
 	return &p2pNodeClient{probes: realP2PProbeFuncs{}, socksProxyAddr: proxyAddr}
 }
@@ -102,7 +106,7 @@ func NewP2PClientWithSocksProxy(proxyAddr string) NodeClient {
 //
 // Version is intentionally left nil here: ChainMetadataInfo (the result of
 // go-tari-lib/p2p.ProbeChainMetadata) has no version/user-agent field, and
-// there is no cheap way to get one from the same call. p2p.Probe's
+// there is no cheap way to get one from the same call. p2p.ProbeWithOptions's
 // PeerInfo.UserAgent is a separate call that requires a second full
 // handshake/dial — not worth the extra round trip just for Version, given
 // the GRPC path already covers Version on nodes that expose GRPC.
@@ -110,8 +114,9 @@ func NewP2PClientWithSocksProxy(proxyAddr string) NodeClient {
 // PublicKey, unlike Version, IS worth that second dial: ChainMetadataInfo
 // has no pubkey field at all (out of scope to add — that's inside
 // go-tari-lib), so the only way to get addr's confirmed pubkey over this
-// transport is a second, independent p2p.Probe call (a full Noise_XX
-// handshake in its own right, recovering PeerInfo.RemoteStaticPubKey).
+// transport is a second, independent p2p.ProbeWithOptions call (a full
+// Noise_XX handshake in its own right, recovering
+// PeerInfo.RemoteStaticPubKey).
 // This means GetInfo now makes two separate P2P dials/handshakes to the
 // same addr on every call — an accepted, real limitation given
 // go-tari-lib is out of scope to modify further to merge them into one
@@ -134,7 +139,7 @@ func (c *p2pNodeClient) GetInfo(ctx context.Context, addr string) (NodeInfo, err
 		Reachable: true,
 	}
 
-	if peerInfo, err := c.probes.probeIdentity(ctx, addr); err != nil {
+	if peerInfo, err := c.probes.probeIdentity(ctx, addr, p2p.ProbeOptions{SocksProxyAddr: c.socksProxyAddr}); err != nil {
 		log.Printf("p2p GetInfo %s: probeIdentity failed (non-fatal, PublicKey left nil): %v", addr, err)
 	} else {
 		info.PublicKey = peerInfo.RemoteStaticPubKey

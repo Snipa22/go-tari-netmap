@@ -24,11 +24,13 @@ type fakeP2PProbeFuncs struct {
 	peers    []*pb.PeerInfo
 	peersErr error
 
-	// lastChainMetadataOpts/lastGetPeersOpts record the p2p.ProbeOptions
-	// each fake probe method was last called with, so tests can assert
-	// on what p2pNodeClient passed through (e.g. socksProxyAddr wiring).
+	// lastChainMetadataOpts/lastGetPeersOpts/lastIdentityOpts record the
+	// p2p.ProbeOptions each fake probe method was last called with, so
+	// tests can assert on what p2pNodeClient passed through (e.g.
+	// socksProxyAddr wiring).
 	lastChainMetadataOpts p2p.ProbeOptions
 	lastGetPeersOpts      p2p.ProbeOptions
+	lastIdentityOpts      p2p.ProbeOptions
 }
 
 func (f *fakeP2PProbeFuncs) probeChainMetadata(ctx context.Context, addr string, opts p2p.ProbeOptions) (*p2p.ChainMetadataInfo, error) {
@@ -39,7 +41,8 @@ func (f *fakeP2PProbeFuncs) probeChainMetadata(ctx context.Context, addr string,
 	return f.chainMetadata, nil
 }
 
-func (f *fakeP2PProbeFuncs) probeIdentity(ctx context.Context, addr string) (*p2p.PeerInfo, error) {
+func (f *fakeP2PProbeFuncs) probeIdentity(ctx context.Context, addr string, opts p2p.ProbeOptions) (*p2p.PeerInfo, error) {
+	f.lastIdentityOpts = opts
 	if f.identityErr != nil {
 		return nil, f.identityErr
 	}
@@ -291,6 +294,9 @@ func TestP2PClientZeroSocksProxyAddrIsZeroConfigProbeOptions(t *testing.T) {
 	if fake.lastGetPeersOpts != (p2p.ProbeOptions{}) {
 		t.Errorf("lastGetPeersOpts = %+v, want zero value", fake.lastGetPeersOpts)
 	}
+	if fake.lastIdentityOpts != (p2p.ProbeOptions{}) {
+		t.Errorf("lastIdentityOpts = %+v, want zero value", fake.lastIdentityOpts)
+	}
 }
 
 // TestP2PClientPassesThroughSocksProxyAddr verifies that a p2pNodeClient
@@ -320,5 +326,8 @@ func TestP2PClientPassesThroughSocksProxyAddr(t *testing.T) {
 	}
 	if fake.lastGetPeersOpts.SocksProxyAddr != proxyAddr {
 		t.Errorf("lastGetPeersOpts.SocksProxyAddr = %q, want %q", fake.lastGetPeersOpts.SocksProxyAddr, proxyAddr)
+	}
+	if fake.lastIdentityOpts.SocksProxyAddr != proxyAddr {
+		t.Errorf("lastIdentityOpts.SocksProxyAddr = %q, want %q", fake.lastIdentityOpts.SocksProxyAddr, proxyAddr)
 	}
 }
