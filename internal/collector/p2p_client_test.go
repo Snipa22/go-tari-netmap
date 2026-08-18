@@ -23,9 +23,16 @@ type fakeP2PProbeFuncs struct {
 
 	peers    []*pb.PeerInfo
 	peersErr error
+
+	// lastChainMetadataOpts/lastGetPeersOpts record the p2p.ProbeOptions
+	// each fake probe method was last called with, so tests can assert
+	// on what p2pNodeClient passed through (e.g. socksProxyAddr wiring).
+	lastChainMetadataOpts p2p.ProbeOptions
+	lastGetPeersOpts      p2p.ProbeOptions
 }
 
-func (f *fakeP2PProbeFuncs) probeChainMetadata(ctx context.Context, addr string) (*p2p.ChainMetadataInfo, error) {
+func (f *fakeP2PProbeFuncs) probeChainMetadata(ctx context.Context, addr string, opts p2p.ProbeOptions) (*p2p.ChainMetadataInfo, error) {
+	f.lastChainMetadataOpts = opts
 	if f.chainMetadataErr != nil {
 		return nil, f.chainMetadataErr
 	}
@@ -39,7 +46,8 @@ func (f *fakeP2PProbeFuncs) probeIdentity(ctx context.Context, addr string) (*p2
 	return f.identity, nil
 }
 
-func (f *fakeP2PProbeFuncs) probeGetPeers(ctx context.Context, addr string, req rpcpkg.GetPeersRequest) ([]*pb.PeerInfo, error) {
+func (f *fakeP2PProbeFuncs) probeGetPeers(ctx context.Context, addr string, req rpcpkg.GetPeersRequest, opts p2p.ProbeOptions) ([]*pb.PeerInfo, error) {
+	f.lastGetPeersOpts = opts
 	if f.peersErr != nil {
 		return nil, f.peersErr
 	}
@@ -233,5 +241,84 @@ func TestNewP2PClientReturnsRealProbes(t *testing.T) {
 	}
 	if _, ok := client.probes.(realP2PProbeFuncs); !ok {
 		t.Errorf("NewP2PClient().probes = %T, want realP2PProbeFuncs", client.probes)
+	}
+	if client.socksProxyAddr != "" {
+		t.Errorf("NewP2PClient().socksProxyAddr = %q, want \"\"", client.socksProxyAddr)
+	}
+}
+
+// TestNewP2PClientWithSocksProxyReturnsRealProbes mirrors
+// TestNewP2PClientReturnsRealProbes, additionally asserting that the
+// given proxy address is stored on the returned client.
+func TestNewP2PClientWithSocksProxyReturnsRealProbes(t *testing.T) {
+	client, ok := NewP2PClientWithSocksProxy("127.0.0.1:9050").(*p2pNodeClient)
+	if !ok {
+		t.Fatalf("NewP2PClientWithSocksProxy(...) = %T, want *p2pNodeClient", NewP2PClientWithSocksProxy("127.0.0.1:9050"))
+	}
+	if _, ok := client.probes.(realP2PProbeFuncs); !ok {
+		t.Errorf("NewP2PClientWithSocksProxy(...).probes = %T, want realP2PProbeFuncs", client.probes)
+	}
+	if client.socksProxyAddr != "127.0.0.1:9050" {
+		t.Errorf("NewP2PClientWithSocksProxy(...).socksProxyAddr = %q, want %q", client.socksProxyAddr, "127.0.0.1:9050")
+	}
+}
+
+// TestP2PClientZeroSocksProxyAddrIsZeroConfigProbeOptions verifies that a
+// p2pNodeClient with socksProxyAddr left as its zero value ("") passes a
+// zero-value p2p.ProbeOptions through to probeChainMetadata/probeGetPeers
+// — i.e. existing callers that never set socksProxyAddr get byte-for-byte
+// identical zero-config behavior after this change.
+func TestP2PClientZeroSocksProxyAddrIsZeroConfigProbeOptions(t *testing.T) {
+	fake := &fakeP2PProbeFuncs{
+		chainMetadata: &p2p.ChainMetadataInfo{},
+		identity:      &p2p.PeerInfo{},
+	}
+	client := &p2pNodeClient{probes: fake}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if _, err := client.GetInfo(ctx, "127.0.0.1:18189"); err != nil {
+		t.Fatalf("GetInfo: %v", err)
+	}
+	if _, err := client.GetPeers(ctx, "127.0.0.1:18189"); err != nil {
+		t.Fatalf("GetPeers: %v", err)
+	}
+
+	if fake.lastChainMetadataOpts != (p2p.ProbeOptions{}) {
+		t.Errorf("lastChainMetadataOpts = %+v, want zero value", fake.lastChainMetadataOpts)
+	}
+	if fake.lastGetPeersOpts != (p2p.ProbeOptions{}) {
+		t.Errorf("lastGetPeersOpts = %+v, want zero value", fake.lastGetPeersOpts)
+	}
+}
+
+// TestP2PClientPassesThroughSocksProxyAddr verifies that a p2pNodeClient
+// with socksProxyAddr set passes a p2p.ProbeOptions carrying that same
+// address through to both probeChainMetadata and probeGetPeers.
+func TestP2PClientPassesThroughSocksProxyAddr(t *testing.T) {
+	const proxyAddr = "127.0.0.1:9050"
+
+	fake := &fakeP2PProbeFuncs{
+		chainMetadata: &p2p.ChainMetadataInfo{},
+		identity:      &p2p.PeerInfo{},
+	}
+	client := &p2pNodeClient{probes: fake, socksProxyAddr: proxyAddr}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if _, err := client.GetInfo(ctx, "127.0.0.1:18189"); err != nil {
+		t.Fatalf("GetInfo: %v", err)
+	}
+	if _, err := client.GetPeers(ctx, "127.0.0.1:18189"); err != nil {
+		t.Fatalf("GetPeers: %v", err)
+	}
+
+	if fake.lastChainMetadataOpts.SocksProxyAddr != proxyAddr {
+		t.Errorf("lastChainMetadataOpts.SocksProxyAddr = %q, want %q", fake.lastChainMetadataOpts.SocksProxyAddr, proxyAddr)
+	}
+	if fake.lastGetPeersOpts.SocksProxyAddr != proxyAddr {
+		t.Errorf("lastGetPeersOpts.SocksProxyAddr = %q, want %q", fake.lastGetPeersOpts.SocksProxyAddr, proxyAddr)
 	}
 }

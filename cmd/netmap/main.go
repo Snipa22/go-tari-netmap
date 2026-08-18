@@ -47,7 +47,18 @@ func main() {
 	// Real go-tari-lib/p2p-backed client: talks to Tari nodes over the
 	// direct comms/RPC-over-P2P transport, independent of gRPC — see
 	// p2pNodeClient's doc comment in internal/collector/p2p_client.go.
-	p2pClient := collector.NewP2PClient()
+	//
+	// NETMAP_SOCKS_PROXY_ADDR is the "host:port" address of a Tor SOCKS5
+	// proxy (e.g. a local Tor daemon's SocksPort, typically
+	// 127.0.0.1:9050), used to reach `.onion` Tari peers over this
+	// transport. Empty/unset (the default) disables it, matching the
+	// pre-existing zero-config behavior.
+	var p2pClient collector.NodeClient
+	if socksProxyAddr := os.Getenv("NETMAP_SOCKS_PROXY_ADDR"); socksProxyAddr != "" {
+		p2pClient = collector.NewP2PClientWithSocksProxy(socksProxyAddr)
+	} else {
+		p2pClient = collector.NewP2PClient()
+	}
 
 	c := collector.New(collector.Config{
 		SeedNodes: parseSeedNodes(os.Getenv("NETMAP_SEED_NODES")),

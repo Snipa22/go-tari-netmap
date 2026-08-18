@@ -25,8 +25,8 @@ const p2pDialTimeout = dialTimeout
 // instead of making real P2P network calls — mirroring how grpcNodeClient
 // injects dial/dialOpts for the same purpose.
 type p2pProbeFuncs interface {
-	probeChainMetadata(ctx context.Context, addr string) (*p2p.ChainMetadataInfo, error)
-	probeGetPeers(ctx context.Context, addr string, req rpcpkg.GetPeersRequest) ([]*pb.PeerInfo, error)
+	probeChainMetadata(ctx context.Context, addr string, opts p2p.ProbeOptions) (*p2p.ChainMetadataInfo, error)
+	probeGetPeers(ctx context.Context, addr string, req rpcpkg.GetPeersRequest, opts p2p.ProbeOptions) ([]*pb.PeerInfo, error)
 
 	// probeIdentity performs a Noise_XX handshake against addr and
 	// returns the peer's confirmed pubkey (PeerInfo.RemoteStaticPubKey),
@@ -41,12 +41,12 @@ type p2pProbeFuncs interface {
 // the real go-tari-lib/p2p package.
 type realP2PProbeFuncs struct{}
 
-func (realP2PProbeFuncs) probeChainMetadata(ctx context.Context, addr string) (*p2p.ChainMetadataInfo, error) {
-	return p2p.ProbeChainMetadata(ctx, addr)
+func (realP2PProbeFuncs) probeChainMetadata(ctx context.Context, addr string, opts p2p.ProbeOptions) (*p2p.ChainMetadataInfo, error) {
+	return p2p.ProbeChainMetadataWithOptions(ctx, addr, opts)
 }
 
-func (realP2PProbeFuncs) probeGetPeers(ctx context.Context, addr string, req rpcpkg.GetPeersRequest) ([]*pb.PeerInfo, error) {
-	return p2p.ProbeGetPeers(ctx, addr, req)
+func (realP2PProbeFuncs) probeGetPeers(ctx context.Context, addr string, req rpcpkg.GetPeersRequest, opts p2p.ProbeOptions) ([]*pb.PeerInfo, error) {
+	return p2p.ProbeGetPeersWithOptions(ctx, addr, req, opts)
 }
 
 func (realP2PProbeFuncs) probeIdentity(ctx context.Context, addr string) (*p2p.PeerInfo, error) {
@@ -63,13 +63,35 @@ type p2pNodeClient struct {
 	// inject a fake implementation so tests exercise GetInfo/GetPeers'
 	// mapping logic without any real P2P network calls.
 	probes p2pProbeFuncs
+
+	// socksProxyAddr, if non-empty, is the "host:port" address of a
+	// SOCKS5 proxy (e.g. a local Tor daemon's SocksPort) passed through
+	// to probeChainMetadata/probeGetPeers via p2p.ProbeOptions, letting
+	// this client reach `.onion` Tari peers. The zero value (empty
+	// string) preserves the exact pre-existing zero-config behavior —
+	// see NewP2PClient/NewP2PClientWithSocksProxy. probeIdentity is
+	// deliberately NOT given this treatment (out of scope for this
+	// field, see GetInfo's doc comment).
+	socksProxyAddr string
 }
 
 // NewP2PClient returns a NodeClient backed by real go-tari-lib/p2p calls
 // against Tari nodes over the comms/RPC-over-P2P transport. It takes no
-// required args: each method probes the addr passed to it, per-call.
+// required args: each method probes the addr passed to it, per-call. The
+// returned client dials directly (no SOCKS proxy) — see
+// NewP2PClientWithSocksProxy for `.onion` peer support.
 func NewP2PClient() NodeClient {
 	return &p2pNodeClient{probes: realP2PProbeFuncs{}}
+}
+
+// NewP2PClientWithSocksProxy returns a NodeClient identical to
+// NewP2PClient's, except probeChainMetadata/probeGetPeers calls are given
+// proxyAddr (a SOCKS5 proxy "host:port", e.g. a local Tor daemon's
+// SocksPort) via p2p.ProbeOptions.SocksProxyAddr, letting this client
+// reach `.onion` Tari peers. proxyAddr has no effect on non-`.onion`
+// addresses — see p2p.ProbeOptions's doc comment in go-tari-lib.
+func NewP2PClientWithSocksProxy(proxyAddr string) NodeClient {
+	return &p2pNodeClient{probes: realP2PProbeFuncs{}, socksProxyAddr: proxyAddr}
 }
 
 // GetInfo implements NodeClient.
@@ -99,7 +121,7 @@ func (c *p2pNodeClient) GetInfo(ctx context.Context, addr string) (NodeInfo, err
 	ctx, cancel := context.WithTimeout(ctx, p2pDialTimeout)
 	defer cancel()
 
-	meta, err := c.probes.probeChainMetadata(ctx, addr)
+	meta, err := c.probes.probeChainMetadata(ctx, addr, p2p.ProbeOptions{SocksProxyAddr: c.socksProxyAddr})
 	if err != nil {
 		return NodeInfo{}, fmt.Errorf("p2p ProbeChainMetadata %s: %w", addr, err)
 	}
@@ -138,7 +160,7 @@ func (c *p2pNodeClient) GetPeers(ctx context.Context, addr string) ([]Discovered
 	ctx, cancel := context.WithTimeout(ctx, p2pDialTimeout)
 	defer cancel()
 
-	peers, err := c.probes.probeGetPeers(ctx, addr, p2p.DefaultGetPeersRequest())
+	peers, err := c.probes.probeGetPeers(ctx, addr, p2p.DefaultGetPeersRequest(), p2p.ProbeOptions{SocksProxyAddr: c.socksProxyAddr})
 	if err != nil {
 		return nil, fmt.Errorf("p2p ProbeGetPeers %s: %w", addr, err)
 	}
