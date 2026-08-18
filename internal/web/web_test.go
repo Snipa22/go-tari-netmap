@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -326,6 +328,211 @@ func TestDashboardTopPeeredOnionClearnetCounts(t *testing.T) {
 	if !strings.Contains(hubRow, "<td>2</td>") {
 		t.Errorf("hub row missing OnionPeerCount/ClearnetPeerCount cell %q; row = %s", "<td>2</td>", hubRow)
 	}
+}
+
+// TestDashboardTopPeeredLiveCounts asserts the dashboard's "top peered"
+// panel renders the five new "(live)" column headers plus the hub row's
+// correct raw AND live per-node counts, for a hub whose distinct peers
+// are a mix of confirmed and unconfirmed nodes — mirroring
+// storage.TestTopPeeredNodesLiveCounts's setup (see its doc comment for
+// the exact reasoning behind each expected count).
+//
+// The hub has three CONFIRMED peers (onion-only, clearnet-only, and
+// dual-stack, each reached via an out-edge) and three unconfirmed peers
+// (onion-only, clearnet-only, and plain, each reached via an in-edge).
+func TestDashboardTopPeeredLiveCounts(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	const (
+		confirmedOnionAddr      = "confonionpeerweb1abcdefghijklmnopq.onion:18142"
+		unconfirmedOnionAddr    = "unconfonionpeerweb2abcdefghijklmno.onion:18142"
+		dualStackClearnetAddr   = "203.0.113.41:18142"
+		dualStackOnionAddr      = "confdualstackpeerwebabcdefghijklmn.onion:18142"
+		confirmedClearnetAddr   = "203.0.113.42:18142"
+		unconfirmedClearnetAddr = "203.0.113.43:18142"
+		unconfirmedPlainAddr    = "unconfirmed-plain-peer-web:18142"
+	)
+
+	hub, err := store.UpsertDiscoveredNode(ctx, "hub-live-web:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert hub: %v", err)
+	}
+
+	confirmedOnionPeer, err := store.UpsertConfirmedNode(ctx, confirmedOnionAddr, []byte("some-unique-fake-pubkey-web-01"), storage.DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("upsert confirmed onion peer: %v", err)
+	}
+	unconfirmedOnionPeer, err := store.UpsertDiscoveredNode(ctx, unconfirmedOnionAddr, storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert unconfirmed onion peer: %v", err)
+	}
+	confirmedDualStackPeer, err := store.UpsertConfirmedNode(ctx, dualStackClearnetAddr, []byte("some-unique-fake-pubkey-web-02"), storage.DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("upsert confirmed dual-stack peer: %v", err)
+	}
+	// storage.Store doesn't expose the raw pool, so add the confirmed
+	// dual-stack peer's second address via a direct connection to the
+	// same test database instead (same DSN newTestStore's store was
+	// built with).
+	pool, err := pgxpool.New(ctx, testDSN())
+	if err != nil {
+		t.Fatalf("connect to test db: %v", err)
+	}
+	defer pool.Close()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO node_addresses (node_id, address, first_seen, last_seen)
+		VALUES ($1, $2, now(), now())
+	`, confirmedDualStackPeer.ID, dualStackOnionAddr); err != nil {
+		t.Fatalf("insert confirmed dual-stack peer's onion address: %v", err)
+	}
+	confirmedClearnetPeer, err := store.UpsertConfirmedNode(ctx, confirmedClearnetAddr, []byte("some-unique-fake-pubkey-web-03"), storage.DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("upsert confirmed clearnet peer: %v", err)
+	}
+	unconfirmedClearnetPeer, err := store.UpsertDiscoveredNode(ctx, unconfirmedClearnetAddr, storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert unconfirmed clearnet peer: %v", err)
+	}
+	unconfirmedPlainPeer, err := store.UpsertDiscoveredNode(ctx, unconfirmedPlainAddr, storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert unconfirmed plain peer: %v", err)
+	}
+
+	// Out-edges (hub -> peer).
+	if err := store.RecordPeerEdgeObservation(ctx, hub.ID, confirmedOnionPeer.ID); err != nil {
+		t.Fatalf("record edge hub -> confirmedOnionPeer: %v", err)
+	}
+	if err := store.RecordPeerEdgeObservation(ctx, hub.ID, unconfirmedOnionPeer.ID); err != nil {
+		t.Fatalf("record edge hub -> unconfirmedOnionPeer: %v", err)
+	}
+	if err := store.RecordPeerEdgeObservation(ctx, hub.ID, confirmedDualStackPeer.ID); err != nil {
+		t.Fatalf("record edge hub -> confirmedDualStackPeer: %v", err)
+	}
+	// In-edges (peer -> hub).
+	if err := store.RecordPeerEdgeObservation(ctx, confirmedClearnetPeer.ID, hub.ID); err != nil {
+		t.Fatalf("record edge confirmedClearnetPeer -> hub: %v", err)
+	}
+	if err := store.RecordPeerEdgeObservation(ctx, unconfirmedClearnetPeer.ID, hub.ID); err != nil {
+		t.Fatalf("record edge unconfirmedClearnetPeer -> hub: %v", err)
+	}
+	if err := store.RecordPeerEdgeObservation(ctx, unconfirmedPlainPeer.ID, hub.ID); err != nil {
+		t.Fatalf("record edge unconfirmedPlainPeer -> hub: %v", err)
+	}
+
+	srv := newTestServer(t, store)
+	status, body := getBody(t, srv.URL+"/")
+	if status != http.StatusOK {
+		t.Fatalf("GET / status = %d, want %d", status, http.StatusOK)
+	}
+
+	for _, header := range []string{
+		"Degree (live)", "In (live)", "Out (live)",
+		"Onion peers (live)", "Clearnet peers (live)",
+	} {
+		if !strings.Contains(body, header) {
+			t.Errorf("GET / body missing top-peered panel's %q column header", header)
+		}
+	}
+
+	hubIdx := strings.Index(body, fmt.Sprintf(`href="/nodes/%s"`, hub.ID))
+	if hubIdx == -1 {
+		t.Fatalf("GET / body missing top-peered identity link for hub node %s", hub.ID)
+	}
+	rowStart := strings.LastIndex(body[:hubIdx], "<tr>")
+	rowEnd := strings.Index(body[hubIdx:], "</tr>")
+	if rowStart == -1 || rowEnd == -1 {
+		t.Fatalf("could not isolate hub's <tr> row in GET / body")
+	}
+	hubRow := body[rowStart : hubIdx+rowEnd]
+
+	// Extract every plain-integer <td> cell's value, in document order,
+	// and compare against the expected Degree/LiveDegree/In/LiveIn/
+	// Out/LiveOut/Onion/LiveOnion/Clearnet/LiveClearnet sequence exactly
+	// as the template renders them (immediately adjacent, raw then
+	// live) — robust to whitespace, but not to reordering.
+	cellRE := regexp.MustCompile(`<td>(\d+)</td>`)
+	matches := cellRE.FindAllStringSubmatch(hubRow, -1)
+	got := make([]int, len(matches))
+	for i, m := range matches {
+		v, err := strconv.Atoi(m[1])
+		if err != nil {
+			t.Fatalf("parse cell value %q: %v", m[1], err)
+		}
+		got[i] = v
+	}
+
+	want := []int{
+		6, 3, // Degree, Degree (live)
+		3, 1, // In, In (live)
+		3, 2, // Out, Out (live)
+		3, 2, // Onion peers, Onion peers (live)
+		3, 2, // Clearnet peers, Clearnet peers (live)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("hub row has %d numeric <td> cells, want %d; got = %v; row = %s", len(got), len(want), got, hubRow)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("hub row numeric <td> cell[%d] = %d, want %d (got = %v, want = %v)", i, got[i], want[i], got, want)
+		}
+	}
+}
+
+// TestDashboardTopPeeredAddressTruncation asserts the "top peered"
+// panel's Address column truncates a long onion address to its first 16
+// characters plus an ellipsis in the visible text, while still exposing
+// the full untruncated address via a title="" tooltip attribute — the
+// same ShortHex/FullHex tooltip convention buildIdentity already uses
+// for pubkeys.
+func TestDashboardTopPeeredAddressTruncation(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	const longOnionAddr = "wyow2dp6w2ff4u2kebklkmbzwlixyhjtza5bf3pt3oxnps5hcjn76iyd.onion:18141"
+	const truncatedOnionAddr = "wyow2dp6w2ff4u2k…" // first 16 chars + "…"
+
+	hub, err := store.UpsertDiscoveredNode(ctx, longOnionAddr, storage.DiscoverySourceRegistry, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert opted-in hub: %v", err)
+	}
+	leaf, err := store.UpsertDiscoveredNode(ctx, "leaf-trunc:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert leaf: %v", err)
+	}
+	if err := store.RecordPeerEdgeObservation(ctx, hub.ID, leaf.ID); err != nil {
+		t.Fatalf("record edge observation: %v", err)
+	}
+
+	srv := newTestServer(t, store)
+	status, body := getBody(t, srv.URL+"/")
+	if status != http.StatusOK {
+		t.Fatalf("GET / status = %d, want %d", status, http.StatusOK)
+	}
+
+	if !strings.Contains(body, fmt.Sprintf(`title="%s">%s</span>`, longOnionAddr, truncatedOnionAddr)) {
+		t.Errorf("GET / body missing top-peered panel's truncated address %q with full address %q in a title attribute; body excerpt around address: %s",
+			truncatedOnionAddr, longOnionAddr, excerptAround(body, "public-address"))
+	}
+	// The full, untruncated address string must never appear as VISIBLE
+	// text in the top-peered panel — only inside the title attribute.
+	if strings.Contains(body, fmt.Sprintf(">%s<", longOnionAddr)) {
+		t.Errorf("GET / body contains the full untruncated address %q as visible text, want it truncated", longOnionAddr)
+	}
+}
+
+// excerptAround returns up to 200 characters of body starting at the
+// first occurrence of marker, for a more useful test failure message.
+func excerptAround(body, marker string) string {
+	idx := strings.Index(body, marker)
+	if idx == -1 {
+		return "(marker not found)"
+	}
+	end := idx + 200
+	if end > len(body) {
+		end = len(body)
+	}
+	return body[idx:end]
 }
 
 // TestDashboardReachableWithinWindowFilter exercises the dashboard's
