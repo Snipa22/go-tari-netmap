@@ -6,6 +6,7 @@
 package web
 
 import (
+	"context"
 	"embed"
 	"encoding/hex"
 	"errors"
@@ -106,9 +107,9 @@ type dashboardCounts struct {
 	ClearnetOnly int
 }
 
-// dashboardNodeRow is one row of the dashboard's node table, combining node
-// data with its most recent health-check result (if any) and its
-// privacy-scrubbed display fields.
+// dashboardNodeRow is one row of a node table (the dashboard's or
+// /network's), combining node data with its most recent health-check
+// result (if any) and its privacy-scrubbed display fields.
 type dashboardNodeRow struct {
 	storage.Node
 	LatestHealth *storage.HealthCheck
@@ -116,6 +117,14 @@ type dashboardNodeRow struct {
 	Identity        identity
 	Capabilities    capabilities
 	PublicAddresses []string
+
+	// LikelyDead reuses handleNodeDetail's heuristic (see
+	// computeLikelyDead) against whatever history buildNodeTableData
+	// fetched for this row's historyLimit. The main dashboard passes
+	// historyLimit == 1, so this is always false there (not enough
+	// history to ever satisfy the >= 3 threshold) — it's only
+	// meaningful on /network, which passes historyLimit == 3.
+	LikelyDead bool
 }
 
 // topPeeredRow is one row of the dashboard's "top peered" panel: a node's
@@ -161,6 +170,50 @@ type dashboardData struct {
 	NextPage       int
 }
 
+// networkData is the template data for network.html.tmpl (GET /network —
+// see handleFullNetwork). Same whole-population summary counts and node
+// table shape as dashboardData, but deliberately has no TopPeered/
+// TopPeeredWindowLabel fields — that panel stays exclusively on the main
+// dashboard.
+type networkData struct {
+	Counts                 dashboardCounts
+	Nodes                  []dashboardNodeRow
+	NetworkHeight          *int64
+	NetworkHeightNodeCount int
+
+	// Node table pagination metadata (see handleFullNetwork and
+	// buildNodeTableData). Unlike dashboardData's NodeTotal, this IS
+	// the same as Counts.Total — /network's table has no
+	// ReachableSince filter, so it's paginating through the whole
+	// population.
+	NodePage       int
+	NodeLimit      int
+	NodeTotal      int
+	NodeRangeStart int
+	NodeRangeEnd   int
+	HasPrevPage    bool
+	HasNextPage    bool
+	PrevPage       int
+	NextPage       int
+}
+
+// nodeTablePagination is the pagination metadata buildNodeTableData
+// computes for a paginated node table — the shared shape copied into
+// both dashboardData's and networkData's flat Node*/HasPrevPage/etc.
+// fields by their respective handlers.
+type nodeTablePagination struct {
+	Page       int
+	Limit      int
+	Total      int
+	RangeStart int
+	RangeEnd   int
+
+	HasPrevPage bool
+	HasNextPage bool
+	PrevPage    int
+	NextPage    int
+}
+
 // peerEdgeRow is one row of a node detail page's "peer connections" table:
 // the OTHER node's privacy-scrubbed identity (never an address), the
 // direction of the observed edge relative to the page's node, and when it
@@ -185,7 +238,7 @@ type nodeDetailData struct {
 
 	// LikelyDead is a simple, deliberately non-aggregate-query heuristic
 	// computed from the already-fetched History slice — see
-	// handleNodeDetail for exactly how it's derived.
+	// computeLikelyDead for exactly how it's derived.
 	LikelyDead bool
 }
 
@@ -209,6 +262,21 @@ const dashboardNodeMaxPageSize = 200
 // nodeEdgesLimit caps the number of rows shown in a node detail page's
 // "peer connections" table.
 const nodeEdgesLimit = 50
+
+// dashboardRowHistoryLimit is the number of history rows
+// buildNodeTableData fetches per row on the main dashboard — just
+// enough for LatestHealth, and deliberately too few (< 3) for
+// computeLikelyDead to ever flag a row true there (see
+// dashboardNodeRow.LikelyDead's doc comment).
+const dashboardRowHistoryLimit = 1
+
+// networkRowHistoryLimit is the number of history rows
+// buildNodeTableData fetches per row on /network — enough to also
+// compute computeLikelyDead's "3+ probes, zero successes" heuristic per
+// row, at the cost of a slightly larger per-row GetNodeHistory call
+// (still one query per visible row, same as the dashboard's, just with
+// a bigger LIMIT).
+const networkRowHistoryLimit = 3
 
 // dashboardReachableWindow is the display-layer cutoff for "reachable
 // recently enough to show in the main Nodes table" on the dashboard. It
@@ -255,6 +323,180 @@ func formatDuration(d time.Duration) string {
 	return out
 }
 
+// computeLikelyDead applies the "3+ probes, zero successes" heuristic
+// shared by handleNodeDetail's nodeDetailData.LikelyDead and
+// buildNodeTableData's per-row dashboardNodeRow.LikelyDead: a node with
+// at least 3 recorded health checks in history and not a single
+// Reachable == true among them is overwhelmingly likely to be
+// permanently gone rather than just having a bad day — in production,
+// 83% of nodes probed 3+ times never once succeed, so this is a
+// deliberately simple, well-grounded proxy for "persistently dead", not
+// a guess. Fewer than 3 history entries is never enough to conclude
+// anything, so it always returns false in that case.
+func computeLikelyDead(history []storage.HealthCheck) bool {
+	if len(history) < 3 {
+		return false
+	}
+	for _, h := range history {
+		if h.Reachable {
+			return false
+		}
+	}
+	return true
+}
+
+// buildNodeTableData fetches the whole-population dashboardCounts
+// (Total/P2P/Registry/Both/Confirmed/Unconfirmed/OnionCapable/
+// ClearnetOnly — always unfiltered, regardless of reachableSince) plus a
+// paginated page of dashboardNodeRow for a node table. reachableSince
+// nil means no filter (the full node population, for /network);
+// non-nil applies that cutoff (the main dashboard's
+// dashboardReachableWindow liveness view). page/limit/offset drive the
+// SQL-level LIMIT/OFFSET of the paginated page; historyLimit controls
+// how many HealthCheck rows are fetched per row (see
+// dashboardRowHistoryLimit/networkRowHistoryLimit) — LatestHealth only
+// ever needs the most recent one, but computeLikelyDead needs at least
+// 3 to ever return true.
+//
+// This is shared, extract-don't-change logic behind both
+// handleDashboard and handleFullNetwork: same whole-population counts
+// query, same per-row scrub+history+pagination-math shape, differing
+// only in the ReachableSince filter and historyLimit each passes in.
+func buildNodeTableData(ctx context.Context, store storage.Store, reachableSince *time.Time, page, limit, offset, historyLimit int) (dashboardCounts, []dashboardNodeRow, nodeTablePagination, error) {
+	var counts dashboardCounts
+	var pagination nodeTablePagination
+
+	// Unpaginated: dashboardCounts must reflect the WHOLE population,
+	// never just the current page or any ReachableSince filter. This is
+	// a separate query from the paginated one used for the rows below,
+	// deliberately NOT reusing its LIMIT/OFFSET/ReachableSince.
+	allNodes, err := store.ListNodes(ctx, storage.NodeFilter{})
+	if err != nil {
+		return counts, nil, pagination, err
+	}
+
+	allNodeIDs := make([]uuid.UUID, len(allNodes))
+	for i, n := range allNodes {
+		allNodeIDs[i] = n.ID
+	}
+	// ONE batch call for the whole node set — covers both this counts
+	// pass and the paginated table rows below (its keys are a superset
+	// of the paginated page's node IDs), so neither reintroduces the
+	// old per-node ListNodeAddresses N+1.
+	addrsByNode, err := store.ListNodeAddressesForNodes(ctx, allNodeIDs)
+	if err != nil {
+		return counts, nil, pagination, err
+	}
+
+	for _, n := range allNodes {
+		counts.Total++
+		switch n.DiscoverySource {
+		case storage.DiscoverySourceP2P:
+			counts.P2P++
+		case storage.DiscoverySourceRegistry:
+			counts.Registry++
+		case storage.DiscoverySourceBoth:
+			counts.Both++
+		}
+
+		view := scrubForDisplay(n, addrsByNode[n.ID])
+		if view.Identity.Confirmed {
+			counts.Confirmed++
+		} else {
+			counts.Unconfirmed++
+		}
+		if view.Capabilities.HasOnion {
+			counts.OnionCapable++
+		}
+		if (view.Capabilities.HasIPv4 || view.Capabilities.HasIPv6) && !view.Capabilities.HasOnion {
+			counts.ClearnetOnly++
+		}
+	}
+
+	// Paginated: the actual SQL-level LIMIT/OFFSET query backing the
+	// node table rows shown on this page, restricted to reachableSince
+	// if non-nil. This is a display-only cut when non-nil — the
+	// whole-population counts above are deliberately built from the
+	// unfiltered allNodes query and never use this filter.
+	pageNodes, err := store.ListNodes(ctx, storage.NodeFilter{ReachableSince: reachableSince, Limit: limit, Offset: offset})
+	if err != nil {
+		return counts, nil, pagination, err
+	}
+
+	var rows []dashboardNodeRow
+	for _, n := range pageNodes {
+		view := scrubForDisplay(n, addrsByNode[n.ID])
+		row := dashboardNodeRow{
+			Node:            n,
+			Identity:        view.Identity,
+			Capabilities:    view.Capabilities,
+			PublicAddresses: view.PublicAddresses,
+		}
+		history, err := store.GetNodeHistory(ctx, n.ID, historyLimit)
+		if err != nil {
+			return counts, nil, pagination, err
+		}
+		if len(history) > 0 {
+			row.LatestHealth = &history[0]
+		}
+		row.LikelyDead = computeLikelyDead(history)
+		rows = append(rows, row)
+	}
+
+	// filteredTotal is the size of the SAME reachableSince-filtered set
+	// pageNodes is a page of, used only for its len() as pagination
+	// metadata below. When reachableSince is nil, that set IS the whole
+	// population, so counts.Total (already computed above) can be
+	// reused directly instead of firing a second identical query.
+	filteredTotal := counts.Total
+	if reachableSince != nil {
+		filteredNodes, err := store.ListNodes(ctx, storage.NodeFilter{ReachableSince: reachableSince})
+		if err != nil {
+			return counts, nil, pagination, err
+		}
+		filteredTotal = len(filteredNodes)
+	}
+
+	pagination.Page = page
+	pagination.Limit = limit
+	pagination.Total = filteredTotal
+	if len(pageNodes) > 0 {
+		pagination.RangeStart = offset + 1
+		pagination.RangeEnd = offset + len(pageNodes)
+	}
+	pagination.HasPrevPage = page > 1
+	pagination.PrevPage = page - 1
+	pagination.HasNextPage = offset+len(pageNodes) < filteredTotal
+	pagination.NextPage = page + 1
+
+	return counts, rows, pagination, nil
+}
+
+// parseNodeTablePageParams parses the `?page=`/`?limit=` query params
+// shared by both the dashboard's and /network's node tables, applying
+// the same 1-indexed-page/default-page-size/max-page-size conventions
+// (dashboardNodePageSize/dashboardNodeMaxPageSize) to both. Returns the
+// resolved page, limit, and the SQL OFFSET derived from them.
+func parseNodeTablePageParams(r *http.Request) (page, limit, offset int) {
+	page = 1
+	if v := r.URL.Query().Get("page"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			page = n
+		}
+	}
+	limit = dashboardNodePageSize
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > dashboardNodeMaxPageSize {
+		limit = dashboardNodeMaxPageSize
+	}
+	offset = (page - 1) * limit
+	return page, limit, offset
+}
+
 // NewHandler returns an http.Handler serving the dashboard: a homepage
 // summary + node table (with a registry-submission form posted via htmx
 // directly to the /api/nodes JSON API), a per-node detail/history page,
@@ -280,6 +522,7 @@ func NewHandler(store storage.Store, adminCreds adminauth.Credentials) (http.Han
 	mux.HandleFunc("GET /{$}", handleDashboard(tmpl, store))
 	mux.HandleFunc("GET /nodes/{id}", handleNodeDetail(tmpl, store))
 	mux.HandleFunc("GET /topology", handleTopologyGraph(tmpl))
+	mux.HandleFunc("GET /network", handleFullNetwork(tmpl, store))
 	mux.HandleFunc("GET /static/style.css", handleStaticCSS)
 
 	// The submission review page moved under /admin/* (see this
@@ -309,132 +552,34 @@ func handleDashboard(tmpl *template.Template, store storage.Store) http.HandlerF
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 
-		page := 1
-		if v := r.URL.Query().Get("page"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n > 0 {
-				page = n
-			}
-		}
-		limit := dashboardNodePageSize
-		if v := r.URL.Query().Get("limit"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n > 0 {
-				limit = n
-			}
-		}
-		if limit > dashboardNodeMaxPageSize {
-			limit = dashboardNodeMaxPageSize
-		}
-		offset := (page - 1) * limit
+		page, limit, offset := parseNodeTablePageParams(r)
 
-		// Unpaginated: dashboardCounts (Total/P2P/Registry/Both/
-		// Confirmed/Unconfirmed/OnionCapable/ClearnetOnly) must reflect
-		// the WHOLE population, never just the current page. This is a
-		// separate query from the paginated one used for data.Nodes
-		// below, deliberately NOT reusing its LIMIT/OFFSET.
-		allNodes, err := store.ListNodes(ctx, storage.NodeFilter{})
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		allNodeIDs := make([]uuid.UUID, len(allNodes))
-		for i, n := range allNodes {
-			allNodeIDs[i] = n.ID
-		}
-		// ONE batch call for the whole node set — covers both this
-		// counts pass and the paginated table rows below (its keys are
-		// a superset of the paginated page's node IDs), so neither
-		// reintroduces the old per-node ListNodeAddresses N+1.
-		addrsByNode, err := store.ListNodeAddressesForNodes(ctx, allNodeIDs)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		data := dashboardData{TopPeeredWindowLabel: windowLabel(topPeeredWindow)}
-		for _, n := range allNodes {
-			data.Counts.Total++
-			switch n.DiscoverySource {
-			case storage.DiscoverySourceP2P:
-				data.Counts.P2P++
-			case storage.DiscoverySourceRegistry:
-				data.Counts.Registry++
-			case storage.DiscoverySourceBoth:
-				data.Counts.Both++
-			}
-
-			view := scrubForDisplay(n, addrsByNode[n.ID])
-			if view.Identity.Confirmed {
-				data.Counts.Confirmed++
-			} else {
-				data.Counts.Unconfirmed++
-			}
-			if view.Capabilities.HasOnion {
-				data.Counts.OnionCapable++
-			}
-			if (view.Capabilities.HasIPv4 || view.Capabilities.HasIPv6) && !view.Capabilities.HasOnion {
-				data.Counts.ClearnetOnly++
-			}
-		}
-
-		// Paginated: the actual SQL-level LIMIT/OFFSET query backing the
-		// node table rows shown on this page. Restricted to nodes
+		// The main dashboard's Nodes table is restricted to nodes
 		// reachable within dashboardReachableWindow (see its doc
-		// comment) — this is a display-only cut, the whole-population
-		// counts above are deliberately built from the unfiltered
-		// allNodes query and don't use this cutoff at all.
+		// comment) — a display-only cut, the whole-population counts
+		// buildNodeTableData returns are deliberately built from an
+		// unfiltered query and don't use this cutoff at all.
 		cutoff := time.Now().Add(-dashboardReachableWindow)
-		reachableFilter := storage.NodeFilter{ReachableSince: &cutoff}
-		pageNodes, err := store.ListNodes(ctx, storage.NodeFilter{ReachableSince: &cutoff, Limit: limit, Offset: offset})
+		counts, rows, pagination, err := buildNodeTableData(ctx, store, &cutoff, page, limit, offset, dashboardRowHistoryLimit)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		for _, n := range pageNodes {
-			view := scrubForDisplay(n, addrsByNode[n.ID])
-			row := dashboardNodeRow{
-				Node:            n,
-				Identity:        view.Identity,
-				Capabilities:    view.Capabilities,
-				PublicAddresses: view.PublicAddresses,
-			}
-			history, err := store.GetNodeHistory(ctx, n.ID, 1)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			if len(history) > 0 {
-				row.LatestHealth = &history[0]
-			}
-			data.Nodes = append(data.Nodes, row)
-		}
 
-		// reachableTotal is the size of the SAME reachable-within-window
-		// filtered set pageNodes is a page of — a second, unpaginated
-		// ListNodes call with the same ReachableSince filter, used only
-		// for its len() as pagination metadata (NodeTotal/HasNextPage/
-		// etc. below). This is deliberately separate from allNodes
-		// (which drives Counts.Total and must stay unfiltered) — the
-		// table's pagination math needs to reflect what it's actually
-		// paginating through, not the whole population.
-		reachableNodes, err := store.ListNodes(ctx, reachableFilter)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+		data := dashboardData{
+			TopPeeredWindowLabel: windowLabel(topPeeredWindow),
+			Counts:               counts,
+			Nodes:                rows,
+			NodePage:             pagination.Page,
+			NodeLimit:            pagination.Limit,
+			NodeTotal:            pagination.Total,
+			NodeRangeStart:       pagination.RangeStart,
+			NodeRangeEnd:         pagination.RangeEnd,
+			HasPrevPage:          pagination.HasPrevPage,
+			HasNextPage:          pagination.HasNextPage,
+			PrevPage:             pagination.PrevPage,
+			NextPage:             pagination.NextPage,
 		}
-		reachableTotal := len(reachableNodes)
-
-		data.NodePage = page
-		data.NodeLimit = limit
-		data.NodeTotal = reachableTotal
-		if len(pageNodes) > 0 {
-			data.NodeRangeStart = offset + 1
-			data.NodeRangeEnd = offset + len(pageNodes)
-		}
-		data.HasPrevPage = page > 1
-		data.PrevPage = page - 1
-		data.HasNextPage = offset+len(pageNodes) < reachableTotal
-		data.NextPage = page + 1
 
 		height, heightNodeCount, err := store.NetworkHeight(ctx)
 		if err != nil {
@@ -475,6 +620,59 @@ func handleDashboard(tmpl *template.Template, store storage.Store) http.HandlerF
 		}
 
 		if err := tmpl.ExecuteTemplate(w, "index.html.tmpl", data); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	}
+}
+
+// handleFullNetwork serves GET /network: the complete, unfiltered node
+// population (all nodes, paginated — no ReachableSince filter), as a
+// companion to handleDashboard's "/" view, which only shows nodes
+// reachable within dashboardReachableWindow. This is the "show me
+// everything, including likely-dead/stale nodes" view, so its
+// per-row history fetch uses networkRowHistoryLimit (3, not 1) to also
+// compute each row's LikelyDead badge via computeLikelyDead. It
+// deliberately has no "top peered" panel — that stays exclusively on
+// the main dashboard (see networkData's doc comment) — but does reuse
+// the exact same whole-population summary counts and NetworkHeight
+// fetch shown there.
+func handleFullNetwork(tmpl *template.Template, store storage.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+
+		page, limit, offset := parseNodeTablePageParams(r)
+
+		// reachableSince is nil here — /network's table has no
+		// liveness filter at all, unlike handleDashboard's.
+		counts, rows, pagination, err := buildNodeTableData(ctx, store, nil, page, limit, offset, networkRowHistoryLimit)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		data := networkData{
+			Counts:         counts,
+			Nodes:          rows,
+			NodePage:       pagination.Page,
+			NodeLimit:      pagination.Limit,
+			NodeTotal:      pagination.Total,
+			NodeRangeStart: pagination.RangeStart,
+			NodeRangeEnd:   pagination.RangeEnd,
+			HasPrevPage:    pagination.HasPrevPage,
+			HasNextPage:    pagination.HasNextPage,
+			PrevPage:       pagination.PrevPage,
+			NextPage:       pagination.NextPage,
+		}
+
+		height, heightNodeCount, err := store.NetworkHeight(ctx)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		data.NetworkHeight = height
+		data.NetworkHeightNodeCount = heightNodeCount
+
+		if err := tmpl.ExecuteTemplate(w, "network.html.tmpl", data); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 	}
@@ -571,24 +769,12 @@ func handleNodeDetail(tmpl *template.Template, store storage.Store) http.Handler
 			PublicAddresses: view.PublicAddresses,
 		}
 
-		// LikelyDead: "3+ probes, zero successes" against the
-		// already-fetched 50-row history above — no new aggregate
-		// query needed. This is a deliberately simple, well-grounded
-		// proxy for "persistently dead", not a guess: in production,
-		// 83% of nodes probed 3+ times never once succeed, so a node
-		// with at least 3 recorded probes and not a single
-		// Reachable == true among them is overwhelmingly likely to be
-		// permanently gone rather than just having a bad day.
-		if len(history) >= 3 {
-			anyReachable := false
-			for _, h := range history {
-				if h.Reachable {
-					anyReachable = true
-					break
-				}
-			}
-			data.LikelyDead = !anyReachable
-		}
+		// LikelyDead against the already-fetched 50-row history above —
+		// no new aggregate query needed. See computeLikelyDead's doc
+		// comment for the heuristic itself; also reused (with a much
+		// shorter per-row history fetch) by buildNodeTableData for
+		// /network's rows.
+		data.LikelyDead = computeLikelyDead(history)
 
 		for _, e := range edges {
 			otherID := e.ToNodeID

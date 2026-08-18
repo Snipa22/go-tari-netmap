@@ -902,6 +902,10 @@ func TestNonAdminRoutesRemainUnauthenticated(t *testing.T) {
 	if status != http.StatusOK {
 		t.Errorf("no-auth GET /topology status = %d, want %d", status, http.StatusOK)
 	}
+	status, _ = getBody(t, srv.URL+"/network")
+	if status != http.StatusOK {
+		t.Errorf("no-auth GET /network status = %d, want %d", status, http.StatusOK)
+	}
 	status, _ = getBody(t, srv.URL+"/nodes/"+node.ID.String())
 	if status != http.StatusOK {
 		t.Errorf("no-auth GET /nodes/%s status = %d, want %d", node.ID, status, http.StatusOK)
@@ -1005,5 +1009,95 @@ func TestStaticStylesheetServed(t *testing.T) {
 	}
 	if len(body) == 0 {
 		t.Error("expected non-empty CSS body")
+	}
+}
+
+// TestFullNetworkShowsAllNodes asserts GET /network shows a node that
+// GET /'s dashboardReachableWindow filter excludes: a node whose only
+// health check is reachable=false (mirroring the "unreachable" case in
+// TestDashboardReachableWithinWindowFilter, which the main dashboard's
+// table excludes). /network has no such filter, so it must still show
+// this node.
+func TestFullNetworkShowsAllNodes(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	unreachable, err := store.UpsertDiscoveredNode(ctx, "unreachable-network:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert unreachable: %v", err)
+	}
+	if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{NodeID: unreachable.ID, Reachable: false, ProbeSource: storage.ProbeSourceGRPC}); err != nil {
+		t.Fatalf("record health check for unreachable: %v", err)
+	}
+
+	srv := newTestServer(t, store)
+
+	// All four p2p_discovered nodes are privacy-scrubbed (never opted
+	// in), so presence/absence is checked via the never-scrubbed
+	// /nodes/{id} link, same technique as
+	// TestDashboardReachableWithinWindowFilter.
+	unreachableLink := fmt.Sprintf(`href="/nodes/%s"`, unreachable.ID)
+
+	status, networkBody := getBody(t, srv.URL+"/network")
+	if status != http.StatusOK {
+		t.Fatalf("GET /network status = %d, want %d", status, http.StatusOK)
+	}
+	if !strings.Contains(networkBody, unreachableLink) {
+		t.Errorf("GET /network body missing the unreachable node's link %q, want included (no ReachableSince filter)", unreachableLink)
+	}
+	if !strings.Contains(networkBody, "badge-unreachable") {
+		t.Errorf("GET /network body missing a badge-unreachable for the unreachable node")
+	}
+
+	status, dashboardBody := getBody(t, srv.URL+"/")
+	if status != http.StatusOK {
+		t.Fatalf("GET / status = %d, want %d", status, http.StatusOK)
+	}
+	if strings.Contains(dashboardBody, unreachableLink) {
+		t.Errorf("GET / body contains the unreachable node's link %q, want excluded by dashboardReachableWindow", unreachableLink)
+	}
+}
+
+// TestFullNetworkSummaryCounts asserts /network's Summary card-grid
+// renders the same whole-population Counts as the dashboard's, for a
+// small known population: 2 confirmed (one onion-capable, one
+// clearnet-only) and 1 unconfirmed node.
+func TestFullNetworkSummaryCounts(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	const onionAddr = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcd.onion:18142"
+	const clearnetAddr = "1.2.3.4:18142"
+
+	if _, err := store.UpsertConfirmedNode(ctx, onionAddr, []byte("network-summary-onion-pubkey"), storage.DiscoverySourceP2P); err != nil {
+		t.Fatalf("upsert confirmed onion node: %v", err)
+	}
+	if _, err := store.UpsertConfirmedNode(ctx, clearnetAddr, []byte("network-summary-clearnet-pubkey"), storage.DiscoverySourceRegistry); err != nil {
+		t.Fatalf("upsert confirmed clearnet node: %v", err)
+	}
+	if _, err := store.UpsertDiscoveredNode(ctx, "unconfirmed-network:1", storage.DiscoverySourceP2P, nil, nil); err != nil {
+		t.Fatalf("upsert unconfirmed node: %v", err)
+	}
+
+	srv := newTestServer(t, store)
+	status, body := getBody(t, srv.URL+"/network")
+	if status != http.StatusOK {
+		t.Fatalf("GET /network status = %d, want %d", status, http.StatusOK)
+	}
+
+	if !strings.Contains(body, `<div class="card-value">3</div>`) {
+		t.Errorf("GET /network body's Total nodes card doesn't show the whole population (3):\n%s", body)
+	}
+	if !strings.Contains(body, `<div class="card-value">2</div>`) {
+		t.Errorf("GET /network body's Confirmed card doesn't show 2 confirmed nodes:\n%s", body)
+	}
+	if !strings.Contains(body, "1 unconfirmed") {
+		t.Errorf("GET /network body's Confirmed card sub-label doesn't show 1 unconfirmed node:\n%s", body)
+	}
+	if !strings.Contains(body, `<div class="card-label">Onion-capable</div>`) {
+		t.Errorf("GET /network body missing the Onion-capable summary card")
+	}
+	if !strings.Contains(body, `<div class="card-label">Clearnet-only</div>`) {
+		t.Errorf("GET /network body missing the Clearnet-only summary card")
 	}
 }

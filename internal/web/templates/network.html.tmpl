@@ -2,10 +2,8 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>go-tari-netmap</title>
+  <title>go-tari-netmap — full network</title>
   <link rel="stylesheet" href="/static/style.css">
-  <script src="https://unpkg.com/htmx.org@2"></script>
-  <script src="https://unpkg.com/htmx.org@2/dist/ext/json-enc.js"></script>
 </head>
 <body>
   <header class="site-header">
@@ -18,7 +16,12 @@
   </header>
 
   <main>
-    <p class="tagline">Tari network peer-topology + node-health mapping for mining-pool operators picking peers.</p>
+    <p class="tagline">
+      The complete, unfiltered node population — every known node,
+      including nodes that haven't been reachable recently (or ever).
+      For the dashboard's reachable-within-24h view, see the main
+      Dashboard page instead.
+    </p>
 
     <section>
       <h2>Summary</h2>
@@ -53,72 +56,6 @@
     </section>
 
     <section>
-      <h2>Submit a node</h2>
-      <p class="tagline">Submissions are reviewed before appearing publicly.</p>
-      <form class="node-form" hx-ext="json-enc" hx-post="/api/nodes" hx-target="#submit-result" hx-swap="innerHTML">
-        <label>Host <input type="text" name="host" required></label>
-        <label>Port <input type="number" name="port" min="1" max="65535" required></label>
-        <label>Label (optional) <input type="text" name="label"></label>
-        <label>Owner tag (optional) <input type="text" name="owner_tag"></label>
-        <button type="submit">Submit</button>
-      </form>
-      <pre id="submit-result"></pre>
-    </section>
-
-    <section>
-      <h2>Top peered <span class="panel-note">{{ .TopPeeredWindowLabel }}</span></h2>
-      <table>
-        <thead>
-          <tr>
-            <th>Identity</th>
-            <th>Capabilities</th>
-            <th>Address</th>
-            <th>Degree</th>
-            <th>In</th>
-            <th>Out</th>
-            <th>Onion peers</th>
-            <th>Clearnet peers</th>
-          </tr>
-        </thead>
-        <tbody>
-          {{range .TopPeered}}
-          <tr>
-            <td>
-              <a href="/nodes/{{.ID}}">
-                {{if .Identity.Confirmed}}
-                <span class="pubkey" title="{{.Identity.FullHex}}">{{.Identity.ShortHex}}</span>
-                {{else}}
-                <span class="badge badge-unconfirmed">unconfirmed</span>
-                {{end}}
-              </a>
-            </td>
-            <td>
-              <span class="capabilities">
-                {{if or .Capabilities.HasIPv4 .Capabilities.HasIPv6}}<span class="badge badge-clearnet">clearnet</span>{{end}}
-                {{if .Capabilities.HasOnion}}<span class="badge badge-onion">onion</span>{{end}}
-                {{if and (or .Capabilities.HasIPv4 .Capabilities.HasIPv6) .Capabilities.HasOnion}}<span class="badge badge-dualstack">dual-stack</span>{{end}}
-              </span>
-            </td>
-            <td>
-              {{if .PublicAddresses}}
-              {{range .PublicAddresses}}<span class="public-address">{{.}}</span><br>{{end}}
-              <span class="badge badge-registry">opted-in</span>
-              {{end}}
-            </td>
-            <td>{{.Degree}}</td>
-            <td>{{.InDegree}}</td>
-            <td>{{.OutDegree}}</td>
-            <td>{{.OnionPeerCount}}</td>
-            <td>{{.ClearnetPeerCount}}</td>
-          </tr>
-          {{else}}
-          <tr><td colspan="8" class="empty-note">No peer connections observed in the last hour.</td></tr>
-          {{end}}
-        </tbody>
-      </table>
-    </section>
-
-    <section>
       <h2>Nodes</h2>
       <table>
         <thead>
@@ -142,6 +79,9 @@
                 <span class="badge badge-unconfirmed">unconfirmed</span>
                 {{end}}
               </a>
+              {{if .LikelyDead}}
+              <span class="badge badge-likely-dead">likely dead</span>
+              {{end}}
             </td>
             <td>
               <span class="capabilities">
@@ -182,8 +122,8 @@
           {{if .NodeTotal}}Showing {{.NodeRangeStart}}-{{.NodeRangeEnd}} of {{.NodeTotal}} nodes{{else}}No nodes known yet.{{end}}
         </span>
         <span class="pagination-links">
-          {{if .HasPrevPage}}<a href="/?page={{.PrevPage}}">Prev</a>{{else}}<span class="pagination-disabled">Prev</span>{{end}}
-          {{if .HasNextPage}}<a href="/?page={{.NextPage}}">Next</a>{{else}}<span class="pagination-disabled">Next</span>{{end}}
+          {{if .HasPrevPage}}<a href="/network?page={{.PrevPage}}">Prev</a>{{else}}<span class="pagination-disabled">Prev</span>{{end}}
+          {{if .HasNextPage}}<a href="/network?page={{.NextPage}}">Next</a>{{else}}<span class="pagination-disabled">Next</span>{{end}}
         </span>
       </div>
     </section>
