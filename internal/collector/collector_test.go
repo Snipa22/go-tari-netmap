@@ -87,7 +87,7 @@ func newTestStore(t *testing.T) storage.Store {
 	if err != nil {
 		t.Fatalf("connect for truncate: %v", err)
 	}
-	if _, err := pool.Exec(ctx, "TRUNCATE TABLE node_health, peer_edge_observations, node_addresses, nodes CASCADE"); err != nil {
+	if _, err := pool.Exec(ctx, "TRUNCATE TABLE node_health, peer_edge_observations, node_addresses, pending_submissions, nodes CASCADE"); err != nil {
 		pool.Close()
 		t.Fatalf("truncate test tables: %v", err)
 	}
@@ -576,8 +576,8 @@ func TestPollNilP2PClientSkipsP2PProbe(t *testing.T) {
 }
 
 func TestPollIntervalUsesPoolOwnedCadence(t *testing.T) {
-	poolOwned := storage.Node{Tags: map[string]any{"pool_owned": true}}
-	regular := storage.Node{Tags: map[string]any{}}
+	poolOwned := storage.Node{PublicKey: []byte{0x01, 0x02}, Tags: map[string]any{"pool_owned": true}}
+	regular := storage.Node{PublicKey: []byte{0x03, 0x04}, Tags: map[string]any{}}
 
 	c := New(Config{})
 	if got := c.pollInterval(poolOwned); got != PollIntervalPoolOwned {
@@ -585,6 +585,22 @@ func TestPollIntervalUsesPoolOwnedCadence(t *testing.T) {
 	}
 	if got := c.pollInterval(regular); got != PollIntervalGeneric {
 		t.Errorf("pollInterval(regular) = %v, want %v", got, PollIntervalGeneric)
+	}
+}
+
+func TestPollIntervalUsesUnconfirmedCadenceForPlaceholderNodes(t *testing.T) {
+	unconfirmed := storage.Node{PublicKey: nil, Tags: map[string]any{}}
+	confirmed := storage.Node{PublicKey: []byte{0x01, 0x02}, Tags: map[string]any{}}
+
+	c := New(Config{})
+	if got := c.pollInterval(unconfirmed); got != PollIntervalUnconfirmed {
+		t.Errorf("pollInterval(unconfirmed) = %v, want %v", got, PollIntervalUnconfirmed)
+	}
+	if got := c.pollInterval(confirmed); got != PollIntervalGeneric {
+		t.Errorf("pollInterval(confirmed) = %v, want %v", got, PollIntervalGeneric)
+	}
+	if PollIntervalUnconfirmed >= PollIntervalGeneric {
+		t.Errorf("PollIntervalUnconfirmed = %v, want shorter than PollIntervalGeneric = %v", PollIntervalUnconfirmed, PollIntervalGeneric)
 	}
 }
 

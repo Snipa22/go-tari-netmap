@@ -90,7 +90,7 @@ func newTestStore(t *testing.T) storage.Store {
 	if err != nil {
 		t.Fatalf("connect for truncate: %v", err)
 	}
-	if _, err := pool.Exec(ctx, "TRUNCATE TABLE node_health, peer_edge_observations, node_addresses, nodes CASCADE"); err != nil {
+	if _, err := pool.Exec(ctx, "TRUNCATE TABLE node_health, peer_edge_observations, node_addresses, pending_submissions, nodes CASCADE"); err != nil {
 		pool.Close()
 		t.Fatalf("truncate test tables: %v", err)
 	}
@@ -265,6 +265,56 @@ func TestTopologyGraphPage(t *testing.T) {
 	}
 	if strings.Contains(body, p2pAddr) {
 		t.Errorf("GET /topology body contains p2p node's raw address %q", p2pAddr)
+	}
+}
+
+// TestSubmissionsPage asserts GET /submissions renders the pending
+// submissions in a plain HTML table with approve/reject htmx buttons, and
+// that a fully-reviewed (non-pending) submission does not show up.
+func TestSubmissionsPage(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	const pendingAddr = "1.2.3.4:18142"
+	pending, err := store.CreatePendingSubmission(ctx, pendingAddr, nil, nil)
+	if err != nil {
+		t.Fatalf("create pending submission: %v", err)
+	}
+	rejected, err := store.CreatePendingSubmission(ctx, "5.6.7.8:18142", nil, nil)
+	if err != nil {
+		t.Fatalf("create rejected submission: %v", err)
+	}
+	if err := store.RejectPendingSubmission(ctx, rejected.ID, nil); err != nil {
+		t.Fatalf("reject: %v", err)
+	}
+
+	srv := newTestServer(t, store)
+	status, body := getBody(t, srv.URL+"/submissions")
+	if status != http.StatusOK {
+		t.Fatalf("GET /submissions status = %d, want %d", status, http.StatusOK)
+	}
+	if !strings.Contains(body, pendingAddr) {
+		t.Errorf("GET /submissions body missing pending submission's address %q", pendingAddr)
+	}
+	if !strings.Contains(body, fmt.Sprintf("/api/submissions/%s/approve", pending.ID)) {
+		t.Errorf("GET /submissions body missing approve htmx action for %s", pending.ID)
+	}
+	if !strings.Contains(body, fmt.Sprintf("/api/submissions/%s/reject", pending.ID)) {
+		t.Errorf("GET /submissions body missing reject htmx action for %s", pending.ID)
+	}
+	if strings.Contains(body, "5.6.7.8:18142") {
+		t.Errorf("GET /submissions body contains an already-rejected (non-pending) submission's address")
+	}
+	if !strings.Contains(body, "not yet probed") {
+		t.Errorf("GET /submissions body missing the not-yet-probed indicator for %s", pending.ID)
+	}
+
+	if err := store.RecordSubmissionProbeResult(ctx, pending.ID, false); err != nil {
+		t.Fatalf("record submission probe result: %v", err)
+	}
+	_, body = getBody(t, srv.URL+"/submissions")
+	if !strings.Contains(body, "unreachable") {
+		t.Errorf("GET /submissions body missing unreachable probe result for %s", pending.ID)
 	}
 }
 

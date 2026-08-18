@@ -81,7 +81,7 @@ func newTestStore(t *testing.T) Store {
 	}
 
 	ps := store.(*pgStore)
-	if _, err := ps.pool.Exec(ctx, "TRUNCATE TABLE node_health, peer_edge_observations, node_addresses, nodes CASCADE"); err != nil {
+	if _, err := ps.pool.Exec(ctx, "TRUNCATE TABLE node_health, peer_edge_observations, node_addresses, pending_submissions, nodes CASCADE"); err != nil {
 		t.Fatalf("truncate test tables: %v", err)
 	}
 
