@@ -65,6 +65,7 @@ func TestP2PClientGetInfo(t *testing.T) {
 		},
 		identity: &p2p.PeerInfo{
 			RemoteStaticPubKey: []byte("node-own-pubkey"),
+			UserAgent:          "minotari_node/5.5.0",
 		},
 	}
 	client := &p2pNodeClient{probes: fake}
@@ -91,10 +92,8 @@ func TestP2PClientGetInfo(t *testing.T) {
 	if string(info.PublicKey) != "node-own-pubkey" {
 		t.Errorf("PublicKey = %q, want %q", info.PublicKey, "node-own-pubkey")
 	}
-	// Version is intentionally always nil for the P2P path — see
-	// p2pNodeClient.GetInfo's doc comment.
-	if info.Version != nil {
-		t.Errorf("Version = %v, want nil", *info.Version)
+	if info.Version == nil || *info.Version != "minotari_node/5.5.0" {
+		t.Errorf("Version = %v, want %q", info.Version, "minotari_node/5.5.0")
 	}
 	if info.RxtHashrate != nil || info.C29Hashrate != nil || info.Sha3xHashrate != nil {
 		t.Errorf("expected all hashrate fields nil, got Rxt=%v C29=%v Sha3x=%v",
@@ -130,6 +129,9 @@ func TestP2PClientGetInfoIdentityProbeFailureIsNonFatal(t *testing.T) {
 	}
 	if info.PublicKey != nil {
 		t.Errorf("PublicKey = %x, want nil", info.PublicKey)
+	}
+	if info.Version != nil {
+		t.Errorf("Version = %v, want nil", *info.Version)
 	}
 }
 

@@ -104,14 +104,15 @@ func NewP2PClientWithSocksProxy(proxyAddr string) NodeClient {
 
 // GetInfo implements NodeClient.
 //
-// Version is intentionally left nil here: ChainMetadataInfo (the result of
-// go-tari-lib/p2p.ProbeChainMetadata) has no version/user-agent field, and
-// there is no cheap way to get one from the same call. p2p.ProbeWithOptions's
-// PeerInfo.UserAgent is a separate call that requires a second full
-// handshake/dial — not worth the extra round trip just for Version, given
-// the GRPC path already covers Version on nodes that expose GRPC.
+// Version comes from PeerInfo.UserAgent, returned by the same
+// probeIdentity call already made below to recover PublicKey — so it
+// costs nothing extra: ChainMetadataInfo (the result of
+// go-tari-lib/p2p.ProbeChainMetadata) has no version/user-agent field, but
+// probeIdentity's PeerInfo does, and that second dial is already being
+// paid for PublicKey's sake (see below), so Version rides along for free.
+// Like PublicKey, Version simply stays nil if probeIdentity fails.
 //
-// PublicKey, unlike Version, IS worth that second dial: ChainMetadataInfo
+// PublicKey IS worth that second dial: ChainMetadataInfo
 // has no pubkey field at all (out of scope to add — that's inside
 // go-tari-lib), so the only way to get addr's confirmed pubkey over this
 // transport is a second, independent p2p.ProbeWithOptions call (a full
@@ -143,6 +144,10 @@ func (c *p2pNodeClient) GetInfo(ctx context.Context, addr string) (NodeInfo, err
 		log.Printf("p2p GetInfo %s: probeIdentity failed (non-fatal, PublicKey left nil): %v", addr, err)
 	} else {
 		info.PublicKey = peerInfo.RemoteStaticPubKey
+		if peerInfo.UserAgent != "" {
+			v := peerInfo.UserAgent
+			info.Version = &v
+		}
 	}
 
 	height := int64(meta.BestBlockHeight)
