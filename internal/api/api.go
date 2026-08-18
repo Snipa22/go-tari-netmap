@@ -65,6 +65,7 @@ func NewRouter(store storage.Store, grpcClient, p2pClient collector.NodeClient) 
 	mux.HandleFunc("POST /nodes/poll-now", handlePollNow(store, grpcClient, p2pClient))
 	mux.HandleFunc("GET /nodes/{id}", handleGetNode(store))
 	mux.HandleFunc("GET /nodes/{id}/history", handleGetNodeHistory(store))
+	mux.HandleFunc("GET /nodes/{id}/edges", handleGetNodeEdges(store))
 	mux.HandleFunc("GET /topology", handleTopology(store))
 	mux.HandleFunc("GET /topology/top-peered", handleTopPeeredNodes(store))
 
@@ -608,6 +609,107 @@ func handleGetNodeHistory(store storage.Store) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusOK, history)
+	}
+}
+
+// nodeEdgesResponse is the GET /nodes/{id}/edges response body: every
+// known peer_edges row touching the requested node, plus the
+// privacy-scrubbed view of every distinct neighbor node those edges
+// reference. This intentionally mirrors topologyResponse's {nodes, edges}
+// shape (same convention as GET /topology) but gets its own named type
+// since its docs describe a single node's neighborhood rather than the
+// whole graph.
+type nodeEdgesResponse struct {
+	Nodes []PublicNode       `json:"nodes"`
+	Edges []storage.PeerEdge `json:"edges"`
+}
+
+// handleGetNodeEdges powers the topology page's click-to-expand
+// interaction (see topology.html.tmpl): given a node id, it returns that
+// node's known peer edges plus a scrubbed view of every distinct neighbor
+// node they reference, so the client can incrementally grow the
+// force-directed graph outward from an initial small seed (the
+// top-peered set from GET /topology/top-peered) instead of ever needing
+// the full, unbounded GET /topology response.
+//
+// Deliberately does NOT 404 on an id with zero edges (or one that
+// doesn't correspond to any real node at all) — ListNodeEdges's own doc
+// comment confirms it returns an empty slice rather than erroring in
+// that case, and mirroring that "empty, not an error" semantics here
+// means the client-side expand logic doesn't need a special case for a
+// leaf node with no (yet-discovered) peers.
+func handleGetNodeEdges(store storage.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := uuid.Parse(r.PathValue("id"))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, errors.New("invalid node id"))
+			return
+		}
+
+		limit := 50
+		if v := r.URL.Query().Get("limit"); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n <= 0 {
+				writeError(w, http.StatusBadRequest, errors.New("invalid limit"))
+				return
+			}
+			limit = n
+		}
+
+		edges, err := store.ListNodeEdges(r.Context(), id, limit)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+
+		// Collect the set of distinct neighbor ids referenced by these
+		// edges — every FromNodeID/ToNodeID that isn't the requested
+		// node itself. A dedup map, not a slice, both to avoid loading
+		// the same neighbor twice when multiple edges share it and to
+		// naturally no-op on a (currently impossible, but not worth
+		// crashing over) self-edge.
+		neighborSet := make(map[uuid.UUID]struct{}, len(edges)*2)
+		for _, e := range edges {
+			if e.FromNodeID != id {
+				neighborSet[e.FromNodeID] = struct{}{}
+			}
+			if e.ToNodeID != id {
+				neighborSet[e.ToNodeID] = struct{}{}
+			}
+		}
+		neighborIDs := make([]uuid.UUID, 0, len(neighborSet))
+		for nid := range neighborSet {
+			neighborIDs = append(neighborIDs, nid)
+		}
+
+		// Batch address lookup (same style as handleTopology's existing
+		// node-loading loop) rather than N+1 ListNodeAddresses calls.
+		addrsByNode, err := store.ListNodeAddressesForNodes(r.Context(), neighborIDs)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+
+		nodes := make([]PublicNode, 0, len(neighborIDs))
+		for _, nid := range neighborIDs {
+			n, err := store.GetNode(r.Context(), nid)
+			if err != nil {
+				// A neighbor referenced by an edge but since deleted
+				// (deleted mid-flight) shouldn't fail the whole
+				// request — just skip it and return what we can.
+				if errors.Is(err, storage.ErrNotFound) {
+					continue
+				}
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+			nodes = append(nodes, ScrubNode(n, addrsByNode[nid]))
+		}
+
+		// edges carry only from_node_id/to_node_id UUIDs (see
+		// storage.PeerEdge) — no address data, so no scrubbing needed,
+		// same as handleTopology's edges.
+		writeJSON(w, http.StatusOK, nodeEdgesResponse{Nodes: nodes, Edges: edges})
 	}
 }
 
