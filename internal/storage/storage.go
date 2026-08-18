@@ -75,9 +75,29 @@ type Store interface {
 	// at, oldest first.
 	ListNodeAddresses(ctx context.Context, nodeID uuid.UUID) ([]NodeAddress, error)
 
+	// ListNodeAddressesForNodes is the batch form of ListNodeAddresses:
+	// it returns every address ever seen for each of nodeIDs in a single
+	// query, avoiding an N+1 round trip per node. The returned map always
+	// has one entry per input nodeID, even if that node has zero known
+	// addresses (an empty, non-nil slice, never a missing key). An empty
+	// nodeIDs returns an empty map without erroring.
+	ListNodeAddressesForNodes(ctx context.Context, nodeIDs []uuid.UUID) (map[uuid.UUID][]NodeAddress, error)
+
 	// ListNodes returns nodes matching filter. A zero-value filter returns
-	// all nodes.
+	// every node, unpaginated — this is the behavior internal callers
+	// (e.g. the collector's Poll/Discover loops) depend on and must keep
+	// getting forever. filter.Limit/filter.Offset, when set (Limit > 0
+	// and/or Offset > 0), apply real SQL LIMIT/OFFSET pagination on top
+	// of any DiscoverySource filtering; this is strictly opt-in — a zero
+	// Limit never truncates the result set.
 	ListNodes(ctx context.Context, filter NodeFilter) ([]Node, error)
+
+	// CountNodes returns the total number of nodes matching filter's
+	// DiscoverySource (if set), ignoring filter.Limit/filter.Offset — it
+	// always reports the full matching population, for pagination
+	// metadata (e.g. "page N of M" / has-more-pages checks) alongside a
+	// paginated ListNodes call using the same filter.
+	CountNodes(ctx context.Context, filter NodeFilter) (int, error)
 
 	// GetNode returns a single node by ID. Returns ErrNotFound if no such
 	// node exists.
@@ -99,8 +119,17 @@ type Store interface {
 	// last_seen timestamp.
 	RecordPeerEdgeObservation(ctx context.Context, fromNodeID, toNodeID uuid.UUID) error
 
-	// ListTopology returns all nodes and edges for the graph view.
-	ListTopology(ctx context.Context) ([]Node, []PeerEdge, error)
+	// ListTopology returns nodes and edges for the graph view, with no
+	// time-window filtering (every edge ever observed is treated as
+	// "current" — see the pgStore implementation's doc comment for why).
+	// A zero-value TopologyFilter (MaxNodes == 0) returns every node and
+	// edge, unbounded. When filter.MaxNodes > 0, the result is capped to
+	// the top MaxNodes nodes by total peer-degree (see TopologyFilter's
+	// doc comment), and edges are filtered to only those between two
+	// nodes both present in that capped set — the returned graph is
+	// always self-consistent (no edge ever dangles to a node not also
+	// returned).
+	ListTopology(ctx context.Context, filter TopologyFilter) ([]Node, []PeerEdge, error)
 
 	// TopPeeredNodes returns the nodes with the most distinct peers,
 	// counting only peer-edge observations at or after since. A node's
@@ -623,23 +652,70 @@ func (s *pgStore) ListNodeAddresses(ctx context.Context, nodeID uuid.UUID) ([]No
 	return addrs, nil
 }
 
-func (s *pgStore) ListNodes(ctx context.Context, filter NodeFilter) ([]Node, error) {
-	var rows pgx.Rows
-	var err error
-	if filter.DiscoverySource != "" {
-		rows, err = s.pool.Query(ctx, `
-			SELECT `+nodeColumns+`
-			FROM nodes
-			WHERE discovery_source = $1
-			ORDER BY address
-		`, string(filter.DiscoverySource))
-	} else {
-		rows, err = s.pool.Query(ctx, `
-			SELECT `+nodeColumns+`
-			FROM nodes
-			ORDER BY address
-		`)
+// ListNodeAddressesForNodes is the batch form of ListNodeAddresses. It
+// initializes an empty-slice map entry for every input nodeID up front
+// (so a node with zero addresses still gets an empty-slice entry, never a
+// missing key), then fills in rows from a single
+// `WHERE node_id = ANY($1)` query. An empty nodeIDs returns an empty map
+// without querying at all.
+func (s *pgStore) ListNodeAddressesForNodes(ctx context.Context, nodeIDs []uuid.UUID) (map[uuid.UUID][]NodeAddress, error) {
+	out := make(map[uuid.UUID][]NodeAddress, len(nodeIDs))
+	for _, id := range nodeIDs {
+		out[id] = []NodeAddress{}
 	}
+	if len(nodeIDs) == 0 {
+		return out, nil
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, node_id, address, first_seen, last_seen
+		FROM node_addresses
+		WHERE node_id = ANY($1)
+		ORDER BY node_id, first_seen
+	`, nodeIDs)
+	if err != nil {
+		return nil, fmt.Errorf("storage: list node addresses for nodes: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var a NodeAddress
+		if err := rows.Scan(&a.ID, &a.NodeID, &a.Address, &a.FirstSeen, &a.LastSeen); err != nil {
+			return nil, fmt.Errorf("storage: scan node address: %w", err)
+		}
+		out[a.NodeID] = append(out[a.NodeID], a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage: list node addresses for nodes: %w", err)
+	}
+	return out, nil
+}
+
+func (s *pgStore) ListNodes(ctx context.Context, filter NodeFilter) ([]Node, error) {
+	query := "SELECT " + nodeColumns + " FROM nodes"
+	args := []any{}
+
+	if filter.DiscoverySource != "" {
+		args = append(args, string(filter.DiscoverySource))
+		query += fmt.Sprintf(" WHERE discovery_source = $%d", len(args))
+	}
+
+	query += " ORDER BY address"
+
+	// Limit/Offset are strictly opt-in (see NodeFilter's doc comment): a
+	// zero Limit never truncates the result set, since internal callers
+	// (e.g. the collector's Poll/Discover loops) rely on a zero-value
+	// filter returning every node, unpaginated, forever.
+	if filter.Limit > 0 {
+		args = append(args, filter.Limit)
+		query += fmt.Sprintf(" LIMIT $%d", len(args))
+	}
+	if filter.Offset > 0 {
+		args = append(args, filter.Offset)
+		query += fmt.Sprintf(" OFFSET $%d", len(args))
+	}
+
+	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("storage: list nodes: %w", err)
 	}
@@ -657,6 +733,24 @@ func (s *pgStore) ListNodes(ctx context.Context, filter NodeFilter) ([]Node, err
 		return nil, fmt.Errorf("storage: list nodes: %w", err)
 	}
 	return nodes, nil
+}
+
+// CountNodes returns the total number of nodes matching filter's
+// DiscoverySource (if set), ignoring filter.Limit/filter.Offset entirely
+// — it always reports the full matching population.
+func (s *pgStore) CountNodes(ctx context.Context, filter NodeFilter) (int, error) {
+	query := "SELECT count(*) FROM nodes"
+	args := []any{}
+	if filter.DiscoverySource != "" {
+		args = append(args, string(filter.DiscoverySource))
+		query += " WHERE discovery_source = $1"
+	}
+
+	var count int
+	if err := s.pool.QueryRow(ctx, query, args...).Scan(&count); err != nil {
+		return 0, fmt.Errorf("storage: count nodes: %w", err)
+	}
+	return count, nil
 }
 
 func (s *pgStore) GetNode(ctx context.Context, id uuid.UUID) (Node, error) {
@@ -726,39 +820,157 @@ func (s *pgStore) RecordPeerEdgeObservation(ctx context.Context, fromNodeID, toN
 	return nil
 }
 
-// ListTopology returns all nodes and edges for the graph view. It queries
-// the peer_edges VIEW (a rollup of peer_edge_observations), with no
+// scanPeerEdgeRows scans a *peer_edges-shaped* rows result into a
+// []PeerEdge. Shared by ListTopology's capped and uncapped paths.
+func scanPeerEdgeRows(rows pgx.Rows) ([]PeerEdge, error) {
+	edges := []PeerEdge{}
+	for rows.Next() {
+		var e PeerEdge
+		if err := rows.Scan(&e.ID, &e.FromNodeID, &e.ToNodeID, &e.FirstSeen, &e.LastSeen); err != nil {
+			return nil, fmt.Errorf("storage: scan peer edge: %w", err)
+		}
+		edges = append(edges, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage: list topology edges: %w", err)
+	}
+	return edges, nil
+}
+
+// topNodeIDsByDegree ranks every node by total peer-degree — an
+// undirected distinct-peer count across ALL peer_edge_observations, with
+// no time-window filtering (adapted from TopPeeredNodes's degree CTE,
+// minus its `since` filter, since ListTopology's contract is explicitly
+// "no time filtering") — and returns the top maxNodes node IDs.
+//
+// Degree-0 nodes (no edges at all) are included, ordered after every
+// nonzero-degree node, so a mostly-empty network still fills out
+// maxNodes with something to show rather than an oddly small graph; ties
+// (including the "all degree 0" case) are broken by address for
+// determinism.
+func topNodeIDsByDegree(ctx context.Context, pool *pgxpool.Pool, maxNodes int) ([]uuid.UUID, error) {
+	rows, err := pool.Query(ctx, `
+		WITH undirected AS (
+			SELECT from_node_id AS node_id, to_node_id AS other_node_id
+			FROM peer_edge_observations
+			UNION ALL
+			SELECT to_node_id AS node_id, from_node_id AS other_node_id
+			FROM peer_edge_observations
+		),
+		degrees AS (
+			SELECT node_id, count(DISTINCT other_node_id) AS degree
+			FROM undirected
+			GROUP BY node_id
+		)
+		SELECT n.id
+		FROM nodes n
+		LEFT JOIN degrees d ON d.node_id = n.id
+		ORDER BY COALESCE(d.degree, 0) DESC, n.address
+		LIMIT $1
+	`, maxNodes)
+	if err != nil {
+		return nil, fmt.Errorf("storage: rank nodes by degree: %w", err)
+	}
+	defer rows.Close()
+
+	ids := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("storage: scan ranked node id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage: rank nodes by degree: %w", err)
+	}
+	return ids, nil
+}
+
+// ListTopology returns nodes and edges for the graph view. It queries the
+// peer_edges VIEW (a rollup of peer_edge_observations), with no
 // time-window filtering: every edge ever observed shows up as "current".
 // This is intentional for now — there is no delete/edge-removal detection
 // yet, so there is nothing more precise to filter by. Callers wanting a
 // time-bounded view of connectivity (e.g. "who's well-connected in the
 // last hour") should use TopPeeredNodes instead.
-func (s *pgStore) ListTopology(ctx context.Context) ([]Node, []PeerEdge, error) {
-	nodes, err := s.ListNodes(ctx, NodeFilter{})
+//
+// When filter.MaxNodes == 0, behavior is byte-for-byte identical to the
+// original, uncapped ListTopology: every node and every edge. When
+// filter.MaxNodes > 0, the result is capped: only the top MaxNodes nodes
+// by total peer-degree (see topNodeIDsByDegree) are returned, and edges
+// are restricted to those where BOTH endpoints are in that capped set —
+// so the returned graph never has an edge dangling to a node that isn't
+// also present in the returned node list.
+func (s *pgStore) ListTopology(ctx context.Context, filter TopologyFilter) ([]Node, []PeerEdge, error) {
+	if filter.MaxNodes <= 0 {
+		nodes, err := s.ListNodes(ctx, NodeFilter{})
+		if err != nil {
+			return nil, nil, err
+		}
+
+		rows, err := s.pool.Query(ctx, `
+			SELECT id, from_node_id, to_node_id, first_seen, last_seen
+			FROM peer_edges
+			ORDER BY first_seen
+		`)
+		if err != nil {
+			return nil, nil, fmt.Errorf("storage: list topology edges: %w", err)
+		}
+		defer rows.Close()
+
+		edges, err := scanPeerEdgeRows(rows)
+		if err != nil {
+			return nil, nil, err
+		}
+		return nodes, edges, nil
+	}
+
+	nodeIDs, err := topNodeIDsByDegree(ctx, s.pool, filter.MaxNodes)
 	if err != nil {
 		return nil, nil, err
 	}
+	if len(nodeIDs) == 0 {
+		return []Node{}, []PeerEdge{}, nil
+	}
 
-	rows, err := s.pool.Query(ctx, `
+	nodeRows, err := s.pool.Query(ctx, `
+		SELECT `+nodeColumns+`
+		FROM nodes
+		WHERE id = ANY($1)
+		ORDER BY address
+	`, nodeIDs)
+	if err != nil {
+		return nil, nil, fmt.Errorf("storage: list capped topology nodes: %w", err)
+	}
+	defer nodeRows.Close()
+
+	nodes := []Node{}
+	for nodeRows.Next() {
+		n, err := scanNode(nodeRows)
+		if err != nil {
+			return nil, nil, fmt.Errorf("storage: scan node: %w", err)
+		}
+		nodes = append(nodes, n)
+	}
+	if err := nodeRows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("storage: list capped topology nodes: %w", err)
+	}
+
+	edgeRows, err := s.pool.Query(ctx, `
 		SELECT id, from_node_id, to_node_id, first_seen, last_seen
 		FROM peer_edges
+		WHERE from_node_id = ANY($1) AND to_node_id = ANY($1)
 		ORDER BY first_seen
-	`)
+	`, nodeIDs)
 	if err != nil {
-		return nil, nil, fmt.Errorf("storage: list topology edges: %w", err)
+		return nil, nil, fmt.Errorf("storage: list capped topology edges: %w", err)
 	}
-	defer rows.Close()
+	defer edgeRows.Close()
 
-	edges := []PeerEdge{}
-	for rows.Next() {
-		var e PeerEdge
-		if err := rows.Scan(&e.ID, &e.FromNodeID, &e.ToNodeID, &e.FirstSeen, &e.LastSeen); err != nil {
-			return nil, nil, fmt.Errorf("storage: scan peer edge: %w", err)
-		}
-		edges = append(edges, e)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, nil, fmt.Errorf("storage: list topology edges: %w", err)
+	edges, err := scanPeerEdgeRows(edgeRows)
+	if err != nil {
+		return nil, nil, err
 	}
 	return nodes, edges, nil
 }

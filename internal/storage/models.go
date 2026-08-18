@@ -71,11 +71,37 @@ type NodeInput struct {
 }
 
 // NodeFilter filters the results of ListNodes. A zero-value NodeFilter
-// applies no filtering.
+// applies no filtering and no pagination (returns every matching node) —
+// this is relied upon by internal callers like the collector's Poll/
+// Discover loops, which must always see the entire node set. Limit/Offset
+// are strictly opt-in: a Limit of 0 means "no limit" (never a default),
+// and an Offset of 0 means "start from the beginning". Pagination is
+// offset-based, not cursor-based.
 type NodeFilter struct {
 	// DiscoverySource, if non-empty, restricts results to nodes with this
 	// exact discovery_source value.
 	DiscoverySource DiscoverySource
+
+	// Limit, if > 0, caps the number of rows returned (SQL LIMIT). Zero
+	// means unlimited.
+	Limit int
+
+	// Offset, if > 0, skips this many rows before returning results (SQL
+	// OFFSET). Zero means no offset. Offset is meaningful even with
+	// Limit == 0 (skip N, return the rest).
+	Offset int
+}
+
+// TopologyFilter filters/caps the result of ListTopology. A zero-value
+// TopologyFilter (MaxNodes == 0) applies no cap — every node and edge is
+// returned, byte-for-byte identical to ListTopology's pre-capping
+// behavior.
+type TopologyFilter struct {
+	// MaxNodes, if > 0, caps the returned node set to the top MaxNodes
+	// nodes ranked by total peer-degree (see ListTopology's doc comment
+	// for the exact ranking and edge-consistency rules). Zero means no
+	// cap.
+	MaxNodes int
 }
 
 // PeerEdge is a directed edge in the observed peer topology graph.
