@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -249,7 +251,7 @@ func TestListNodesFilter(t *testing.T) {
 		t.Fatalf("GET /nodes: %v", err)
 	}
 	defer resp.Body.Close()
-	var all []storage.Node
+	var all []api.PublicNode
 	if err := json.NewDecoder(resp.Body).Decode(&all); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -262,12 +264,14 @@ func TestListNodesFilter(t *testing.T) {
 		t.Fatalf("GET /nodes?discovery_source=...: %v", err)
 	}
 	defer resp2.Body.Close()
-	var filtered []storage.Node
+	var filtered []api.PublicNode
 	if err := json.NewDecoder(resp2.Body).Decode(&filtered); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(filtered) != 1 || filtered[0].Address != "a:1" {
-		t.Fatalf("filtered = %+v, want just a:1", filtered)
+	// "a:1" is a p2p_discovered node, so its real address is scrubbed
+	// from the response — assert on discovery_source instead of address.
+	if len(filtered) != 1 || filtered[0].DiscoverySource != storage.DiscoverySourceP2P {
+		t.Fatalf("filtered = %+v, want just the p2p_discovered node", filtered)
 	}
 }
 
@@ -288,7 +292,7 @@ func TestGetNode(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
-	var got storage.Node
+	var got api.PublicNode
 	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -372,7 +376,7 @@ func TestTopology(t *testing.T) {
 	}
 
 	var got struct {
-		Nodes []storage.Node     `json:"nodes"`
+		Nodes []api.PublicNode   `json:"nodes"`
 		Edges []storage.PeerEdge `json:"edges"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
@@ -383,5 +387,86 @@ func TestTopology(t *testing.T) {
 	}
 	if len(got.Edges) != 1 {
 		t.Errorf("len(edges) = %d, want 1", len(got.Edges))
+	}
+}
+
+// TestScrubbingP2PVsRegistry is the single most important test in this
+// package: it asserts the hard privacy requirement end-to-end across the
+// actual HTTP responses (raw JSON body substring checks, not just decoded
+// struct field checks, since the whole point is that the raw address
+// string must never appear anywhere in the response body for a
+// p2p_discovered node) — GET /nodes, GET /nodes/{id}, and GET /topology
+// must never leak a p2p_discovered node's address, but must show a
+// registry_submitted node's address (the owner opted in).
+func TestScrubbingP2PVsRegistry(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
+
+	const p2pAddr = "1.2.3.4:18142"
+	const registryAddr = "5.6.7.8:18142"
+
+	p2pNode, err := store.UpsertDiscoveredNode(ctx, p2pAddr, storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert p2p node: %v", err)
+	}
+	registryNode, err := store.UpsertDiscoveredNode(ctx, registryAddr, storage.DiscoverySourceRegistry, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert registry node: %v", err)
+	}
+
+	getBody := func(url string) string {
+		t.Helper()
+		resp, err := http.Get(url)
+		if err != nil {
+			t.Fatalf("GET %s: %v", url, err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		return string(body)
+	}
+
+	// GET /nodes
+	listBody := getBody(srv.URL + "/nodes")
+	if strings.Contains(listBody, p2pAddr) {
+		t.Errorf("GET /nodes body contains p2p node's address %q:\n%s", p2pAddr, listBody)
+	}
+	if !strings.Contains(listBody, registryAddr) {
+		t.Errorf("GET /nodes body missing registry node's address %q:\n%s", registryAddr, listBody)
+	}
+	if !strings.Contains(listBody, `"has_ipv4":true`) {
+		t.Errorf("GET /nodes body missing has_ipv4:true capability signal:\n%s", listBody)
+	}
+
+	// GET /nodes/{id} for each node
+	p2pGetBody := getBody(fmt.Sprintf("%s/nodes/%s", srv.URL, p2pNode.ID))
+	if strings.Contains(p2pGetBody, p2pAddr) {
+		t.Errorf("GET /nodes/%s body contains its own address %q:\n%s", p2pNode.ID, p2pAddr, p2pGetBody)
+	}
+	if !strings.Contains(p2pGetBody, `"has_ipv4":true`) {
+		t.Errorf("GET /nodes/%s body missing has_ipv4:true capability signal:\n%s", p2pNode.ID, p2pGetBody)
+	}
+
+	registryGetBody := getBody(fmt.Sprintf("%s/nodes/%s", srv.URL, registryNode.ID))
+	if !strings.Contains(registryGetBody, registryAddr) {
+		t.Errorf("GET /nodes/%s body missing its own address %q:\n%s", registryNode.ID, registryAddr, registryGetBody)
+	}
+
+	// Cross-check: the p2p node's address must not appear in the
+	// registry node's response either, and vice versa is not asserted
+	// (no reason the registry address would appear there).
+	if strings.Contains(registryGetBody, p2pAddr) {
+		t.Errorf("GET /nodes/%s body contains the OTHER (p2p) node's address %q:\n%s", registryNode.ID, p2pAddr, registryGetBody)
+	}
+
+	// GET /topology
+	topologyBody := getBody(srv.URL + "/topology")
+	if strings.Contains(topologyBody, p2pAddr) {
+		t.Errorf("GET /topology body contains p2p node's address %q:\n%s", p2pAddr, topologyBody)
+	}
+	if !strings.Contains(topologyBody, registryAddr) {
+		t.Errorf("GET /topology body missing registry node's address %q:\n%s", registryAddr, topologyBody)
 	}
 }

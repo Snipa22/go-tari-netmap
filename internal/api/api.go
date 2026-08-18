@@ -54,7 +54,17 @@ func handleListNodes(store storage.Store) http.HandlerFunc {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, nodes)
+
+		public := make([]PublicNode, len(nodes))
+		for i, n := range nodes {
+			addrs, err := store.ListNodeAddresses(r.Context(), n.ID)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+			public[i] = ScrubNode(n, addrs)
+		}
+		writeJSON(w, http.StatusOK, public)
 	}
 }
 
@@ -167,7 +177,13 @@ func handleGetNode(store storage.Store) http.HandlerFunc {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, node)
+
+		addrs, err := store.ListNodeAddresses(r.Context(), node.ID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, ScrubNode(node, addrs))
 	}
 }
 
@@ -200,7 +216,7 @@ func handleGetNodeHistory(store storage.Store) http.HandlerFunc {
 
 // topologyResponse is the GET /topology response body.
 type topologyResponse struct {
-	Nodes []storage.Node     `json:"nodes"`
+	Nodes []PublicNode       `json:"nodes"`
 	Edges []storage.PeerEdge `json:"edges"`
 }
 
@@ -211,7 +227,19 @@ func handleTopology(store storage.Store) http.HandlerFunc {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, topologyResponse{Nodes: nodes, Edges: edges})
+
+		public := make([]PublicNode, len(nodes))
+		for i, n := range nodes {
+			addrs, err := store.ListNodeAddresses(r.Context(), n.ID)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+			public[i] = ScrubNode(n, addrs)
+		}
+		// edges only carry from_node_id/to_node_id UUIDs (see
+		// storage.PeerEdge) — no address data, so no scrubbing needed.
+		writeJSON(w, http.StatusOK, topologyResponse{Nodes: public, Edges: edges})
 	}
 }
 
@@ -242,7 +270,17 @@ func handleTopPeeredNodes(store storage.Store) http.HandlerFunc {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, degrees)
+
+		public := make([]PublicNodeDegree, len(degrees))
+		for i, d := range degrees {
+			pd, err := ScrubNodeDegree(r.Context(), store, d)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+			public[i] = pd
+		}
+		writeJSON(w, http.StatusOK, public)
 	}
 }
 
