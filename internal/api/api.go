@@ -670,13 +670,16 @@ type nodeEdgesResponse struct {
 // means the client-side expand logic doesn't need a special case for a
 // leaf node with no (yet-discovered) peers.
 //
-// Confirmed-neighbors-only filtering: both the returned nodes and edges
-// are restricted to neighbors with a non-empty PublicKey (the same
-// "confirmed" convention as PublicNode.PublicKey/ScrubNode — see
-// privacy.go). This is Alex's call: unconfirmed peers are noise (only
-// ~3% of the ~3100+ real nodes in the network are confirmed) and an
-// unconfirmed node has no pubkey identity worth showing anyway, so
-// there's nothing useful to reveal by expanding into one.
+// Confirmed-neighbors-only filtering (Alex's decision): both the
+// returned nodes and edges are restricted to neighbors with a non-empty
+// PublicKey (i.e. "confirmed" in the same sense as PublicNode's
+// PublicKey doc comment / ScrubNode). Unconfirmed peers are noise here —
+// only ~3% of the ~3100+ real nodes in the network are confirmed — and
+// an unconfirmed node has no pubkey identity worth showing on the
+// topology graph anyway. Any edge whose non-center endpoint is an
+// unconfirmed (or otherwise filtered-out) neighbor is dropped too, so
+// the response never contains a dangling edge reference to a node not
+// present in its own nodes slice.
 func handleGetNodeEdges(store storage.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id, err := uuid.Parse(r.PathValue("id"))
@@ -729,8 +732,11 @@ func handleGetNodeEdges(store storage.Store) http.HandlerFunc {
 			return
 		}
 
+		// confirmedNeighborIDs tracks which neighbors made it into nodes
+		// below (non-empty PublicKey only) — used afterward to filter
+		// edges down to only those touching a confirmed neighbor.
+		confirmedNeighborIDs := make(map[uuid.UUID]struct{}, len(neighborIDs))
 		nodes := make([]PublicNode, 0, len(neighborIDs))
-		confirmedNeighbors := make(map[uuid.UUID]struct{}, len(neighborIDs))
 		for _, nid := range neighborIDs {
 			n, err := store.GetNode(r.Context(), nid)
 			if err != nil {
@@ -743,29 +749,24 @@ func handleGetNodeEdges(store storage.Store) http.HandlerFunc {
 				writeError(w, http.StatusInternalServerError, err)
 				return
 			}
-			// Confirmed-only: skip neighbors with no PublicKey (see
-			// this handler's doc comment). Unconfirmed neighbors are
-			// filtered here rather than downstream so their edges
-			// below can be excluded too via confirmedNeighbors.
 			if len(n.PublicKey) == 0 {
+				// Unconfirmed — excluded, see doc comment above.
 				continue
 			}
-			confirmedNeighbors[nid] = struct{}{}
+			confirmedNeighborIDs[nid] = struct{}{}
 			nodes = append(nodes, ScrubNode(n, addrsByNode[nid]))
 		}
 
-		// Drop any edge whose other endpoint (not the requested node
-		// itself) isn't in confirmedNeighbors — i.e. edges to a
-		// neighbor that got filtered out above as unconfirmed. Without
-		// this, the response would contain dangling edges pointing at
-		// neighbor ids that never appear in Nodes.
+		// Filter edges down to only those whose non-center endpoint is a
+		// confirmed neighbor, so the response never references a
+		// neighbor that got excluded from nodes above.
 		confirmedEdges := make([]storage.PeerEdge, 0, len(edges))
 		for _, e := range edges {
 			other := e.FromNodeID
 			if other == id {
 				other = e.ToNodeID
 			}
-			if _, ok := confirmedNeighbors[other]; ok {
+			if _, ok := confirmedNeighborIDs[other]; ok {
 				confirmedEdges = append(confirmedEdges, e)
 			}
 		}

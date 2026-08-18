@@ -464,45 +464,46 @@ func TestGetNodeHistory(t *testing.T) {
 	}
 }
 
-// TestGetNodeEdges seeds a center node with a p2p_discovered, still-
-// unconfirmed neighbor and a registry_submitted, confirmed neighbor,
-// records real peer-edge observations between them, and asserts
-// GET /nodes/{id}/edges returns exactly the confirmed subset of that
+// TestGetNodeEdges seeds a center node with a p2p_discovered neighbor and
+// a registry_submitted neighbor, records real peer-edge observations
+// between them, and asserts GET /nodes/{id}/edges returns exactly that
 // neighborhood — mirroring TestScrubbingP2PVsRegistry's setup style so
 // scrubbing behavior is actually exercised, not just the neighbor/edge
-// set itself. This also exercises the handler's confirmed-only filtering
-// (see handleGetNodeEdges' doc comment): the unconfirmed p2p neighbor,
-// despite having a real edge to center, must not appear in either Nodes
-// or Edges. The raw-body substring check for the registry neighbor's
+// set itself. The raw-body substring check for the p2p neighbor's
 // address is the single most important assertion here — see
 // TestScrubbingP2PVsRegistry's doc comment for why a decoded-struct-only
 // check wouldn't be sufficient.
+// TestGetNodeEdges also asserts the handler's confirmed-only filtering
+// (see handleGetNodeEdges' doc comment): a neighbor with no confirmed
+// PublicKey — regardless of DiscoverySource — must not appear in either
+// the nodes or edges slice of the response, even though a real edge to
+// it exists in storage.
 func TestGetNodeEdges(t *testing.T) {
 	srv, store := newTestServer(t, nil)
 	ctx := context.Background()
 
 	const centerAddr = "center:1"
-	const p2pAddr = "1.2.3.4:18142"
-	const registryAddr = "5.6.7.8:18142"
+	const confirmedAddr = "5.6.7.8:18142"
+	const unconfirmedAddr = "1.2.3.4:18142"
 
 	center, err := store.UpsertDiscoveredNode(ctx, centerAddr, storage.DiscoverySourceP2P, nil, nil)
 	if err != nil {
 		t.Fatalf("upsert center: %v", err)
 	}
-	// p2pNeighbor is deliberately left unconfirmed (nil PublicKey) —
-	// this is the neighbor the new filtering must exclude even though
-	// it has a real edge to center.
-	p2pNeighbor, err := store.UpsertDiscoveredNode(ctx, p2pAddr, storage.DiscoverySourceP2P, nil, nil)
+	// confirmedNeighbor has a real PublicKey (via UpsertConfirmedNode)
+	// and is registry-sourced, so it must appear in the response *and*
+	// (per PublicNode's opt-in address rule) its real address must be
+	// visible in the response body.
+	confirmedNeighbor, err := store.UpsertConfirmedNode(ctx, confirmedAddr, []byte("confirmed-neighbor-pubkey"), storage.DiscoverySourceRegistry)
 	if err != nil {
-		t.Fatalf("upsert p2p neighbor: %v", err)
+		t.Fatalf("upsert confirmed neighbor: %v", err)
 	}
-	// registryNeighbor is confirmed (has a real PublicKey) via
-	// UpsertConfirmedNode — same call TestUpsertConfirmedNodePromotesPlaceholder
-	// uses — so it's the one neighbor the new filtering must keep.
-	registryPubkey := []byte("confirmed-registry-neighbor-pubkey")
-	registryNeighbor, err := store.UpsertConfirmedNode(ctx, registryAddr, registryPubkey, storage.DiscoverySourceRegistry)
+	// unconfirmedNeighbor has a real edge to center but no PublicKey —
+	// the new confirmed-only filtering must exclude it (and its edge)
+	// from the response entirely.
+	unconfirmedNeighbor, err := store.UpsertDiscoveredNode(ctx, unconfirmedAddr, storage.DiscoverySourceP2P, nil, nil)
 	if err != nil {
-		t.Fatalf("upsert registry neighbor: %v", err)
+		t.Fatalf("upsert unconfirmed neighbor: %v", err)
 	}
 	// A third node, not connected to center at all, must NOT show up in
 	// the response — asserts ListNodeEdges' WHERE clause (and this
@@ -513,11 +514,11 @@ func TestGetNodeEdges(t *testing.T) {
 		t.Fatalf("upsert unrelated: %v", err)
 	}
 
-	if err := store.RecordPeerEdgeObservation(ctx, center.ID, p2pNeighbor.ID); err != nil {
-		t.Fatalf("record edge center->p2p: %v", err)
+	if err := store.RecordPeerEdgeObservation(ctx, center.ID, confirmedNeighbor.ID); err != nil {
+		t.Fatalf("record edge center->confirmed: %v", err)
 	}
-	if err := store.RecordPeerEdgeObservation(ctx, registryNeighbor.ID, center.ID); err != nil {
-		t.Fatalf("record edge registry->center: %v", err)
+	if err := store.RecordPeerEdgeObservation(ctx, unconfirmedNeighbor.ID, center.ID); err != nil {
+		t.Fatalf("record edge unconfirmed->center: %v", err)
 	}
 
 	resp, err := http.Get(fmt.Sprintf("%s/nodes/%s/edges", srv.URL, center.ID))
@@ -541,22 +542,25 @@ func TestGetNodeEdges(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 
+	// Only the confirmed neighbor's edge should survive the filtering —
+	// the edge to the unconfirmed neighbor must be dropped too, not just
+	// the unconfirmed node itself (no dangling edge references).
 	if len(got.Edges) != 1 {
-		t.Fatalf("len(edges) = %d, want 1 (only the edge to the confirmed neighbor):\n%s", len(got.Edges), body)
+		t.Fatalf("len(edges) = %d, want 1:\n%s", len(got.Edges), body)
 	}
 	if len(got.Nodes) != 1 {
-		t.Fatalf("len(nodes) = %d, want 1 (only the confirmed neighbor):\n%s", len(got.Nodes), body)
+		t.Fatalf("len(nodes) = %d, want 1:\n%s", len(got.Nodes), body)
 	}
 
 	gotNodeIDs := map[uuid.UUID]bool{}
 	for _, n := range got.Nodes {
 		gotNodeIDs[n.ID] = true
 	}
-	if gotNodeIDs[p2pNeighbor.ID] {
-		t.Errorf("nodes unexpectedly contains unconfirmed p2p neighbor %v (confirmed-only filtering should exclude it):\n%s", p2pNeighbor.ID, body)
+	if !gotNodeIDs[confirmedNeighbor.ID] {
+		t.Errorf("nodes missing confirmed neighbor %v:\n%s", confirmedNeighbor.ID, body)
 	}
-	if !gotNodeIDs[registryNeighbor.ID] {
-		t.Errorf("nodes missing confirmed registry neighbor %v:\n%s", registryNeighbor.ID, body)
+	if gotNodeIDs[unconfirmedNeighbor.ID] {
+		t.Errorf("nodes unexpectedly contains unconfirmed neighbor %v:\n%s", unconfirmedNeighbor.ID, body)
 	}
 	if gotNodeIDs[unrelated.ID] {
 		t.Errorf("nodes unexpectedly contains unrelated node %v:\n%s", unrelated.ID, body)
@@ -565,21 +569,25 @@ func TestGetNodeEdges(t *testing.T) {
 		t.Errorf("nodes unexpectedly contains the center node itself %v:\n%s", center.ID, body)
 	}
 
+	gotEdgeTouchesUnconfirmed := false
 	for _, e := range got.Edges {
-		if e.FromNodeID == p2pNeighbor.ID || e.ToNodeID == p2pNeighbor.ID {
-			t.Errorf("edges unexpectedly contains an edge to the unconfirmed p2p neighbor %v:\n%s", p2pNeighbor.ID, body)
+		if e.FromNodeID == unconfirmedNeighbor.ID || e.ToNodeID == unconfirmedNeighbor.ID {
+			gotEdgeTouchesUnconfirmed = true
 		}
 	}
+	if gotEdgeTouchesUnconfirmed {
+		t.Errorf("edges unexpectedly contains an edge touching the unconfirmed neighbor %v:\n%s", unconfirmedNeighbor.ID, body)
+	}
 
-	// Privacy: the registry neighbor's (opted-in, confirmed) address must
-	// appear. The p2p neighbor's address is NOT asserted absent here on
-	// its own merits — it's unconfirmed, so confirmed-only filtering
-	// excludes it (and its edge) from the response entirely, which is a
-	// strictly stronger privacy guarantee than merely omitting its
-	// address field would have been.
+	// Privacy: the confirmed neighbor is registry-sourced (opted-in), so
+	// its real address must be visible in the response body. The
+	// unconfirmed neighbor's address is NOT separately asserted absent
+	// here — it's excluded from the response entirely by the new
+	// confirmed-only filtering, which is an even stronger privacy
+	// guarantee than the old per-address scrubbing check.
 	rawBody := string(body)
-	if !strings.Contains(rawBody, registryAddr) {
-		t.Errorf("GET /nodes/%s/edges body missing registry neighbor's address %q:\n%s", center.ID, registryAddr, rawBody)
+	if !strings.Contains(rawBody, confirmedAddr) {
+		t.Errorf("GET /nodes/%s/edges body missing confirmed neighbor's address %q:\n%s", center.ID, confirmedAddr, rawBody)
 	}
 }
 
