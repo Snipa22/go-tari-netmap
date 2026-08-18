@@ -469,6 +469,66 @@ func TestSubmissionsPage(t *testing.T) {
 	}
 }
 
+// TestDashboardNodePagination asserts the dashboard's node table honors
+// `?page=`, rendering the correct subset of nodes per page and the
+// correct Prev/Next link presence/absence at the first/last page
+// boundaries: page 1 must have no Prev link, and the last page must have
+// no Next link.
+func TestDashboardNodePagination(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	// Seed 5 nodes with addresses that sort n1..n5 (ListNodes orders by
+	// address), and a small page size via ?limit= so 2 pages of 3 (3+2)
+	// exercise the boundary without needing 50+ real nodes.
+	for _, addr := range []string{"n1:1", "n2:1", "n3:1", "n4:1", "n5:1"} {
+		if _, err := store.UpsertDiscoveredNode(ctx, addr, storage.DiscoverySourceP2P, nil, nil); err != nil {
+			t.Fatalf("upsert %s: %v", addr, err)
+		}
+	}
+
+	srv := newTestServer(t, store)
+
+	// Page 1 of limit=3: n1, n2, n3. No Prev link, but a Next link (to
+	// page 2) must be present.
+	status, page1Body := getBody(t, srv.URL+"/?page=1&limit=3")
+	if status != http.StatusOK {
+		t.Fatalf("GET /?page=1&limit=3 status = %d, want %d", status, http.StatusOK)
+	}
+	if strings.Contains(page1Body, `href="/?page=0"`) {
+		t.Errorf("GET /?page=1 body contains a Prev link to page 0, want none")
+	}
+	if !strings.Contains(page1Body, `href="/?page=2"`) {
+		t.Errorf("GET /?page=1 body missing a Next link to page 2")
+	}
+	if !strings.Contains(page1Body, "Showing 1-3 of 5 nodes") {
+		t.Errorf("GET /?page=1 body missing the range summary %q:\n%s", "Showing 1-3 of 5 nodes", page1Body)
+	}
+
+	// Page 2 of limit=3: n4, n5 (partial page). Must have a Prev link
+	// back to page 1, and no Next link (this is the last page).
+	status, page2Body := getBody(t, srv.URL+"/?page=2&limit=3")
+	if status != http.StatusOK {
+		t.Fatalf("GET /?page=2&limit=3 status = %d, want %d", status, http.StatusOK)
+	}
+	if !strings.Contains(page2Body, `href="/?page=1"`) {
+		t.Errorf("GET /?page=2 body missing a Prev link to page 1")
+	}
+	if strings.Contains(page2Body, `href="/?page=3"`) {
+		t.Errorf("GET /?page=2 body contains a Next link to page 3, want none (last page)")
+	}
+	if !strings.Contains(page2Body, "Showing 4-5 of 5 nodes") {
+		t.Errorf("GET /?page=2 body missing the range summary %q:\n%s", "Showing 4-5 of 5 nodes", page2Body)
+	}
+
+	// The summary counts (Total nodes card) must reflect the WHOLE
+	// population (5), not just the current page's size (3 or 2), on
+	// every page.
+	if !strings.Contains(page1Body, `<div class="card-value">5</div>`) {
+		t.Errorf("GET /?page=1 body's Total nodes card doesn't show the whole population (5)")
+	}
+}
+
 // TestStaticStylesheetServed asserts the CSS route is wired up and
 // returns a text/css response.
 func TestStaticStylesheetServed(t *testing.T) {

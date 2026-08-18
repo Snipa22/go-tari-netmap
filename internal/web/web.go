@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -135,6 +136,20 @@ type dashboardData struct {
 	NetworkHeightNodeCount int
 	TopPeered              []topPeeredRow
 	TopPeeredWindowLabel   string
+
+	// Node table pagination metadata (see handleDashboard). NodeTotal is
+	// the WHOLE population's count (Counts.Total), not just the current
+	// page — the summary cards above rely on that same total, so the two
+	// never disagree.
+	NodePage       int
+	NodeLimit      int
+	NodeTotal      int
+	NodeRangeStart int
+	NodeRangeEnd   int
+	HasPrevPage    bool
+	HasNextPage    bool
+	PrevPage       int
+	NextPage       int
 }
 
 // peerEdgeRow is one row of a node detail page's "peer connections" table:
@@ -168,6 +183,14 @@ const topPeeredWindow = 1 * time.Hour
 // topPeeredLimit caps the number of rows shown in the dashboard's "top
 // peered" panel.
 const topPeeredLimit = 10
+
+// dashboardNodePageSize is the default page size for the dashboard's node
+// table (`?page=` is 1-indexed; offset = (page-1)*limit).
+const dashboardNodePageSize = 50
+
+// dashboardNodeMaxPageSize caps a caller-supplied `?limit=` on the
+// dashboard's node table.
+const dashboardNodeMaxPageSize = 200
 
 // nodeEdgesLimit caps the number of rows shown in a node detail page's
 // "peer connections" table.
@@ -249,14 +272,50 @@ func handleDashboard(tmpl *template.Template, store storage.Store) http.HandlerF
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 
-		nodes, err := store.ListNodes(ctx, storage.NodeFilter{})
+		page := 1
+		if v := r.URL.Query().Get("page"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				page = n
+			}
+		}
+		limit := dashboardNodePageSize
+		if v := r.URL.Query().Get("limit"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				limit = n
+			}
+		}
+		if limit > dashboardNodeMaxPageSize {
+			limit = dashboardNodeMaxPageSize
+		}
+		offset := (page - 1) * limit
+
+		// Unpaginated: dashboardCounts (Total/P2P/Registry/Both/
+		// Confirmed/Unconfirmed/OnionCapable/ClearnetOnly) must reflect
+		// the WHOLE population, never just the current page. This is a
+		// separate query from the paginated one used for data.Nodes
+		// below, deliberately NOT reusing its LIMIT/OFFSET.
+		allNodes, err := store.ListNodes(ctx, storage.NodeFilter{})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		allNodeIDs := make([]uuid.UUID, len(allNodes))
+		for i, n := range allNodes {
+			allNodeIDs[i] = n.ID
+		}
+		// ONE batch call for the whole node set — covers both this
+		// counts pass and the paginated table rows below (its keys are
+		// a superset of the paginated page's node IDs), so neither
+		// reintroduces the old per-node ListNodeAddresses N+1.
+		addrsByNode, err := store.ListNodeAddressesForNodes(ctx, allNodeIDs)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
 		data := dashboardData{TopPeeredWindowLabel: windowLabel(topPeeredWindow)}
-		for _, n := range nodes {
+		for _, n := range allNodes {
 			data.Counts.Total++
 			switch n.DiscoverySource {
 			case storage.DiscoverySourceP2P:
@@ -267,12 +326,7 @@ func handleDashboard(tmpl *template.Template, store storage.Store) http.HandlerF
 				data.Counts.Both++
 			}
 
-			addrs, err := store.ListNodeAddresses(ctx, n.ID)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			view := scrubForDisplay(n, addrs)
+			view := scrubForDisplay(n, addrsByNode[n.ID])
 			if view.Identity.Confirmed {
 				data.Counts.Confirmed++
 			} else {
@@ -284,7 +338,17 @@ func handleDashboard(tmpl *template.Template, store storage.Store) http.HandlerF
 			if (view.Capabilities.HasIPv4 || view.Capabilities.HasIPv6) && !view.Capabilities.HasOnion {
 				data.Counts.ClearnetOnly++
 			}
+		}
 
+		// Paginated: the actual SQL-level LIMIT/OFFSET query backing the
+		// node table rows shown on this page.
+		pageNodes, err := store.ListNodes(ctx, storage.NodeFilter{Limit: limit, Offset: offset})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		for _, n := range pageNodes {
+			view := scrubForDisplay(n, addrsByNode[n.ID])
 			row := dashboardNodeRow{
 				Node:            n,
 				Identity:        view.Identity,
@@ -301,6 +365,19 @@ func handleDashboard(tmpl *template.Template, store storage.Store) http.HandlerF
 			}
 			data.Nodes = append(data.Nodes, row)
 		}
+
+		total := data.Counts.Total
+		data.NodePage = page
+		data.NodeLimit = limit
+		data.NodeTotal = total
+		if len(pageNodes) > 0 {
+			data.NodeRangeStart = offset + 1
+			data.NodeRangeEnd = offset + len(pageNodes)
+		}
+		data.HasPrevPage = page > 1
+		data.PrevPage = page - 1
+		data.HasNextPage = offset+len(pageNodes) < total
+		data.NextPage = page + 1
 
 		height, heightNodeCount, err := store.NetworkHeight(ctx)
 		if err != nil {
