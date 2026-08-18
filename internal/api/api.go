@@ -54,6 +54,7 @@ func NewRouter(store storage.Store, grpcClient, p2pClient collector.NodeClient) 
 
 	mux.HandleFunc("GET /nodes", handleListNodes(store))
 	mux.HandleFunc("POST /nodes", handleCreateNode(store, grpcClient, p2pClient, limiter, lockouts))
+	mux.HandleFunc("POST /nodes/poll-now", handlePollNow(store, grpcClient, p2pClient))
 	mux.HandleFunc("GET /nodes/{id}", handleGetNode(store))
 	mux.HandleFunc("GET /nodes/{id}/history", handleGetNodeHistory(store))
 	mux.HandleFunc("GET /topology", handleTopology(store))
@@ -237,6 +238,94 @@ func handleCreateNode(store storage.Store, grpcClient, p2pClient collector.NodeC
 		go probeSubmission(store, grpcClient, p2pClient, submission.ID, address)
 
 		writeJSON(w, http.StatusAccepted, submission)
+	}
+}
+
+// pollNowRequest is the POST /nodes/poll-now request body: same host/port
+// shape as createNodeRequest, minus the registry-submission-only fields
+// (Label, OwnerTag) that don't apply to a forced admin probe.
+type pollNowRequest struct {
+	Host string   `json:"host"`
+	Port flexPort `json:"port"`
+}
+
+// pollNowResponse is the POST /nodes/poll-now response body. Unlike
+// every other node-returning endpoint in this file, it returns the
+// FULL, unscrubbed storage.Node (real address, real pubkey if
+// confirmed) rather than going through ScrubNode/PublicNode — this
+// endpoint is explicitly an internal admin/debugging tool operated
+// directly by Alex on the private VLAN, not part of the public
+// read API's privacy contract, and the whole point of this
+// endpoint is giving him the real, current, post-probe node state
+// to confirm things like a dual-stack merge actually happened.
+type pollNowResponse struct {
+	Node  storage.Node `json:"node"`
+	Error string       `json:"error,omitempty"`
+}
+
+// handlePollNow forces a synchronous health-check probe of an
+// address, bypassing the discovery/registry pipeline's usual async
+// kickoff and review queue entirely. Deliberately does NOT call
+// validateSubmittedHost — this is an internal admin-only endpoint
+// (private VLAN, same trust model as the rest of the internal API),
+// and an admin must be able to force-poll local/private-network
+// addresses for testing. Contrast with handleCreateNode's SSRF check
+// above: that check exists because POST /nodes is reachable by
+// untrusted public submitters, which is not the threat model here.
+func handlePollNow(store storage.Store, grpcClient, p2pClient collector.NodeClient) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req pollNowRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid JSON body: %w", err))
+			return
+		}
+
+		if req.Host == "" {
+			writeError(w, http.StatusBadRequest, errors.New("host is required"))
+			return
+		}
+		if req.Port < 1 || req.Port > 65535 {
+			writeError(w, http.StatusBadRequest, errors.New("port must be between 1 and 65535"))
+			return
+		}
+
+		address := fmt.Sprintf("%s:%d", req.Host, req.Port)
+
+		node, err := store.UpsertDiscoveredNode(r.Context(), address, storage.DiscoverySourceP2P, nil, nil)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+
+		// Bounded probe timeout, same convention (and constant) as
+		// the async health-check kickoff elsewhere in this file —
+		// r.Context() alone has no deadline of its own here, and we
+		// want this synchronous call to give up eventually rather
+		// than hang on an unreachable node.
+		ctx, cancel := context.WithTimeout(r.Context(), asyncCheckTimeout)
+		defer cancel()
+
+		// Synchronous, not launched via `go`: the whole point of this
+		// endpoint is to force a probe and report back its result
+		// immediately. A probe failure (unreachable node) is an
+		// expected, useful result to report, not a fatal handler
+		// error — PollOnce already records reachability failures as
+		// rows, not via this returned error (see its doc comment), so
+		// we don't abort on it; we still want to show the resulting
+		// node state either way.
+		pollErr := collector.PollOnce(ctx, grpcClient, p2pClient, store, node)
+
+		updated, err := store.GetNode(ctx, node.ID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+
+		var errStr string
+		if pollErr != nil {
+			errStr = pollErr.Error()
+		}
+		writeJSON(w, http.StatusOK, pollNowResponse{Node: updated, Error: errStr})
 	}
 }
 
