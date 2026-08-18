@@ -623,6 +623,17 @@ func handleGetNodeHistory(store storage.Store) http.HandlerFunc {
 // `?limit=N`.
 const defaultTopologyMaxNodes = 300
 
+// defaultTopologyMaxEdges bounds the default GET /topology response's
+// edge count independently of defaultTopologyMaxNodes. Rationale: even
+// with the node cap in place, the edge count among the capped node set
+// can still be large (observed ~11,616 edges / ~2.8MB in production).
+// Alex's suggested range was 2000-3000; 2500 is the midpoint, keeping the
+// response well below that previous measurement while still showing a
+// meaningful subset of the core topology's edges. Callers that genuinely
+// want everything can pass `?all=true`; callers that want a different
+// explicit cap can pass `?max_edges=N`.
+const defaultTopologyMaxEdges = 2500
+
 // topologyResponse is the GET /topology response body.
 type topologyResponse struct {
 	Nodes []PublicNode       `json:"nodes"`
@@ -632,6 +643,7 @@ type topologyResponse struct {
 func handleTopology(store storage.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		maxNodes := defaultTopologyMaxNodes
+		maxEdges := defaultTopologyMaxEdges
 
 		if v := r.URL.Query().Get("all"); v != "" {
 			all, err := strconv.ParseBool(v)
@@ -641,6 +653,7 @@ func handleTopology(store storage.Store) http.HandlerFunc {
 			}
 			if all {
 				maxNodes = 0
+				maxEdges = 0
 			}
 		}
 
@@ -653,7 +666,16 @@ func handleTopology(store storage.Store) http.HandlerFunc {
 			maxNodes = n
 		}
 
-		nodes, edges, err := store.ListTopology(r.Context(), storage.TopologyFilter{MaxNodes: maxNodes})
+		if v := r.URL.Query().Get("max_edges"); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n <= 0 {
+				writeError(w, http.StatusBadRequest, errors.New("invalid max_edges"))
+				return
+			}
+			maxEdges = n
+		}
+
+		nodes, edges, err := store.ListTopology(r.Context(), storage.TopologyFilter{MaxNodes: maxNodes, MaxEdges: maxEdges})
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return

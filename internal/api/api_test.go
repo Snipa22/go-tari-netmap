@@ -1517,3 +1517,167 @@ func TestTopologyAllTrueUnbounded(t *testing.T) {
 		t.Fatalf("len(got.Edges) = %d, want 3 (unbounded)", len(got.Edges))
 	}
 }
+
+// TestTopologyDefaultMaxEdges asserts GET /topology with no params
+// returns an edges array bounded by defaultTopologyMaxEdges. Seeding
+// thousands of edges to actually exceed the 2500 default isn't practical
+// for a fast/deterministic unit test, so this seeds a small dataset and
+// asserts the invariant holds (it's trivially true here, but it
+// exercises the same default-wiring code path as the production case;
+// the max_edges/all=true tests above are what actually prove the cap
+// truncates when exceeded).
+func TestTopologyDefaultMaxEdges(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
+
+	hub, err := store.UpsertDiscoveredNode(ctx, "hub:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert hub: %v", err)
+	}
+	for _, addr := range []string{"leaf1:1", "leaf2:1"} {
+		leaf, err := store.UpsertDiscoveredNode(ctx, addr, storage.DiscoverySourceP2P, nil, nil)
+		if err != nil {
+			t.Fatalf("upsert %s: %v", addr, err)
+		}
+		if err := store.RecordPeerEdgeObservation(ctx, hub.ID, leaf.ID); err != nil {
+			t.Fatalf("record edge hub->%s: %v", addr, err)
+		}
+	}
+
+	resp, err := http.Get(srv.URL + "/topology")
+	if err != nil {
+		t.Fatalf("GET /topology: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	var got struct {
+		Nodes []api.PublicNode   `json:"nodes"`
+		Edges []storage.PeerEdge `json:"edges"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// 2500 mirrors api.defaultTopologyMaxEdges (unexported).
+	const wantMaxEdges = 2500
+	if len(got.Edges) > wantMaxEdges {
+		t.Fatalf("len(got.Edges) = %d, want <= %d (default max_edges cap)", len(got.Edges), wantMaxEdges)
+	}
+}
+
+// TestTopologyMaxEdgesCap asserts GET /topology?max_edges=N caps the
+// returned edge count independently of the node cap: it seeds a small
+// clique (more real edges between the nodes than the requested
+// max_edges) and a generous ?limit= so every node survives the node cap,
+// then checks the edge count is bounded by max_edges.
+func TestTopologyMaxEdgesCap(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
+
+	// 4 nodes, pairwise connected: 6 undirected edges, more than the
+	// max_edges=3 cap used below.
+	var ids []uuid.UUID
+	for _, addr := range []string{"clique-a:1", "clique-b:1", "clique-c:1", "clique-d:1"} {
+		n, err := store.UpsertDiscoveredNode(ctx, addr, storage.DiscoverySourceP2P, nil, nil)
+		if err != nil {
+			t.Fatalf("upsert %s: %v", addr, err)
+		}
+		ids = append(ids, n.ID)
+	}
+	for i := 0; i < len(ids); i++ {
+		for j := i + 1; j < len(ids); j++ {
+			if err := store.RecordPeerEdgeObservation(ctx, ids[i], ids[j]); err != nil {
+				t.Fatalf("record edge %v -> %v: %v", ids[i], ids[j], err)
+			}
+		}
+	}
+
+	resp, err := http.Get(srv.URL + "/topology?limit=100&max_edges=3")
+	if err != nil {
+		t.Fatalf("GET /topology?limit=100&max_edges=3: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	var got struct {
+		Nodes []api.PublicNode   `json:"nodes"`
+		Edges []storage.PeerEdge `json:"edges"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got.Nodes) != 4 {
+		t.Fatalf("len(got.Nodes) = %d, want 4 (node cap not exceeded)", len(got.Nodes))
+	}
+	if len(got.Edges) > 3 {
+		t.Fatalf("len(got.Edges) = %d, want <= 3 (max_edges cap)", len(got.Edges))
+	}
+}
+
+// TestTopologyAllTrueUnboundedEdges asserts GET /topology?all=true
+// returns the full, uncapped edge set even when there are more edges
+// than defaultTopologyMaxEdges would normally allow -- the escape hatch
+// must be genuinely uncapped on both the node and edge dimensions, not
+// just nodes.
+func TestTopologyAllTrueUnboundedEdges(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
+
+	var ids []uuid.UUID
+	for _, addr := range []string{"clique-a:1", "clique-b:1", "clique-c:1", "clique-d:1"} {
+		n, err := store.UpsertDiscoveredNode(ctx, addr, storage.DiscoverySourceP2P, nil, nil)
+		if err != nil {
+			t.Fatalf("upsert %s: %v", addr, err)
+		}
+		ids = append(ids, n.ID)
+	}
+	for i := 0; i < len(ids); i++ {
+		for j := i + 1; j < len(ids); j++ {
+			if err := store.RecordPeerEdgeObservation(ctx, ids[i], ids[j]); err != nil {
+				t.Fatalf("record edge %v -> %v: %v", ids[i], ids[j], err)
+			}
+		}
+	}
+
+	resp, err := http.Get(srv.URL + "/topology?all=true")
+	if err != nil {
+		t.Fatalf("GET /topology?all=true: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	var got struct {
+		Nodes []api.PublicNode   `json:"nodes"`
+		Edges []storage.PeerEdge `json:"edges"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got.Nodes) != 4 {
+		t.Fatalf("len(got.Nodes) = %d, want 4 (unbounded)", len(got.Nodes))
+	}
+	if len(got.Edges) != 6 {
+		t.Fatalf("len(got.Edges) = %d, want 6 (unbounded, all pairwise edges present)", len(got.Edges))
+	}
+}
+
+// TestTopologyInvalidMaxEdges asserts GET /topology?max_edges= rejects
+// non-positive/non-numeric values with 400, mirroring ?limit='s
+// validation.
+func TestTopologyInvalidMaxEdges(t *testing.T) {
+	srv, _ := newTestServer(t, nil)
+
+	for _, v := range []string{"0", "-1", "not-a-number"} {
+		resp, err := http.Get(srv.URL + "/topology?max_edges=" + v)
+		if err != nil {
+			t.Fatalf("GET /topology?max_edges=%s: %v", v, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("max_edges=%s: status = %d, want %d", v, resp.StatusCode, http.StatusBadRequest)
+		}
+	}
+}
