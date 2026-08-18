@@ -336,6 +336,45 @@ func TestPollRecordsHealthChecksAndRespectsCadence(t *testing.T) {
 	}
 }
 
+// TestPollThreadsPeerIdentityUpdatedAtIntoStorage verifies that a
+// NodeInfo.PeerIdentityUpdatedAt returned by GetInfo makes it all the way
+// through pollOnceWithSource into the recorded storage.HealthCheck.
+func TestPollThreadsPeerIdentityUpdatedAtIntoStorage(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	identityTS := time.Now().Add(-30 * time.Minute).Truncate(time.Microsecond).UTC()
+	client := &fakeClient{
+		info: map[string]NodeInfo{
+			"node:1": {Reachable: true, PeerIdentityUpdatedAt: &identityTS},
+		},
+	}
+
+	node, err := store.UpsertDiscoveredNode(ctx, "node:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	c := New(Config{})
+	c.Storage = store
+	c.GRPCClient = client
+
+	if err := c.Poll(ctx); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+
+	history, err := store.GetNodeHistory(ctx, node.ID, 10)
+	if err != nil {
+		t.Fatalf("get history: %v", err)
+	}
+	if len(history) != 1 {
+		t.Fatalf("len(history) = %d, want 1", len(history))
+	}
+	if history[0].PeerIdentityUpdatedAt == nil || !history[0].PeerIdentityUpdatedAt.Equal(identityTS) {
+		t.Errorf("history[0].PeerIdentityUpdatedAt = %v, want %v", history[0].PeerIdentityUpdatedAt, identityTS)
+	}
+}
+
 func TestPollUnreachableNodeRecordsFailure(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

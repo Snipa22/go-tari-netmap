@@ -66,6 +66,7 @@ func TestP2PClientGetInfo(t *testing.T) {
 		identity: &p2p.PeerInfo{
 			RemoteStaticPubKey: []byte("node-own-pubkey"),
 			UserAgent:          "minotari_node/5.5.0",
+			IdentitySignature:  &p2p.IdentitySignature{UpdatedAt: 1700000000},
 		},
 	}
 	client := &p2pNodeClient{probes: fake}
@@ -95,9 +96,39 @@ func TestP2PClientGetInfo(t *testing.T) {
 	if info.Version == nil || *info.Version != "minotari_node/5.5.0" {
 		t.Errorf("Version = %v, want %q", info.Version, "minotari_node/5.5.0")
 	}
+	if info.PeerIdentityUpdatedAt == nil || !info.PeerIdentityUpdatedAt.Equal(time.Unix(1700000000, 0)) {
+		t.Errorf("PeerIdentityUpdatedAt = %v, want %v", info.PeerIdentityUpdatedAt, time.Unix(1700000000, 0))
+	}
 	if info.RxtHashrate != nil || info.C29Hashrate != nil || info.Sha3xHashrate != nil {
 		t.Errorf("expected all hashrate fields nil, got Rxt=%v C29=%v Sha3x=%v",
 			info.RxtHashrate, info.C29Hashrate, info.Sha3xHashrate)
+	}
+}
+
+// TestP2PClientGetInfoNoIdentitySignatureLeavesPeerIdentityUpdatedAtNil
+// verifies that a peer sending no IdentitySignature at all (a nil
+// pointer, per PeerInfo.IdentitySignature's doc comment in go-tari-lib)
+// leaves PeerIdentityUpdatedAt nil rather than panicking or defaulting to
+// some zero-time value.
+func TestP2PClientGetInfoNoIdentitySignatureLeavesPeerIdentityUpdatedAtNil(t *testing.T) {
+	fake := &fakeP2PProbeFuncs{
+		chainMetadata: &p2p.ChainMetadataInfo{BestBlockHeight: 1},
+		identity: &p2p.PeerInfo{
+			RemoteStaticPubKey: []byte("node-own-pubkey"),
+			IdentitySignature:  nil,
+		},
+	}
+	client := &p2pNodeClient{probes: fake}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	info, err := client.GetInfo(ctx, "127.0.0.1:18189")
+	if err != nil {
+		t.Fatalf("GetInfo: %v", err)
+	}
+	if info.PeerIdentityUpdatedAt != nil {
+		t.Errorf("PeerIdentityUpdatedAt = %v, want nil", *info.PeerIdentityUpdatedAt)
 	}
 }
 
@@ -132,6 +163,9 @@ func TestP2PClientGetInfoIdentityProbeFailureIsNonFatal(t *testing.T) {
 	}
 	if info.Version != nil {
 		t.Errorf("Version = %v, want nil", *info.Version)
+	}
+	if info.PeerIdentityUpdatedAt != nil {
+		t.Errorf("PeerIdentityUpdatedAt = %v, want nil", *info.PeerIdentityUpdatedAt)
 	}
 }
 

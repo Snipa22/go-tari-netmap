@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/Snipa22/go-tari-lib/p2p"
 	pb "github.com/Snipa22/go-tari-lib/p2p/proto"
@@ -112,6 +113,13 @@ func NewP2PClientWithSocksProxy(proxyAddr string) NodeClient {
 // paid for PublicKey's sake (see below), so Version rides along for free.
 // Like PublicKey, Version simply stays nil if probeIdentity fails.
 //
+// PeerIdentityUpdatedAt rides along the exact same way, from
+// PeerInfo.IdentitySignature.UpdatedAt (converted from Unix seconds to a
+// *time.Time) — the peer's own claim of when it last (re-)signed its P2P
+// identity. IdentitySignature is nil if the peer sent no signature (per
+// its own doc comment in go-tari-lib), in which case, like Version and
+// PublicKey, PeerIdentityUpdatedAt is simply left nil.
+//
 // PublicKey IS worth that second dial: ChainMetadataInfo
 // has no pubkey field at all (out of scope to add — that's inside
 // go-tari-lib), so the only way to get addr's confirmed pubkey over this
@@ -147,6 +155,10 @@ func (c *p2pNodeClient) GetInfo(ctx context.Context, addr string) (NodeInfo, err
 		if peerInfo.UserAgent != "" {
 			v := peerInfo.UserAgent
 			info.Version = &v
+		}
+		if peerInfo.IdentitySignature != nil && peerInfo.IdentitySignature.UpdatedAt != 0 {
+			t := time.Unix(peerInfo.IdentitySignature.UpdatedAt, 0)
+			info.PeerIdentityUpdatedAt = &t
 		}
 	}
 

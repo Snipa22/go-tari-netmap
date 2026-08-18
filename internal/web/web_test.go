@@ -716,6 +716,83 @@ func TestNodeDetailLikelyDeadBadge(t *testing.T) {
 	}
 }
 
+// TestNodeDetailIdentityUpdatedAt asserts GET /nodes/{id} shows the peer's
+// self-reported identity-signature timestamp (from the most recent
+// successful health check's PeerIdentityUpdatedAt), and that it reflects
+// the most recent SUCCESSFUL check's value even when a later, unrelated
+// unreachable check (with no identity data) was recorded after it —
+// exercising exactly why handleNodeDetail uses
+// store.GetRecentSuccessfulHealthChecks rather than just History[0].
+func TestNodeDetailIdentityUpdatedAt(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	node, err := store.UpsertDiscoveredNode(ctx, "identity-ts:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert node: %v", err)
+	}
+
+	identityTS := time.Date(2026, 3, 15, 12, 30, 0, 0, time.UTC)
+	if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{
+		NodeID:                node.ID,
+		Reachable:             true,
+		ProbeSource:           storage.ProbeSourceP2P,
+		PeerIdentityUpdatedAt: &identityTS,
+	}); err != nil {
+		t.Fatalf("record successful health check: %v", err)
+	}
+	// A later, unreachable check must not blank out the identity
+	// timestamp shown on the page.
+	if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{
+		NodeID:      node.ID,
+		Reachable:   false,
+		ProbeSource: storage.ProbeSourceGRPC,
+	}); err != nil {
+		t.Fatalf("record later unreachable health check: %v", err)
+	}
+
+	srv := newTestServer(t, store)
+
+	status, body := getBody(t, srv.URL+"/nodes/"+node.ID.String())
+	if status != http.StatusOK {
+		t.Fatalf("GET /nodes/%s status = %d, want %d", node.ID, status, http.StatusOK)
+	}
+	if !strings.Contains(body, "Identity last updated") {
+		t.Errorf("GET /nodes/%s body missing \"Identity last updated\" label", node.ID)
+	}
+	// Check the date/time portion only, not the full String() output:
+	// html/template HTML-escapes the "+" in the "+0000 UTC" zone suffix
+	// as "&#43;", so comparing against the raw String() would spuriously
+	// fail.
+	const wantTS = "2026-03-15 12:30:00"
+	if !strings.Contains(body, wantTS) {
+		t.Errorf("GET /nodes/%s body missing identity timestamp %q\nbody: %s", node.ID, wantTS, body)
+	}
+}
+
+// TestNodeDetailNoSuccessfulHealthChecksShowsPlaceholder asserts a node
+// with no recorded health checks at all renders a "—" placeholder for
+// "Identity last updated" rather than erroring or leaving it blank.
+func TestNodeDetailNoSuccessfulHealthChecksShowsPlaceholder(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	node, err := store.UpsertDiscoveredNode(ctx, "no-history:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert node: %v", err)
+	}
+
+	srv := newTestServer(t, store)
+
+	status, body := getBody(t, srv.URL+"/nodes/"+node.ID.String())
+	if status != http.StatusOK {
+		t.Fatalf("GET /nodes/%s status = %d, want %d", node.ID, status, http.StatusOK)
+	}
+	if !strings.Contains(body, "Identity last updated") {
+		t.Errorf("GET /nodes/%s body missing \"Identity last updated\" label", node.ID)
+	}
+}
+
 // TestNodeDetailHidesP2PAddress asserts GET /nodes/{id} returns 200 and
 // never includes the node's own raw address when it was only
 // p2p_discovered, but does show a registry_submitted node's opted-in

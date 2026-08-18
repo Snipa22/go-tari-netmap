@@ -68,6 +68,13 @@ type NodeInfo struct {
 	RxtHashrate    *float64
 	C29Hashrate    *float64
 	Sha3xHashrate  *float64
+
+	// PeerIdentityUpdatedAt is the peer's own self-reported
+	// identity-signature timestamp — see storage.HealthCheck's field of
+	// the same name for the full rationale. Only ever populated by the
+	// P2P transport (see p2p_client.go's GetInfo); the gRPC path has no
+	// equivalent concept and always leaves this nil.
+	PeerIdentityUpdatedAt *time.Time
 }
 
 // DiscoveredPeer is one address+pubkey pairing reported by a directly
@@ -502,16 +509,17 @@ func pollOnceWithSource(ctx context.Context, client NodeClient, store storage.St
 	}
 
 	return store.RecordHealthCheck(ctx, storage.HealthCheckInput{
-		NodeID:         nodeID,
-		Reachable:      info.Reachable,
-		ProbeSource:    probeSource,
-		Height:         info.Height,
-		ChainTipHeight: info.ChainTipHeight,
-		Version:        info.Version,
-		LatencyMS:      info.LatencyMS,
-		RxtHashrate:    info.RxtHashrate,
-		C29Hashrate:    info.C29Hashrate,
-		Sha3xHashrate:  info.Sha3xHashrate,
+		NodeID:                nodeID,
+		Reachable:             info.Reachable,
+		ProbeSource:           probeSource,
+		Height:                info.Height,
+		ChainTipHeight:        info.ChainTipHeight,
+		Version:               info.Version,
+		LatencyMS:             info.LatencyMS,
+		RxtHashrate:           info.RxtHashrate,
+		C29Hashrate:           info.C29Hashrate,
+		Sha3xHashrate:         info.Sha3xHashrate,
+		PeerIdentityUpdatedAt: info.PeerIdentityUpdatedAt,
 	})
 }
 
