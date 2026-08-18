@@ -108,6 +108,11 @@ func newTestStore(t *testing.T) storage.Store {
 // network access.
 type fakeClient struct {
 	info map[string]collector.NodeInfo
+
+	// delay, if non-zero, is slept before GetInfo returns — used to
+	// assert that the submission probe/health-check kickoff is truly
+	// async and never blocks the triggering HTTP response.
+	delay time.Duration
 }
 
 func (f *fakeClient) GetPeers(ctx context.Context, addr string) ([]collector.DiscoveredPeer, error) {
@@ -115,6 +120,9 @@ func (f *fakeClient) GetPeers(ctx context.Context, addr string) ([]collector.Dis
 }
 
 func (f *fakeClient) GetInfo(ctx context.Context, addr string) (collector.NodeInfo, error) {
+	if f.delay > 0 {
+		time.Sleep(f.delay)
+	}
 	info, ok := f.info[addr]
 	if !ok {
 		return collector.NodeInfo{}, fmt.Errorf("api_test: no fixture GetInfo response for %s", addr)
@@ -806,5 +814,218 @@ func TestRejectSubmissionMalformedBody(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+}
+
+// TestCreateNodeProbeAsync asserts the connectivity probe kicked off by a
+// successful POST /nodes submission never blocks the HTTP response (the
+// whole "async, non-blocking" point), and that probe_attempted_at /
+// probe_reachable do eventually land on the pending_submissions row once
+// the (slow, fixture) probe finishes.
+func TestCreateNodeProbeAsync(t *testing.T) {
+	const addr = "203.0.113.10:18142"
+	client := &fakeClient{
+		info:  map[string]collector.NodeInfo{addr: {Reachable: true}},
+		delay: 2 * time.Second,
+	}
+	srv, store := newTestServer(t, client)
+	ctx := context.Background()
+
+	body := `{"host":"203.0.113.10","port":18142}`
+	start := time.Now()
+	resp, err := http.Post(srv.URL+"/nodes", "application/json", bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatalf("POST /nodes: %v", err)
+	}
+	elapsed := time.Since(start)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, http.StatusAccepted, body)
+	}
+	if elapsed >= 200*time.Millisecond {
+		t.Fatalf("POST /nodes took %v, want well under the 2s probe delay (probe must be async)", elapsed)
+	}
+
+	var submission storage.PendingSubmission
+	if err := json.NewDecoder(resp.Body).Decode(&submission); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if submission.ProbeAttemptedAt != nil {
+		t.Errorf("probe_attempted_at = %v, want nil (probe hasn't finished yet)", submission.ProbeAttemptedAt)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		got, err := store.GetPendingSubmission(ctx, submission.ID)
+		if err != nil {
+			t.Fatalf("get pending submission: %v", err)
+		}
+		if got.ProbeAttemptedAt != nil {
+			if got.ProbeReachable == nil || !*got.ProbeReachable {
+				t.Errorf("probe_reachable = %v, want true", got.ProbeReachable)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for async probe to record a result")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// TestCreateNodeSSRFRejected asserts private/reserved-IP hosts are
+// rejected with 400, while a real public IP and a syntactically valid
+// onion host both still queue normally (202). Each case gets its own
+// fresh server (and so its own fresh rate-limiter/lockout-tracker
+// instance) so the SSRF-rejected cases' strikes don't accumulate into a
+// shared lockout that would corrupt later cases in this same test.
+func TestCreateNodeSSRFRejected(t *testing.T) {
+	cases := []struct {
+		name       string
+		host       string
+		port       int
+		wantStatus int
+	}{
+		{"loopback v4", "127.0.0.1", 18142, http.StatusBadRequest},
+		{"private v4 class C", "192.168.1.1", 18142, http.StatusBadRequest},
+		{"private v4 class A", "10.0.0.1", 18142, http.StatusBadRequest},
+		{"link-local v4", "169.254.1.1", 18142, http.StatusBadRequest},
+		{"loopback v6", "::1", 18142, http.StatusBadRequest},
+		{"public v4", "1.1.1.1", 18143, http.StatusAccepted},
+		{"onion v3-shaped", "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion", 18144, http.StatusAccepted},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, _ := newTestServer(t, nil)
+			body := fmt.Sprintf(`{"host":%q,"port":%d}`, tc.host, tc.port)
+			resp, err := http.Post(srv.URL+"/nodes", "application/json", bytes.NewBufferString(body))
+			if err != nil {
+				t.Fatalf("POST /nodes: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.wantStatus {
+				respBody, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, tc.wantStatus, respBody)
+			}
+		})
+	}
+}
+
+// TestCreateNodeRateLimit asserts the 6th submission from the same
+// source IP within the limiter's window (burst 5) gets 429 with a
+// Retry-After header, while the first 5 (distinct, otherwise-valid
+// addresses) succeed normally.
+func TestCreateNodeRateLimit(t *testing.T) {
+	srv, _ := newTestServer(t, nil)
+
+	for i := 0; i < 5; i++ {
+		body := fmt.Sprintf(`{"host":"198.51.100.%d","port":18142}`, i+1)
+		resp, err := http.Post(srv.URL+"/nodes", "application/json", bytes.NewBufferString(body))
+		if err != nil {
+			t.Fatalf("POST /nodes (%d): %v", i, err)
+		}
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusAccepted {
+			t.Fatalf("submission %d: status = %d, want %d (body: %s)", i, resp.StatusCode, http.StatusAccepted, respBody)
+		}
+	}
+
+	// The 6th submission (still a distinct, otherwise-valid address)
+	// exceeds the per-IP rate limit.
+	body := `{"host":"198.51.100.6","port":18142}`
+	resp, err := http.Post(srv.URL+"/nodes", "application/json", bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatalf("POST /nodes (6th): %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, http.StatusTooManyRequests, respBody)
+	}
+	if resp.Header.Get("Retry-After") == "" {
+		t.Errorf("Retry-After header missing on 429 response")
+	}
+}
+
+// TestCreateNodeInvalidSubmissionLockout asserts that repeated
+// genuinely-invalid submissions (a reused private-IP host) from one
+// source IP eventually flip from repeated 400s to a 429 lockout once the
+// strike threshold is hit.
+func TestCreateNodeInvalidSubmissionLockout(t *testing.T) {
+	srv, _ := newTestServer(t, nil)
+
+	const body = `{"host":"127.0.0.1","port":18142}`
+
+	// strikeThreshold is 4: the first 4 genuinely-invalid submissions
+	// from this IP each get a plain 400 (and record a strike); the 4th
+	// strike crosses the threshold and locks the IP out.
+	for i := 0; i < 4; i++ {
+		resp, err := http.Post(srv.URL+"/nodes", "application/json", bytes.NewBufferString(body))
+		if err != nil {
+			t.Fatalf("POST /nodes (strike %d): %v", i, err)
+		}
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("strike %d: status = %d, want %d (body: %s)", i, resp.StatusCode, http.StatusBadRequest, respBody)
+		}
+	}
+
+	// The next submission — even a well-formed, valid one — is now
+	// blocked by the lockout before validation even runs.
+	resp, err := http.Post(srv.URL+"/nodes", "application/json", bytes.NewBufferString(`{"host":"198.51.100.50","port":18142}`))
+	if err != nil {
+		t.Fatalf("POST /nodes (after lockout): %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, http.StatusTooManyRequests, respBody)
+	}
+	if resp.Header.Get("Retry-After") == "" {
+		t.Errorf("Retry-After header missing on lockout 429 response")
+	}
+}
+
+// TestCreateNodeQueueCap asserts that once the pending-submission queue
+// reaches api.MaxPendingSubmissions, further submissions are rejected
+// with 503 rather than growing the queue further. MaxPendingSubmissions
+// is temporarily lowered so this test doesn't need to create 100 real
+// rows.
+func TestCreateNodeQueueCap(t *testing.T) {
+	orig := api.MaxPendingSubmissions
+	api.MaxPendingSubmissions = 3
+	defer func() { api.MaxPendingSubmissions = orig }()
+
+	srv, _ := newTestServer(t, nil)
+
+	for i := 0; i < 3; i++ {
+		body := fmt.Sprintf(`{"host":"198.51.100.%d","port":18150}`, i+10)
+		resp, err := http.Post(srv.URL+"/nodes", "application/json", bytes.NewBufferString(body))
+		if err != nil {
+			t.Fatalf("POST /nodes (%d): %v", i, err)
+		}
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusAccepted {
+			t.Fatalf("submission %d: status = %d, want %d (body: %s)", i, resp.StatusCode, http.StatusAccepted, respBody)
+		}
+	}
+
+	// The 4th submission is a distinct address too — it must be
+	// rejected purely because the queue is full, not for any other
+	// reason.
+	body := `{"host":"198.51.100.13","port":18150}`
+	resp, err := http.Post(srv.URL+"/nodes", "application/json", bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatalf("POST /nodes (over cap): %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, http.StatusServiceUnavailable, respBody)
 	}
 }

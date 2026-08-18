@@ -33,6 +33,7 @@
             <th>Label</th>
             <th>Owner tag</th>
             <th>Submitted</th>
+            <th>Probe</th>
             <th>Actions</th>
           </tr>
         </thead>
@@ -44,12 +45,18 @@
             <td>{{if .OwnerTag}}{{.OwnerTag}}{{else}}—{{end}}</td>
             <td>{{.SubmittedAt}}</td>
             <td>
+              {{if not .ProbeAttemptedAt}}— not yet probed
+              {{else if derefBool .ProbeReachable}}✅ reachable
+              {{else}}❌ unreachable
+              {{end}}
+            </td>
+            <td>
               <button class="btn-approve" hx-post="/api/submissions/{{.ID}}/approve" hx-target="closest tr" hx-swap="outerHTML">Approve</button>
               <button class="btn-reject" hx-post="/api/submissions/{{.ID}}/reject" hx-confirm="Reject this submission?" hx-target="closest tr" hx-swap="outerHTML">Reject</button>
             </td>
           </tr>
           {{else}}
-          <tr><td colspan="5" class="empty-note">No pending submissions.</td></tr>
+          <tr><td colspan="6" class="empty-note">No pending submissions.</td></tr>
           {{end}}
         </tbody>
       </table>

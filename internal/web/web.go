@@ -176,7 +176,15 @@ const nodeEdgesLimit = 50
 // directly to the /api/nodes JSON API), a per-node detail/history page,
 // and the static CSS stylesheet backing both.
 func NewHandler(store storage.Store) (http.Handler, error) {
-	tmpl, err := template.ParseFS(templatesFS, "templates/*.tmpl")
+	// derefBool is registered as a template func because Go's
+	// text/template `{{if}}` truth test on a pointer only checks
+	// non-nil-ness, not the pointed-to value — a *bool pointing at
+	// false would otherwise render as "true" in
+	// submissions.html.tmpl's probe-result cell. Used to distinguish
+	// nil (not yet probed) from a genuine false (unreachable).
+	tmpl, err := template.New("web").Funcs(template.FuncMap{
+		"derefBool": func(b *bool) bool { return b != nil && *b },
+	}).ParseFS(templatesFS, "templates/*.tmpl")
 	if err != nil {
 		return nil, err
 	}

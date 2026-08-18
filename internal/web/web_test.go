@@ -305,6 +305,17 @@ func TestSubmissionsPage(t *testing.T) {
 	if strings.Contains(body, "5.6.7.8:18142") {
 		t.Errorf("GET /submissions body contains an already-rejected (non-pending) submission's address")
 	}
+	if !strings.Contains(body, "not yet probed") {
+		t.Errorf("GET /submissions body missing the not-yet-probed indicator for %s", pending.ID)
+	}
+
+	if err := store.RecordSubmissionProbeResult(ctx, pending.ID, false); err != nil {
+		t.Fatalf("record submission probe result: %v", err)
+	}
+	_, body = getBody(t, srv.URL+"/submissions")
+	if !strings.Contains(body, "unreachable") {
+		t.Errorf("GET /submissions body missing unreachable probe result for %s", pending.ID)
+	}
 }
 
 // TestStaticStylesheetServed asserts the CSS route is wired up and
