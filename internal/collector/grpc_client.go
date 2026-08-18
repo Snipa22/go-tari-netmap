@@ -2,6 +2,7 @@ package collector
 
 import (
 	"context"
+	"encoding/base32"
 	"encoding/binary"
 	"fmt"
 	"log"
@@ -192,11 +193,12 @@ func (c *grpcNodeClient) GetPeers(ctx context.Context, addr string) ([]Discovere
 //     e.g. "/ip4/1.2.3.4/tcp/18189" or "/ip6/::1/tcp/18189".
 //  2. The bytes are a binary-encoded multiaddr: a sequence of
 //     (varint protocol code, protocol-specific value) pairs per the
-//     multiaddr spec (https://github.com/multiformats/multiaddr). Only
-//     ip4 (code 4, 4 bytes) + tcp (code 6, 2 bytes big-endian port) and
-//     ip6 (code 41, 16 bytes) + tcp (code 6, 2 bytes big-endian port)
-//     combinations are handled, since that covers the ip/tcp peer
-//     addresses a base node advertises.
+//     multiaddr spec (https://github.com/multiformats/multiaddr). ip4
+//     (code 4, 4 bytes) + tcp (code 6, 2 bytes big-endian port), ip6
+//     (code 41, 16 bytes) + tcp (code 6, 2 bytes big-endian port), and
+//     the self-contained onion (code 444, 12 bytes) / onion3 (code 445,
+//     37 bytes) segments are handled, since that covers the ip/tcp and
+//     Tor onion-service peer addresses a base node advertises.
 //
 // If neither encoding yields a usable host:port, it returns ("", false)
 // so the caller can skip the address without crashing or emitting
@@ -219,14 +221,20 @@ func parsePeerAddress(raw []byte) (string, bool) {
 
 // parseTextMultiaddr handles the case where raw is just the UTF-8 bytes of
 // a standard human-readable multiaddr string, e.g.
-// "/ip4/1.2.3.4/tcp/18189" or "/ip6/::1/tcp/18189" or "/dns4/host/tcp/port".
+// "/ip4/1.2.3.4/tcp/18189" or "/ip6/::1/tcp/18189" or "/dns4/host/tcp/port"
+// or "/onion3/<address>:<port>".
 func parseTextMultiaddr(raw []byte) (string, bool) {
 	s := string(raw)
 	if !strings.HasPrefix(s, "/") {
 		return "", false
 	}
 	parts := strings.Split(strings.Trim(s, "/"), "/")
-	if len(parts) < 4 {
+	// Minimum viable text multiaddr is a single proto/value pair (as
+	// used by the self-contained onion/onion3 segments below); ip4/ip6/
+	// dns+tcp combinations need two pairs, but that's enforced by the
+	// host/port emptiness check at the end of this function rather than
+	// here.
+	if len(parts) < 2 || len(parts)%2 != 0 {
 		return "", false
 	}
 
@@ -238,6 +246,26 @@ func parseTextMultiaddr(raw []byte) (string, bool) {
 			host = val
 		case "tcp":
 			port = val
+		case "onion", "onion3":
+			// Unlike ip4/ip6/dns+tcp, onion/onion3 are self-contained
+			// segments: the value is "<address>:<port>", with the
+			// address NOT including the ".onion" suffix (per
+			// go-multiaddr's StringToBytes/onion3StB convention). Split
+			// on the last ":" (the address itself never contains one)
+			// to recover host/port, then lowercase the host (matching
+			// the Tor/base32 casing convention used by the
+			// binary-decoded path) and append ".onion" to keep the
+			// returned host:port format consistent across both paths.
+			idx := strings.LastIndex(val, ":")
+			if idx < 0 {
+				return "", false
+			}
+			onionHost, onionPort := val[:idx], val[idx+1:]
+			if onionHost == "" || onionPort == "" {
+				return "", false
+			}
+			host = strings.ToLower(onionHost) + ".onion"
+			port = onionPort
 		}
 	}
 
@@ -256,12 +284,51 @@ const (
 	multiaddrProtoIP4 = 4
 	multiaddrProtoTCP = 6
 	multiaddrProtoIP6 = 41
+
+	// multiaddrProtoOnion is 0x01bc, the legacy Tor v2 onion address
+	// protocol code. Tor v2 onion services are deprecated network-side,
+	// but old peer records may still reference them, so keep support.
+	// See https://github.com/multiformats/multicodec/blob/master/table.csv.
+	multiaddrProtoOnion = 444
+	// multiaddrProtoOnion3 is 0x01bd, the Tor v3 onion address protocol
+	// code — the current Tor onion service standard.
+	// See https://github.com/multiformats/multicodec/blob/master/table.csv.
+	multiaddrProtoOnion3 = 445
 )
+
+// onionHostLen and onion3HostLen are the raw host byte lengths for the
+// onion/onion3 binary segments, per go-multiaddr's transcoders.go
+// (onionValidate/onion3Validate): onion is 10 raw host bytes + 2 bytes
+// big-endian port (12 bytes total); onion3 is 35 raw host bytes + 2
+// bytes big-endian port (37 bytes total).
+const (
+	onionHostLen  = 10
+	onion3HostLen = 35
+)
+
+// decodeOnionAddr decodes a self-contained onion/onion3 binary multiaddr
+// segment value (raw) into a "host:port" string, per go-multiaddr's
+// transcoders.go onionBtS/onion3BtS: raw must be exactly hostLen+2 bytes
+// (hostLen raw host bytes followed by a 2-byte big-endian port); the host
+// bytes are base32-encoded (encoding/base32, base32.StdEncoding),
+// lowercased, and suffixed with ".onion" to reconstruct the textual onion
+// address. Returns ("", false) on any length mismatch rather than
+// panicking, since onion/onion3 segments are self-contained (host+port in
+// a single segment) unlike ip4/ip6/tcp's separate-segment accumulation.
+func decodeOnionAddr(raw []byte, hostLen int) (string, bool) {
+	if len(raw) != hostLen+2 {
+		return "", false
+	}
+	host := strings.ToLower(base32.StdEncoding.EncodeToString(raw[:hostLen])) + ".onion"
+	port := strconv.Itoa(int(binary.BigEndian.Uint16(raw[hostLen : hostLen+2])))
+	return net.JoinHostPort(host, port), true
+}
 
 // parseBinaryMultiaddr handles the case where raw is a binary-encoded
 // multiaddr: a sequence of (varint protocol code, protocol-specific
-// value bytes) segments. Only ip4/tcp and ip6/tcp combinations are
-// extracted; anything else causes a graceful ("", false) return.
+// value bytes) segments. ip4/tcp, ip6/tcp, and the self-contained
+// onion/onion3 segments are extracted; anything else causes a graceful
+// ("", false) return.
 func parseBinaryMultiaddr(raw []byte) (string, bool) {
 	var host, port string
 
@@ -292,10 +359,20 @@ func parseBinaryMultiaddr(raw []byte) (string, bool) {
 			}
 			port = strconv.Itoa(int(binary.BigEndian.Uint16(buf[:2])))
 			buf = buf[2:]
+		case multiaddrProtoOnion:
+			// onion/onion3 are self-contained: unlike ip4/ip6/tcp
+			// (separate segments accumulated across loop iterations
+			// into host/port), the single segment's bytes encode BOTH
+			// host and port. Decode and return immediately rather than
+			// folding into the host/port accumulation above.
+			return decodeOnionAddr(buf, onionHostLen)
+		case multiaddrProtoOnion3:
+			return decodeOnionAddr(buf, onion3HostLen)
 		default:
 			// Unknown/unsupported protocol segment — this best-effort
-			// parser only understands ip4/ip6/tcp, so bail out rather
-			// than guess at the segment's length and misparse the rest.
+			// parser only understands ip4/ip6/tcp/onion/onion3, so bail
+			// out rather than guess at the segment's length and
+			// misparse the rest.
 			return "", false
 		}
 	}
