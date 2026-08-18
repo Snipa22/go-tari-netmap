@@ -33,15 +33,22 @@
           {{if or .Capabilities.HasIPv4 .Capabilities.HasIPv6 .Capabilities.HasOnion}}
           {{if or .Capabilities.HasIPv4 .Capabilities.HasIPv6}}clearnet{{end}}
           {{if .Capabilities.HasOnion}}onion{{end}}
+          {{if and (or .Capabilities.HasIPv4 .Capabilities.HasIPv6) .Capabilities.HasOnion}}<span class="badge badge-dualstack">dual-stack</span>{{end}}
           {{else}}
           none observed yet
           {{end}}
         </dd>
 
-        {{if .PublicAddress}}
+        {{if .PublicAddresses}}
         <dt>Address</dt>
         <dd>
-          <span class="public-address">{{.PublicAddress}}</span>
+          {{if gt (len .PublicAddresses) 1}}
+          <ul class="public-address-list">
+            {{range .PublicAddresses}}<li><span class="public-address">{{.}}</span></li>{{end}}
+          </ul>
+          {{else}}
+          {{range .PublicAddresses}}<span class="public-address">{{.}}</span>{{end}}
+          {{end}}
           <span class="badge badge-registry">opted in via registry</span>
         </dd>
         {{end}}
