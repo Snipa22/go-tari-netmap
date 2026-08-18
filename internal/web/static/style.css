@@ -328,6 +328,32 @@ tbody tr:hover {
   font-style: italic;
 }
 
+/* Submission review page action buttons */
+
+.btn-approve,
+.btn-reject {
+  border: none;
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  color: #0a1420;
+}
+
+.btn-approve {
+  background: var(--ok);
+}
+
+.btn-reject {
+  background: var(--danger);
+}
+
+.btn-approve:hover,
+.btn-reject:hover {
+  filter: brightness(1.08);
+}
+
 /* Node detail page */
 
 .detail-summary {

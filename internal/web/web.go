@@ -185,6 +185,7 @@ func NewHandler(store storage.Store) (http.Handler, error) {
 	mux.HandleFunc("GET /{$}", handleDashboard(tmpl, store))
 	mux.HandleFunc("GET /nodes/{id}", handleNodeDetail(tmpl, store))
 	mux.HandleFunc("GET /topology", handleTopologyGraph(tmpl))
+	mux.HandleFunc("GET /submissions", handleSubmissions(tmpl, store))
 	mux.HandleFunc("GET /static/style.css", handleStaticCSS)
 	return mux, nil
 }
@@ -303,6 +304,33 @@ func handleDashboard(tmpl *template.Template, store storage.Store) http.HandlerF
 func handleTopologyGraph(tmpl *template.Template) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if err := tmpl.ExecuteTemplate(w, "topology.html.tmpl", nil); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	}
+}
+
+// submissionsData is the template data for submissions.html.tmpl.
+type submissionsData struct {
+	Submissions []storage.PendingSubmission
+}
+
+// handleSubmissions serves the human-facing submission review page: a
+// server-rendered (Go html/template, not client-side JS) table of pending
+// submissions, with Approve/Reject buttons that post directly to the JSON
+// /api/submissions/{id}/approve and /reject endpoints via htmx. This is a
+// distinct route from the JSON GET /api/submissions endpoint registered
+// in internal/api — same path, different mux, following this package's
+// established web-vs-JSON-API split (see NewHandler's doc comment).
+func handleSubmissions(tmpl *template.Template, store storage.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		submissions, err := store.ListPendingSubmissions(r.Context(), "pending")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		data := submissionsData{Submissions: submissions}
+		if err := tmpl.ExecuteTemplate(w, "submissions.html.tmpl", data); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 	}

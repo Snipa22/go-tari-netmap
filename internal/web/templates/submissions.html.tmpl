@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>go-tari-netmap — submissions</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="https://unpkg.com/htmx.org@2"></script>
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-title"><a href="/">go-tari-netmap</a></div>
+    <nav>
+      <a href="/">Dashboard</a>
+      <a href="/topology">Topology</a>
+      <a href="/submissions">Submissions</a>
+    </nav>
+  </header>
+
+  <main>
+    <p class="tagline">
+      Public node submissions awaiting review. Approving promotes a
+      submission into the real node registry (address, label, and owner
+      tag are only published once approved); rejecting discards it
+      without ever touching the node registry.
+    </p>
+
+    <section>
+      <h2>Pending submissions</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Address</th>
+            <th>Label</th>
+            <th>Owner tag</th>
+            <th>Submitted</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{range .Submissions}}
+          <tr>
+            <td class="mono">{{.Address}}</td>
+            <td>{{if .Label}}{{.Label}}{{else}}—{{end}}</td>
+            <td>{{if .OwnerTag}}{{.OwnerTag}}{{else}}—{{end}}</td>
+            <td>{{.SubmittedAt}}</td>
+            <td>
+              <button class="btn-approve" hx-post="/api/submissions/{{.ID}}/approve" hx-target="closest tr" hx-swap="outerHTML">Approve</button>
+              <button class="btn-reject" hx-post="/api/submissions/{{.ID}}/reject" hx-confirm="Reject this submission?" hx-target="closest tr" hx-swap="outerHTML">Reject</button>
+            </td>
+          </tr>
+          {{else}}
+          <tr><td colspan="5" class="empty-note">No pending submissions.</td></tr>
+          {{end}}
+        </tbody>
+      </table>
+    </section>
+  </main>
+</body>
+</html>
