@@ -55,7 +55,7 @@ func buildIdentity(publicKey []byte) identity {
 
 // capabilities mirrors api.PublicNode's HasIPv4/HasIPv6/HasOnion booleans:
 // what transports a node is known to have, without revealing any real
-// address string unless the node has opted in (see PublicAddress on the
+// address string unless the node has opted in (see PublicAddresses on the
 // row/detail types below).
 type capabilities struct {
 	HasIPv4  bool
@@ -71,9 +71,9 @@ type capabilities struct {
 // reimplementing the classification rule, is what guarantees the web
 // layer can never accidentally show a p2p_discovered node's raw address.
 type scrubbedView struct {
-	Identity      identity
-	Capabilities  capabilities
-	PublicAddress *string
+	Identity        identity
+	Capabilities    capabilities
+	PublicAddresses []string
 }
 
 // scrubForDisplay builds a scrubbedView for n given its known addresses
@@ -82,9 +82,9 @@ type scrubbedView struct {
 func scrubForDisplay(n storage.Node, addrs []storage.NodeAddress) scrubbedView {
 	pn := api.ScrubNode(n, addrs)
 	return scrubbedView{
-		Identity:      buildIdentity(pn.PublicKey),
-		Capabilities:  capabilities{HasIPv4: pn.HasIPv4, HasIPv6: pn.HasIPv6, HasOnion: pn.HasOnion},
-		PublicAddress: pn.Address,
+		Identity:        buildIdentity(pn.PublicKey),
+		Capabilities:    capabilities{HasIPv4: pn.HasIPv4, HasIPv6: pn.HasIPv6, HasOnion: pn.HasOnion},
+		PublicAddresses: pn.Addresses,
 	}
 }
 
@@ -109,22 +109,22 @@ type dashboardNodeRow struct {
 	storage.Node
 	LatestHealth *storage.HealthCheck
 
-	Identity      identity
-	Capabilities  capabilities
-	PublicAddress *string
+	Identity        identity
+	Capabilities    capabilities
+	PublicAddresses []string
 }
 
 // topPeeredRow is one row of the dashboard's "top peered" panel: a node's
 // privacy-scrubbed identity plus its connectivity stats from
 // storage.TopPeeredNodes.
 type topPeeredRow struct {
-	ID            uuid.UUID
-	Identity      identity
-	Capabilities  capabilities
-	PublicAddress *string
-	Degree        int
-	InDegree      int
-	OutDegree     int
+	ID              uuid.UUID
+	Identity        identity
+	Capabilities    capabilities
+	PublicAddresses []string
+	Degree          int
+	InDegree        int
+	OutDegree       int
 }
 
 // dashboardData is the template data for index.html.tmpl.
@@ -154,10 +154,10 @@ type nodeDetailData struct {
 	Node    storage.Node
 	History []storage.HealthCheck
 
-	Identity      identity
-	Capabilities  capabilities
-	PublicAddress *string
-	PeerEdges     []peerEdgeRow
+	Identity        identity
+	Capabilities    capabilities
+	PublicAddresses []string
+	PeerEdges       []peerEdgeRow
 }
 
 // topPeeredWindow is the lookback window used to compute the dashboard's
@@ -267,7 +267,12 @@ func handleDashboard(tmpl *template.Template, store storage.Store) http.HandlerF
 				data.Counts.Both++
 			}
 
-			view := scrubForDisplay(n, nil)
+			addrs, err := store.ListNodeAddresses(ctx, n.ID)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			view := scrubForDisplay(n, addrs)
 			if view.Identity.Confirmed {
 				data.Counts.Confirmed++
 			} else {
@@ -281,10 +286,10 @@ func handleDashboard(tmpl *template.Template, store storage.Store) http.HandlerF
 			}
 
 			row := dashboardNodeRow{
-				Node:          n,
-				Identity:      view.Identity,
-				Capabilities:  view.Capabilities,
-				PublicAddress: view.PublicAddress,
+				Node:            n,
+				Identity:        view.Identity,
+				Capabilities:    view.Capabilities,
+				PublicAddresses: view.PublicAddresses,
 			}
 			history, err := store.GetNodeHistory(ctx, n.ID, 1)
 			if err != nil {
@@ -323,13 +328,13 @@ func handleDashboard(tmpl *template.Template, store storage.Store) http.HandlerF
 			}
 			view := scrubForDisplay(n, addrs)
 			data.TopPeered = append(data.TopPeered, topPeeredRow{
-				ID:            nd.NodeID,
-				Identity:      view.Identity,
-				Capabilities:  view.Capabilities,
-				PublicAddress: view.PublicAddress,
-				Degree:        nd.Degree,
-				InDegree:      nd.InDegree,
-				OutDegree:     nd.OutDegree,
+				ID:              nd.NodeID,
+				Identity:        view.Identity,
+				Capabilities:    view.Capabilities,
+				PublicAddresses: view.PublicAddresses,
+				Degree:          nd.Degree,
+				InDegree:        nd.InDegree,
+				OutDegree:       nd.OutDegree,
 			})
 		}
 
@@ -421,11 +426,11 @@ func handleNodeDetail(tmpl *template.Template, store storage.Store) http.Handler
 		}
 
 		data := nodeDetailData{
-			Node:          node,
-			History:       history,
-			Identity:      view.Identity,
-			Capabilities:  view.Capabilities,
-			PublicAddress: view.PublicAddress,
+			Node:            node,
+			History:         history,
+			Identity:        view.Identity,
+			Capabilities:    view.Capabilities,
+			PublicAddresses: view.PublicAddresses,
 		}
 
 		for _, e := range edges {

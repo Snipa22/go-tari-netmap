@@ -224,6 +224,154 @@ func TestNodeDetailHidesP2PAddress(t *testing.T) {
 	}
 }
 
+// TestDualStackBadgeShownForOptedInNodeWithBothTransports asserts a node
+// with both a clearnet and an onion address known renders the
+// "badge-dualstack" badge in both the dashboard (GET /) and the node
+// detail page (GET /nodes/{id}). Two addresses attach to the same node by
+// confirming the same pubkey at two different addresses, per
+// TestUpsertConfirmedNodeAddsAddressToKnownPubkey's established pattern.
+func TestDualStackBadgeShownForOptedInNodeWithBothTransports(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	const clearnetAddr = "1.2.3.4:18142"
+	const onionAddr = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcd.onion:18142"
+	pubkey := []byte("dual-stack-pubkey")
+
+	node, err := store.UpsertConfirmedNode(ctx, clearnetAddr, pubkey, storage.DiscoverySourceRegistry)
+	if err != nil {
+		t.Fatalf("upsert confirmed clearnet: %v", err)
+	}
+	if _, err := store.UpsertConfirmedNode(ctx, onionAddr, pubkey, storage.DiscoverySourceRegistry); err != nil {
+		t.Fatalf("upsert confirmed onion: %v", err)
+	}
+
+	srv := newTestServer(t, store)
+
+	_, dashboardBody := getBody(t, srv.URL+"/")
+	if !strings.Contains(dashboardBody, "badge-dualstack") {
+		t.Errorf("GET / body missing badge-dualstack for a node with both clearnet and onion addresses")
+	}
+
+	_, detailBody := getBody(t, srv.URL+"/nodes/"+node.ID.String())
+	if !strings.Contains(detailBody, "badge-dualstack") {
+		t.Errorf("GET /nodes/%s body missing badge-dualstack for a node with both clearnet and onion addresses", node.ID)
+	}
+}
+
+// TestDualStackBadgeHiddenForSingleTransportNodes asserts nodes with only
+// clearnet or only onion addresses known never render "badge-dualstack"
+// in either the dashboard or the node detail page.
+func TestDualStackBadgeHiddenForSingleTransportNodes(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	clearnetOnly, err := store.UpsertDiscoveredNode(ctx, "1.2.3.4:18142", storage.DiscoverySourceRegistry, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert clearnet-only node: %v", err)
+	}
+	onionOnly, err := store.UpsertDiscoveredNode(ctx, "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcd.onion:18142", storage.DiscoverySourceRegistry, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert onion-only node: %v", err)
+	}
+
+	srv := newTestServer(t, store)
+
+	_, dashboardBody := getBody(t, srv.URL+"/")
+	if strings.Contains(dashboardBody, "badge-dualstack") {
+		t.Errorf("GET / body contains badge-dualstack, but no node has both clearnet and onion addresses")
+	}
+
+	_, clearnetBody := getBody(t, srv.URL+"/nodes/"+clearnetOnly.ID.String())
+	if strings.Contains(clearnetBody, "badge-dualstack") {
+		t.Errorf("GET /nodes/%s body contains badge-dualstack for a clearnet-only node", clearnetOnly.ID)
+	}
+
+	_, onionBody := getBody(t, srv.URL+"/nodes/"+onionOnly.ID.String())
+	if strings.Contains(onionBody, "badge-dualstack") {
+		t.Errorf("GET /nodes/%s body contains badge-dualstack for an onion-only node", onionOnly.ID)
+	}
+}
+
+// TestOptedInNodeWithMultipleAddressesShowsAllAddresses asserts an
+// opted-in (registry_submitted or both) node with multiple known
+// addresses (one clearnet, one onion) shows BOTH real address strings in
+// the dashboard and node detail page bodies — the web-layer proof of
+// Request 2's multi-address display.
+func TestOptedInNodeWithMultipleAddressesShowsAllAddresses(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	const clearnetAddr = "1.2.3.4:18142"
+	const onionAddr = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcd.onion:18142"
+	pubkey := []byte("multi-addr-pubkey")
+
+	node, err := store.UpsertConfirmedNode(ctx, clearnetAddr, pubkey, storage.DiscoverySourceBoth)
+	if err != nil {
+		t.Fatalf("upsert confirmed clearnet: %v", err)
+	}
+	if _, err := store.UpsertConfirmedNode(ctx, onionAddr, pubkey, storage.DiscoverySourceBoth); err != nil {
+		t.Fatalf("upsert confirmed onion: %v", err)
+	}
+
+	srv := newTestServer(t, store)
+
+	_, dashboardBody := getBody(t, srv.URL+"/")
+	if !strings.Contains(dashboardBody, clearnetAddr) {
+		t.Errorf("GET / body missing opted-in node's clearnet address %q", clearnetAddr)
+	}
+	if !strings.Contains(dashboardBody, onionAddr) {
+		t.Errorf("GET / body missing opted-in node's onion address %q", onionAddr)
+	}
+
+	_, detailBody := getBody(t, srv.URL+"/nodes/"+node.ID.String())
+	if !strings.Contains(detailBody, clearnetAddr) {
+		t.Errorf("GET /nodes/%s body missing opted-in node's clearnet address %q", node.ID, clearnetAddr)
+	}
+	if !strings.Contains(detailBody, onionAddr) {
+		t.Errorf("GET /nodes/%s body missing opted-in node's onion address %q", node.ID, onionAddr)
+	}
+}
+
+// TestP2PNodeWithMultipleAddressesHidesAllAddresses asserts the privacy
+// contract holds even when a p2p_discovered node has multiple known
+// addresses recorded: neither address string appears anywhere in the
+// dashboard or node detail page body.
+func TestP2PNodeWithMultipleAddressesHidesAllAddresses(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	const clearnetAddr = "1.2.3.4:18142"
+	const onionAddr = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcd.onion:18142"
+	pubkey := []byte("p2p-multi-addr-pubkey")
+
+	node, err := store.UpsertConfirmedNode(ctx, clearnetAddr, pubkey, storage.DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("upsert confirmed clearnet: %v", err)
+	}
+	if _, err := store.UpsertConfirmedNode(ctx, onionAddr, pubkey, storage.DiscoverySourceP2P); err != nil {
+		t.Fatalf("upsert confirmed onion: %v", err)
+	}
+
+	srv := newTestServer(t, store)
+
+	_, dashboardBody := getBody(t, srv.URL+"/")
+	if strings.Contains(dashboardBody, clearnetAddr) {
+		t.Errorf("GET / body contains p2p node's clearnet address %q", clearnetAddr)
+	}
+	if strings.Contains(dashboardBody, onionAddr) {
+		t.Errorf("GET / body contains p2p node's onion address %q", onionAddr)
+	}
+
+	_, detailBody := getBody(t, srv.URL+"/nodes/"+node.ID.String())
+	if strings.Contains(detailBody, clearnetAddr) {
+		t.Errorf("GET /nodes/%s body contains its own clearnet address %q", node.ID, clearnetAddr)
+	}
+	if strings.Contains(detailBody, onionAddr) {
+		t.Errorf("GET /nodes/%s body contains its own onion address %q", node.ID, onionAddr)
+	}
+}
+
 // TestNodeDetailNotFound asserts an unknown node id 404s rather than
 // panicking or erroring out the template.
 func TestNodeDetailNotFound(t *testing.T) {

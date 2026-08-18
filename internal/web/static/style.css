@@ -27,6 +27,8 @@
   --badge-onion-fg: #b79bf0;
   --badge-registry-bg: rgba(75, 209, 138, 0.16);
   --badge-registry-fg: #4bd18a;
+  --badge-dualstack-bg: rgba(240, 154, 55, 0.18);
+  --badge-dualstack-fg: #f09a37;
 }
 
 * {
@@ -313,6 +315,11 @@ tbody tr:hover {
   color: var(--badge-registry-fg);
 }
 
+.badge-dualstack {
+  background: var(--badge-dualstack-bg);
+  color: var(--badge-dualstack-fg);
+}
+
 /* Identity + capability display helpers */
 
 .pubkey {
@@ -329,6 +336,12 @@ tbody tr:hover {
 .public-address {
   font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
   font-size: 13px;
+}
+
+.public-address-list {
+  list-style: none;
+  margin: 0 0 4px;
+  padding: 0;
 }
 
 .empty-note {
