@@ -80,11 +80,13 @@
           {{range .TopPeered}}
           <tr>
             <td>
-              {{if .Identity.Confirmed}}
-              <span class="pubkey" title="{{.Identity.FullHex}}">{{.Identity.ShortHex}}</span>
-              {{else}}
-              <span class="badge badge-unconfirmed">unconfirmed</span>
-              {{end}}
+              <a href="/nodes/{{.ID}}">
+                {{if .Identity.Confirmed}}
+                <span class="pubkey" title="{{.Identity.FullHex}}">{{.Identity.ShortHex}}</span>
+                {{else}}
+                <span class="badge badge-unconfirmed">unconfirmed</span>
+                {{end}}
+              </a>
             </td>
             <td>
               <span class="capabilities">
