@@ -1774,6 +1774,151 @@ func TestTopPeeredNodesOnionClearnetCounts(t *testing.T) {
 	}
 }
 
+// TestTopPeeredNodesLiveCounts asserts GET /topology/top-peered's
+// response includes correct live_degree/live_in_degree/live_out_degree/
+// live_onion_peer_count/live_clearnet_peer_count fields — the
+// confirmed-peer subset of the raw totals — mirroring
+// storage.TestTopPeeredNodesLiveCounts's setup, but asserted through the
+// public JSON API response (api.PublicNodeDegree) instead of
+// storage.NodeDegree directly.
+//
+// The hub has three CONFIRMED peers (one onion-only, one clearnet-only,
+// one dual-stack reached via an out-edge each) and three unconfirmed
+// peers (one onion-only, one clearnet-only, one plain, reached via an
+// in-edge each) — see storage.TestTopPeeredNodesLiveCounts's doc comment
+// for the exact same setup and the reasoning behind each expected count.
+func TestTopPeeredNodesLiveCounts(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
+
+	const (
+		confirmedOnionAddr      = "confonionpeerapi1abcdefghijklmnopq.onion:18142"
+		unconfirmedOnionAddr    = "unconfonionpeerapi2abcdefghijklmno.onion:18142"
+		dualStackClearnetAddr   = "203.0.113.31:18142"
+		dualStackOnionAddr      = "confdualstackpeerapiabcdefghijklmn.onion:18142"
+		confirmedClearnetAddr   = "203.0.113.32:18142"
+		unconfirmedClearnetAddr = "203.0.113.33:18142"
+		unconfirmedPlainAddr    = "unconfirmed-plain-peer-api:18142"
+	)
+
+	hub, err := store.UpsertDiscoveredNode(ctx, "hub-live-api:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert hub: %v", err)
+	}
+
+	confirmedOnionPeer, err := store.UpsertConfirmedNode(ctx, confirmedOnionAddr, []byte("some-unique-fake-pubkey-api-01"), storage.DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("upsert confirmed onion peer: %v", err)
+	}
+	unconfirmedOnionPeer, err := store.UpsertDiscoveredNode(ctx, unconfirmedOnionAddr, storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert unconfirmed onion peer: %v", err)
+	}
+	confirmedDualStackPeer, err := store.UpsertConfirmedNode(ctx, dualStackClearnetAddr, []byte("some-unique-fake-pubkey-api-02"), storage.DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("upsert confirmed dual-stack peer: %v", err)
+	}
+	// storage.Store doesn't expose the raw pool, so add the confirmed
+	// dual-stack peer's second address via a direct connection to the
+	// same test database instead (same DSN newTestServer's store was
+	// built with).
+	pool, err := pgxpool.New(ctx, testDSN())
+	if err != nil {
+		t.Fatalf("connect to test db: %v", err)
+	}
+	defer pool.Close()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO node_addresses (node_id, address, first_seen, last_seen)
+		VALUES ($1, $2, now(), now())
+	`, confirmedDualStackPeer.ID, dualStackOnionAddr); err != nil {
+		t.Fatalf("insert confirmed dual-stack peer's onion address: %v", err)
+	}
+	confirmedClearnetPeer, err := store.UpsertConfirmedNode(ctx, confirmedClearnetAddr, []byte("some-unique-fake-pubkey-api-03"), storage.DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("upsert confirmed clearnet peer: %v", err)
+	}
+	unconfirmedClearnetPeer, err := store.UpsertDiscoveredNode(ctx, unconfirmedClearnetAddr, storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert unconfirmed clearnet peer: %v", err)
+	}
+	unconfirmedPlainPeer, err := store.UpsertDiscoveredNode(ctx, unconfirmedPlainAddr, storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert unconfirmed plain peer: %v", err)
+	}
+
+	// Out-edges (hub -> peer).
+	for _, peerID := range []uuid.UUID{confirmedOnionPeer.ID, unconfirmedOnionPeer.ID, confirmedDualStackPeer.ID} {
+		if err := store.RecordPeerEdgeObservation(ctx, hub.ID, peerID); err != nil {
+			t.Fatalf("record edge hub -> %v: %v", peerID, err)
+		}
+	}
+	// In-edges (peer -> hub).
+	for _, peerID := range []uuid.UUID{confirmedClearnetPeer.ID, unconfirmedClearnetPeer.ID, unconfirmedPlainPeer.ID} {
+		if err := store.RecordPeerEdgeObservation(ctx, peerID, hub.ID); err != nil {
+			t.Fatalf("record edge %v -> hub: %v", peerID, err)
+		}
+	}
+
+	resp, err := http.Get(srv.URL + "/topology/top-peered")
+	if err != nil {
+		t.Fatalf("GET /topology/top-peered: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	var got []api.PublicNodeDegree
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	var hubRow *api.PublicNodeDegree
+	for i := range got {
+		if got[i].NodeID == hub.ID {
+			hubRow = &got[i]
+			break
+		}
+	}
+	if hubRow == nil {
+		t.Fatalf("hub %v not found in GET /topology/top-peered response: %+v", hub.ID, got)
+	}
+
+	// Raw totals: confirmed AND unconfirmed peers all count.
+	if hubRow.Degree != 6 {
+		t.Errorf("hub Degree = %d, want 6", hubRow.Degree)
+	}
+	if hubRow.OutDegree != 3 {
+		t.Errorf("hub OutDegree = %d, want 3", hubRow.OutDegree)
+	}
+	if hubRow.InDegree != 3 {
+		t.Errorf("hub InDegree = %d, want 3", hubRow.InDegree)
+	}
+	if hubRow.OnionPeerCount != 3 {
+		t.Errorf("hub OnionPeerCount = %d, want 3", hubRow.OnionPeerCount)
+	}
+	if hubRow.ClearnetPeerCount != 3 {
+		t.Errorf("hub ClearnetPeerCount = %d, want 3", hubRow.ClearnetPeerCount)
+	}
+
+	// Live totals: only confirmed (non-null public_key) peers count.
+	if hubRow.LiveDegree != 3 {
+		t.Errorf("hub LiveDegree = %d, want 3 (confirmedOnionPeer, confirmedClearnetPeer, confirmedDualStackPeer)", hubRow.LiveDegree)
+	}
+	if hubRow.LiveOutDegree != 2 {
+		t.Errorf("hub LiveOutDegree = %d, want 2 (confirmedOnionPeer, confirmedDualStackPeer)", hubRow.LiveOutDegree)
+	}
+	if hubRow.LiveInDegree != 1 {
+		t.Errorf("hub LiveInDegree = %d, want 1 (confirmedClearnetPeer)", hubRow.LiveInDegree)
+	}
+	if hubRow.LiveOnionPeerCount != 2 {
+		t.Errorf("hub LiveOnionPeerCount = %d, want 2 (confirmedOnionPeer, confirmedDualStackPeer)", hubRow.LiveOnionPeerCount)
+	}
+	if hubRow.LiveClearnetPeerCount != 2 {
+		t.Errorf("hub LiveClearnetPeerCount = %d, want 2 (confirmedClearnetPeer, confirmedDualStackPeer)", hubRow.LiveClearnetPeerCount)
+	}
+}
+
 // TestTopologyAllTrueUnbounded asserts GET /topology?all=true always
 // returns every node/edge, ignoring the default cap.
 func TestTopologyAllTrueUnbounded(t *testing.T) {

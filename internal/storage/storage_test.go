@@ -927,6 +927,166 @@ func TestTopPeeredNodesOnionClearnetBreakdown(t *testing.T) {
 		hubRow.Degree, hubRow.OnionPeerCount, hubRow.ClearnetPeerCount, dualStackPeer.ID)
 }
 
+// TestTopPeeredNodesLiveCounts verifies TopPeeredNodes' Live* fields
+// (LiveDegree/LiveInDegree/LiveOutDegree/LiveOnionPeerCount/
+// LiveClearnetPeerCount) correctly restrict each corresponding raw total
+// to the subset of peers with a confirmed (non-null) public_key, while
+// the raw totals keep counting confirmed AND unconfirmed peers alike.
+//
+// The hub has six distinct peers, three reached via an out-edge
+// (hub -> peer) and three via an in-edge (peer -> hub):
+//
+//   - confirmedOnionPeer:      out-edge, CONFIRMED, onion address only.
+//   - unconfirmedOnionPeer:    out-edge, unconfirmed, onion address only.
+//   - confirmedDualStackPeer:  out-edge, CONFIRMED, both a clearnet AND
+//     an onion address (second node_addresses row inserted directly,
+//     same pattern as TestTopPeeredNodesOnionClearnetBreakdown's
+//     dual-stack peer).
+//   - confirmedClearnetPeer:   in-edge, CONFIRMED, clearnet address only.
+//   - unconfirmedClearnetPeer: in-edge, unconfirmed, clearnet address
+//     only.
+//   - unconfirmedPlainPeer:    in-edge, unconfirmed, an address that
+//     classifies as neither onion nor clearnet (no dots, not `.onion`)
+//     — exercises a peer that shouldn't move either onion/clearnet
+//     number regardless of confirmation.
+//
+// Expected raw totals (everyone counts, confirmed or not):
+//   - Degree = 6 (all six distinct peers).
+//   - OutDegree = 3 (confirmedOnionPeer, unconfirmedOnionPeer, confirmedDualStackPeer).
+//   - InDegree = 3 (confirmedClearnetPeer, unconfirmedClearnetPeer, unconfirmedPlainPeer).
+//   - OnionPeerCount = 3 (confirmedOnionPeer, unconfirmedOnionPeer, confirmedDualStackPeer).
+//   - ClearnetPeerCount = 3 (confirmedClearnetPeer, unconfirmedClearnetPeer, confirmedDualStackPeer).
+//
+// Expected Live* totals (confirmed peers only):
+//   - LiveDegree = 3 (confirmedOnionPeer, confirmedClearnetPeer, confirmedDualStackPeer).
+//   - LiveOutDegree = 2 (confirmedOnionPeer, confirmedDualStackPeer — unconfirmedOnionPeer excluded).
+//   - LiveInDegree = 1 (confirmedClearnetPeer — unconfirmedClearnetPeer and unconfirmedPlainPeer excluded).
+//   - LiveOnionPeerCount = 2 (confirmedOnionPeer, confirmedDualStackPeer — unconfirmedOnionPeer excluded).
+//   - LiveClearnetPeerCount = 2 (confirmedClearnetPeer, confirmedDualStackPeer — unconfirmedClearnetPeer excluded).
+func TestTopPeeredNodesLiveCounts(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	ps := store.(*pgStore)
+
+	const (
+		confirmedOnionAddr      = "confonionpeer1abcdefghijklmnopqrst.onion:18142"
+		unconfirmedOnionAddr    = "unconfonionpeer2abcdefghijklmnopqr.onion:18142"
+		dualStackClearnetAddr   = "203.0.113.21:18142"
+		dualStackOnionAddr      = "confdualstackpeerabcdefghijklmnopq.onion:18142"
+		confirmedClearnetAddr   = "203.0.113.22:18142"
+		unconfirmedClearnetAddr = "203.0.113.23:18142"
+		unconfirmedPlainAddr    = "unconfirmed-plain-peer:18142"
+	)
+
+	hub, err := store.UpsertDiscoveredNode(ctx, "hub-live:1", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert hub: %v", err)
+	}
+
+	confirmedOnionPeer, err := store.UpsertConfirmedNode(ctx, confirmedOnionAddr, []byte("some-unique-fake-pubkey-bytes-01"), DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("upsert confirmed onion peer: %v", err)
+	}
+	unconfirmedOnionPeer, err := store.UpsertDiscoveredNode(ctx, unconfirmedOnionAddr, DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert unconfirmed onion peer: %v", err)
+	}
+	confirmedDualStackPeer, err := store.UpsertConfirmedNode(ctx, dualStackClearnetAddr, []byte("some-unique-fake-pubkey-bytes-02"), DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("upsert confirmed dual-stack peer: %v", err)
+	}
+	// Give the confirmed dual-stack peer a SECOND node_addresses row (its
+	// onion address) alongside the clearnet address it was created
+	// with above.
+	if _, err := ps.pool.Exec(ctx, `
+		INSERT INTO node_addresses (node_id, address, first_seen, last_seen)
+		VALUES ($1, $2, now(), now())
+	`, confirmedDualStackPeer.ID, dualStackOnionAddr); err != nil {
+		t.Fatalf("insert confirmed dual-stack peer's onion address: %v", err)
+	}
+	confirmedClearnetPeer, err := store.UpsertConfirmedNode(ctx, confirmedClearnetAddr, []byte("some-unique-fake-pubkey-bytes-03"), DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("upsert confirmed clearnet peer: %v", err)
+	}
+	unconfirmedClearnetPeer, err := store.UpsertDiscoveredNode(ctx, unconfirmedClearnetAddr, DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert unconfirmed clearnet peer: %v", err)
+	}
+	unconfirmedPlainPeer, err := store.UpsertDiscoveredNode(ctx, unconfirmedPlainAddr, DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert unconfirmed plain peer: %v", err)
+	}
+
+	// Out-edges (hub -> peer).
+	for _, peerID := range []uuid.UUID{confirmedOnionPeer.ID, unconfirmedOnionPeer.ID, confirmedDualStackPeer.ID} {
+		if err := store.RecordPeerEdgeObservation(ctx, hub.ID, peerID); err != nil {
+			t.Fatalf("record edge hub -> %v: %v", peerID, err)
+		}
+	}
+	// In-edges (peer -> hub).
+	for _, peerID := range []uuid.UUID{confirmedClearnetPeer.ID, unconfirmedClearnetPeer.ID, unconfirmedPlainPeer.ID} {
+		if err := store.RecordPeerEdgeObservation(ctx, peerID, hub.ID); err != nil {
+			t.Fatalf("record edge %v -> hub: %v", peerID, err)
+		}
+	}
+
+	since := time.Now().Add(-time.Hour)
+	top, err := store.TopPeeredNodes(ctx, since, 10)
+	if err != nil {
+		t.Fatalf("top peered nodes: %v", err)
+	}
+
+	var hubRow *NodeDegree
+	for i := range top {
+		if top[i].NodeID == hub.ID {
+			hubRow = &top[i]
+			break
+		}
+	}
+	if hubRow == nil {
+		t.Fatalf("hub %v not found in top peered nodes result: %+v", hub.ID, top)
+	}
+
+	// Raw totals: confirmed AND unconfirmed peers all count.
+	if hubRow.Degree != 6 {
+		t.Errorf("hub Degree = %d, want 6", hubRow.Degree)
+	}
+	if hubRow.OutDegree != 3 {
+		t.Errorf("hub OutDegree = %d, want 3", hubRow.OutDegree)
+	}
+	if hubRow.InDegree != 3 {
+		t.Errorf("hub InDegree = %d, want 3", hubRow.InDegree)
+	}
+	if hubRow.OnionPeerCount != 3 {
+		t.Errorf("hub OnionPeerCount = %d, want 3", hubRow.OnionPeerCount)
+	}
+	if hubRow.ClearnetPeerCount != 3 {
+		t.Errorf("hub ClearnetPeerCount = %d, want 3", hubRow.ClearnetPeerCount)
+	}
+
+	// Live totals: only confirmed (non-null public_key) peers count.
+	if hubRow.LiveDegree != 3 {
+		t.Errorf("hub LiveDegree = %d, want 3 (confirmedOnionPeer, confirmedClearnetPeer, confirmedDualStackPeer)", hubRow.LiveDegree)
+	}
+	if hubRow.LiveOutDegree != 2 {
+		t.Errorf("hub LiveOutDegree = %d, want 2 (confirmedOnionPeer, confirmedDualStackPeer)", hubRow.LiveOutDegree)
+	}
+	if hubRow.LiveInDegree != 1 {
+		t.Errorf("hub LiveInDegree = %d, want 1 (confirmedClearnetPeer)", hubRow.LiveInDegree)
+	}
+	if hubRow.LiveOnionPeerCount != 2 {
+		t.Errorf("hub LiveOnionPeerCount = %d, want 2 (confirmedOnionPeer, confirmedDualStackPeer)", hubRow.LiveOnionPeerCount)
+	}
+	if hubRow.LiveClearnetPeerCount != 2 {
+		t.Errorf("hub LiveClearnetPeerCount = %d, want 2 (confirmedClearnetPeer, confirmedDualStackPeer)", hubRow.LiveClearnetPeerCount)
+	}
+
+	t.Logf("hub row: degree=%d(live=%d) in=%d(live=%d) out=%d(live=%d) onion=%d(live=%d) clearnet=%d(live=%d)",
+		hubRow.Degree, hubRow.LiveDegree, hubRow.InDegree, hubRow.LiveInDegree,
+		hubRow.OutDegree, hubRow.LiveOutDegree, hubRow.OnionPeerCount, hubRow.LiveOnionPeerCount,
+		hubRow.ClearnetPeerCount, hubRow.LiveClearnetPeerCount)
+}
+
 // TestListNodeEdges verifies that ListNodeEdges returns edges in both
 // directions for a node (as either the from or to side) and respects the
 // limit parameter.
