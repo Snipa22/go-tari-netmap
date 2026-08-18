@@ -445,6 +445,141 @@ func TestTopPeeredNodes(t *testing.T) {
 	}
 }
 
+// TestListNodeEdges verifies that ListNodeEdges returns edges in both
+// directions for a node (as either the from or to side) and respects the
+// limit parameter.
+func TestListNodeEdges(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	a, err := store.UpsertDiscoveredNode(ctx, "a:1", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert a: %v", err)
+	}
+	b, err := store.UpsertDiscoveredNode(ctx, "b:2", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert b: %v", err)
+	}
+	c, err := store.UpsertDiscoveredNode(ctx, "c:3", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert c: %v", err)
+	}
+	other1, err := store.UpsertDiscoveredNode(ctx, "other1:1", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert other1: %v", err)
+	}
+	other2, err := store.UpsertDiscoveredNode(ctx, "other2:1", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert other2: %v", err)
+	}
+
+	// a -> b (a is the "from" side), c -> a (a is the "to" side), plus
+	// two edges unrelated to a that should never show up in a's results.
+	if err := store.RecordPeerEdgeObservation(ctx, a.ID, b.ID); err != nil {
+		t.Fatalf("record a->b: %v", err)
+	}
+	if err := store.RecordPeerEdgeObservation(ctx, c.ID, a.ID); err != nil {
+		t.Fatalf("record c->a: %v", err)
+	}
+	if err := store.RecordPeerEdgeObservation(ctx, other1.ID, other2.ID); err != nil {
+		t.Fatalf("record other1->other2: %v", err)
+	}
+
+	edges, err := store.ListNodeEdges(ctx, a.ID, 50)
+	if err != nil {
+		t.Fatalf("list node edges: %v", err)
+	}
+	if len(edges) != 2 {
+		t.Fatalf("len(edges) = %d, want 2 (a->b and c->a), got %+v", len(edges), edges)
+	}
+
+	sawAToB, sawCToA := false, false
+	for _, e := range edges {
+		if e.FromNodeID == a.ID && e.ToNodeID == b.ID {
+			sawAToB = true
+		}
+		if e.FromNodeID == c.ID && e.ToNodeID == a.ID {
+			sawCToA = true
+		}
+		if e.FromNodeID != a.ID && e.ToNodeID != a.ID {
+			t.Errorf("edge %+v does not involve node a", e)
+		}
+	}
+	if !sawAToB || !sawCToA {
+		t.Fatalf("expected both a->b and c->a among edges, got %+v", edges)
+	}
+
+	limited, err := store.ListNodeEdges(ctx, a.ID, 1)
+	if err != nil {
+		t.Fatalf("list node edges (limit 1): %v", err)
+	}
+	if len(limited) != 1 {
+		t.Fatalf("len(limited) = %d, want 1", len(limited))
+	}
+}
+
+// TestNetworkHeight verifies that NetworkHeight returns the mode of the
+// latest-per-node heights, along with how many nodes contributed to that
+// mode, and that it returns (nil, 0, nil) when no health checks with a
+// non-nil height exist.
+func TestNetworkHeight(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	height, count, err := store.NetworkHeight(ctx)
+	if err != nil {
+		t.Fatalf("network height (empty): %v", err)
+	}
+	if height != nil || count != 0 {
+		t.Fatalf("network height (empty) = (%v, %d), want (nil, 0)", height, count)
+	}
+
+	a, err := store.UpsertDiscoveredNode(ctx, "a:1", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert a: %v", err)
+	}
+	b, err := store.UpsertDiscoveredNode(ctx, "b:2", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert b: %v", err)
+	}
+	c, err := store.UpsertDiscoveredNode(ctx, "c:3", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert c: %v", err)
+	}
+
+	h100, h101 := int64(100), int64(101)
+
+	// a's latest height is 100 (its earlier 99 reading is superseded).
+	if err := store.RecordHealthCheck(ctx, HealthCheckInput{NodeID: a.ID, Reachable: true, ProbeSource: ProbeSourceGRPC, Height: func() *int64 { v := int64(99); return &v }()}); err != nil {
+		t.Fatalf("record a height 99: %v", err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	if err := store.RecordHealthCheck(ctx, HealthCheckInput{NodeID: a.ID, Reachable: true, ProbeSource: ProbeSourceGRPC, Height: &h100}); err != nil {
+		t.Fatalf("record a height 100: %v", err)
+	}
+	// b and c both latest at 100 too, so 100 is the mode across 3 nodes.
+	if err := store.RecordHealthCheck(ctx, HealthCheckInput{NodeID: b.ID, Reachable: true, ProbeSource: ProbeSourceGRPC, Height: &h100}); err != nil {
+		t.Fatalf("record b height 100: %v", err)
+	}
+	if err := store.RecordHealthCheck(ctx, HealthCheckInput{NodeID: c.ID, Reachable: true, ProbeSource: ProbeSourceGRPC, Height: &h101}); err != nil {
+		t.Fatalf("record c height 101: %v", err)
+	}
+
+	height, count, err = store.NetworkHeight(ctx)
+	if err != nil {
+		t.Fatalf("network height: %v", err)
+	}
+	if height == nil {
+		t.Fatal("height = nil, want non-nil")
+	}
+	if *height != 100 {
+		t.Errorf("height = %d, want 100", *height)
+	}
+	if count != 2 {
+		t.Errorf("count = %d, want 2 (a and b)", count)
+	}
+}
+
 // TestNodeHealthHypertableCompatiblePK verifies that, after
 // 0005_node_health_hypertable_pk_fix.sql has replaced node_health's
 // single-column primary key with a composite UNIQUE(id, ts) constraint,

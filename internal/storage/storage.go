@@ -109,6 +109,17 @@ type Store interface {
 	// have" is treated as undirected for this ranking). Results are
 	// ordered by Degree descending and capped at limit.
 	TopPeeredNodes(ctx context.Context, since time.Time, limit int) ([]NodeDegree, error)
+
+	// ListNodeEdges returns every peer_edges row (the peer_edge_observations
+	// rollup view) where nodeID is either the from or to side, newest
+	// first by last_seen, capped at limit (0 or negative defaults to 50).
+	ListNodeEdges(ctx context.Context, nodeID uuid.UUID, limit int) ([]PeerEdge, error)
+
+	// NetworkHeight returns the most common height value across the most
+	// recent health check per node (mode of the latest-per-node heights),
+	// and the number of nodes that value was derived from. Returns
+	// (nil, 0, nil) if no health checks with a non-nil height exist yet.
+	NetworkHeight(ctx context.Context) (*int64, int, error)
 }
 
 // ErrNotFound is returned by GetNode when no node with the given ID exists.
@@ -772,4 +783,71 @@ func (s *pgStore) TopPeeredNodes(ctx context.Context, since time.Time, limit int
 		return nil, fmt.Errorf("storage: top peered nodes: %w", err)
 	}
 	return out, nil
+}
+
+// ListNodeEdges returns every peer_edges row (the peer_edge_observations
+// rollup view described in ListTopology's doc comment) where nodeID is
+// either the from or to side, newest first by last_seen, capped at limit
+// (0 or negative defaults to 50).
+func (s *pgStore) ListNodeEdges(ctx context.Context, nodeID uuid.UUID, limit int) ([]PeerEdge, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, from_node_id, to_node_id, first_seen, last_seen
+		FROM peer_edges
+		WHERE from_node_id = $1 OR to_node_id = $1
+		ORDER BY last_seen DESC
+		LIMIT $2
+	`, nodeID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("storage: list node edges: %w", err)
+	}
+	defer rows.Close()
+
+	edges := []PeerEdge{}
+	for rows.Next() {
+		var e PeerEdge
+		if err := rows.Scan(&e.ID, &e.FromNodeID, &e.ToNodeID, &e.FirstSeen, &e.LastSeen); err != nil {
+			return nil, fmt.Errorf("storage: scan node edge: %w", err)
+		}
+		edges = append(edges, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage: list node edges: %w", err)
+	}
+	return edges, nil
+}
+
+// NetworkHeight returns the most common height value across the most
+// recent health check per node (mode of the latest-per-node heights), and
+// the number of nodes that value was derived from. It first picks each
+// node's latest node_health row via DISTINCT ON (node_id) ... ORDER BY
+// node_id, ts DESC, filters out rows with a NULL height, then groups the
+// remaining heights and returns the one with the highest count. Returns
+// (nil, 0, nil) if no health checks with a non-nil height exist yet.
+func (s *pgStore) NetworkHeight(ctx context.Context) (*int64, int, error) {
+	var height int64
+	var count int
+	err := s.pool.QueryRow(ctx, `
+		WITH latest AS (
+			SELECT DISTINCT ON (node_id) node_id, height
+			FROM node_health
+			ORDER BY node_id, ts DESC
+		)
+		SELECT height, count(*) AS node_count
+		FROM latest
+		WHERE height IS NOT NULL
+		GROUP BY height
+		ORDER BY node_count DESC
+		LIMIT 1
+	`).Scan(&height, &count)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, 0, nil
+		}
+		return nil, 0, fmt.Errorf("storage: network height: %w", err)
+	}
+	return &height, count, nil
 }
