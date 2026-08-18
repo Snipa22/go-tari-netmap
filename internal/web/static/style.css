@@ -349,6 +349,26 @@ tbody tr:hover {
   font-style: italic;
 }
 
+/* Node table pagination */
+
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 10px;
+  font-size: 13px;
+}
+
+.pagination-links {
+  display: flex;
+  gap: 14px;
+}
+
+.pagination-disabled {
+  color: #4c5566;
+  cursor: default;
+}
+
 /* Submission review page action buttons */
 
 .btn-approve,

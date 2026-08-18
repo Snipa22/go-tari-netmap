@@ -163,6 +163,15 @@
           {{end}}
         </tbody>
       </table>
+      <div class="pagination">
+        <span class="panel-note">
+          {{if .NodeTotal}}Showing {{.NodeRangeStart}}-{{.NodeRangeEnd}} of {{.NodeTotal}} nodes{{else}}No nodes known yet.{{end}}
+        </span>
+        <span class="pagination-links">
+          {{if .HasPrevPage}}<a href="/?page={{.PrevPage}}">Prev</a>{{else}}<span class="pagination-disabled">Prev</span>{{end}}
+          {{if .HasNextPage}}<a href="/?page={{.NextPage}}">Next</a>{{else}}<span class="pagination-disabled">Next</span>{{end}}
+        </span>
+      </div>
     </section>
   </main>
 </body>
