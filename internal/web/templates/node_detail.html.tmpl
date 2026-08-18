@@ -2,41 +2,123 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>go-tari-netmap — {{.Node.Address}}</title>
+  <title>go-tari-netmap — {{if .Identity.Confirmed}}{{.Identity.ShortHex}}{{else}}unconfirmed node{{end}}</title>
+  <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <p><a href="/">&larr; back to dashboard</a></p>
-  <h1>{{.Node.Address}}</h1>
-  <ul>
-    <li>Discovery source: {{.Node.DiscoverySource}}</li>
-    <li>Tags: {{.Node.Tags}}</li>
-    <li>Label: {{if .Node.Label}}{{.Node.Label}}{{else}}—{{end}}</li>
-    <li>First seen: {{.Node.FirstSeen}}</li>
-    <li>Last seen: {{.Node.LastSeen}}</li>
-  </ul>
+  <header class="site-header">
+    <div class="site-title"><a href="/">go-tari-netmap</a></div>
+    <nav>
+      <a href="/">Dashboard</a>
+      <a class="nav-disabled" href="#" aria-disabled="true" title="Coming soon">Topology</a>
+    </nav>
+  </header>
 
-  <h2>Recent history</h2>
-  <table border="1" cellpadding="4">
-    <thead>
-      <tr>
-        <th>Timestamp</th>
-        <th>Reachable</th>
-        <th>Height</th>
-        <th>Latency (ms)</th>
-      </tr>
-    </thead>
-    <tbody>
-      {{range .History}}
-      <tr>
-        <td>{{.Timestamp}}</td>
-        <td>{{.Reachable}}</td>
-        <td>{{if .Height}}{{.Height}}{{else}}—{{end}}</td>
-        <td>{{if .LatencyMS}}{{.LatencyMS}}{{else}}—{{end}}</td>
-      </tr>
+  <main>
+    <a class="back-link" href="/">&larr; back to dashboard</a>
+
+    <h1>
+      {{if .Identity.Confirmed}}
+      <span class="pubkey" title="{{.Identity.FullHex}}">{{.Identity.ShortHex}}</span>
       {{else}}
-      <tr><td colspan="4">No health checks recorded yet.</td></tr>
+      <span class="badge badge-unconfirmed">unconfirmed</span>
       {{end}}
-    </tbody>
-  </table>
+    </h1>
+
+    <section class="detail-summary">
+      <dl>
+        <dt>Known transports</dt>
+        <dd>
+          {{if or .Capabilities.HasIPv4 .Capabilities.HasIPv6 .Capabilities.HasOnion}}
+          {{if or .Capabilities.HasIPv4 .Capabilities.HasIPv6}}clearnet{{end}}
+          {{if .Capabilities.HasOnion}}onion{{end}}
+          {{else}}
+          none observed yet
+          {{end}}
+        </dd>
+
+        {{if .PublicAddress}}
+        <dt>Address</dt>
+        <dd>
+          <span class="public-address">{{.PublicAddress}}</span>
+          <span class="badge badge-registry">opted in via registry</span>
+        </dd>
+        {{end}}
+
+        <dt>Discovery source</dt>
+        <dd>{{.Node.DiscoverySource}}</dd>
+
+        <dt>Tags</dt>
+        <dd>{{.Node.Tags}}</dd>
+
+        <dt>Label</dt>
+        <dd>{{if .Node.Label}}{{.Node.Label}}{{else}}—{{end}}</dd>
+
+        <dt>First seen</dt>
+        <dd>{{.Node.FirstSeen}}</dd>
+
+        <dt>Last seen</dt>
+        <dd>{{.Node.LastSeen}}</dd>
+      </dl>
+    </section>
+
+    <section>
+      <h2>Recent history</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Timestamp</th>
+            <th>Reachable</th>
+            <th>Height</th>
+            <th>Latency (ms)</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{range .History}}
+          <tr>
+            <td>{{.Timestamp}}</td>
+            <td>{{.Reachable}}</td>
+            <td>{{if .Height}}{{.Height}}{{else}}—{{end}}</td>
+            <td>{{if .LatencyMS}}{{.LatencyMS}}{{else}}—{{end}}</td>
+          </tr>
+          {{else}}
+          <tr><td colspan="4" class="empty-note">No health checks recorded yet.</td></tr>
+          {{end}}
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>Peer connections</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Direction</th>
+            <th>Peer identity</th>
+            <th>First seen</th>
+            <th>Last seen</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{range .PeerEdges}}
+          <tr>
+            <td>{{.Direction}}</td>
+            <td>
+              {{if .OtherIdentity.Confirmed}}
+              <span class="pubkey" title="{{.OtherIdentity.FullHex}}">{{.OtherIdentity.ShortHex}}</span>
+              {{else}}
+              <span class="badge badge-unconfirmed">unconfirmed</span>
+              {{end}}
+            </td>
+            <td>{{.FirstSeen}}</td>
+            <td>{{.LastSeen}}</td>
+          </tr>
+          {{else}}
+          <tr><td colspan="4" class="empty-note">No peer connections observed yet.</td></tr>
+          {{end}}
+        </tbody>
+      </table>
+    </section>
+  </main>
 </body>
 </html>
