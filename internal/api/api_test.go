@@ -307,12 +307,21 @@ func TestListNodesFilter(t *testing.T) {
 		t.Fatalf("GET /nodes: %v", err)
 	}
 	defer resp.Body.Close()
-	var all []api.PublicNode
+	var all struct {
+		Nodes   []api.PublicNode `json:"nodes"`
+		Total   int              `json:"total"`
+		Limit   int              `json:"limit"`
+		Offset  int              `json:"offset"`
+		HasMore bool             `json:"has_more"`
+	}
 	if err := json.NewDecoder(resp.Body).Decode(&all); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(all) != 2 {
-		t.Fatalf("len(all) = %d, want 2", len(all))
+	if len(all.Nodes) != 2 {
+		t.Fatalf("len(all.Nodes) = %d, want 2", len(all.Nodes))
+	}
+	if all.Total != 2 {
+		t.Fatalf("all.Total = %d, want 2", all.Total)
 	}
 
 	resp2, err := http.Get(srv.URL + "/nodes?discovery_source=p2p_discovered")
@@ -320,14 +329,20 @@ func TestListNodesFilter(t *testing.T) {
 		t.Fatalf("GET /nodes?discovery_source=...: %v", err)
 	}
 	defer resp2.Body.Close()
-	var filtered []api.PublicNode
+	var filtered struct {
+		Nodes []api.PublicNode `json:"nodes"`
+		Total int              `json:"total"`
+	}
 	if err := json.NewDecoder(resp2.Body).Decode(&filtered); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	// "a:1" is a p2p_discovered node, so its real address is scrubbed
 	// from the response — assert on discovery_source instead of address.
-	if len(filtered) != 1 || filtered[0].DiscoverySource != storage.DiscoverySourceP2P {
-		t.Fatalf("filtered = %+v, want just the p2p_discovered node", filtered)
+	if len(filtered.Nodes) != 1 || filtered.Nodes[0].DiscoverySource != storage.DiscoverySourceP2P {
+		t.Fatalf("filtered.Nodes = %+v, want just the p2p_discovered node", filtered.Nodes)
+	}
+	if filtered.Total != 1 {
+		t.Fatalf("filtered.Total = %d, want 1", filtered.Total)
 	}
 }
 
@@ -1250,5 +1265,255 @@ func TestCreateNodeQueueCap(t *testing.T) {
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		respBody, _ := io.ReadAll(resp.Body)
 		t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, http.StatusServiceUnavailable, respBody)
+	}
+}
+
+// TestListNodesPaginationDefaults asserts GET /nodes with no query
+// params applies a default page limit rather than returning every node
+// — seeded well above the default limit to actually exercise that.
+func TestListNodesPaginationDefaults(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
+
+	const seeded = 105 // > api's default limit of 100
+	for i := 0; i < seeded; i++ {
+		addr := fmt.Sprintf("10.0.%d.%d:18142", i/256, i%256)
+		if _, err := store.UpsertDiscoveredNode(ctx, addr, storage.DiscoverySourceP2P, nil, nil); err != nil {
+			t.Fatalf("upsert node %d: %v", i, err)
+		}
+	}
+
+	resp, err := http.Get(srv.URL + "/nodes")
+	if err != nil {
+		t.Fatalf("GET /nodes: %v", err)
+	}
+	defer resp.Body.Close()
+	var got struct {
+		Nodes   []api.PublicNode `json:"nodes"`
+		Total   int              `json:"total"`
+		Limit   int              `json:"limit"`
+		Offset  int              `json:"offset"`
+		HasMore bool             `json:"has_more"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Total != seeded {
+		t.Fatalf("got.Total = %d, want %d", got.Total, seeded)
+	}
+	if len(got.Nodes) != 100 {
+		t.Fatalf("len(got.Nodes) = %d, want 100 (default limit), not the full %d", len(got.Nodes), seeded)
+	}
+	if got.Limit != 100 {
+		t.Fatalf("got.Limit = %d, want 100", got.Limit)
+	}
+	if got.Offset != 0 {
+		t.Fatalf("got.Offset = %d, want 0", got.Offset)
+	}
+	if !got.HasMore {
+		t.Fatal("got.HasMore = false, want true (105 seeded, only 100 returned)")
+	}
+}
+
+// TestListNodesExplicitLimitOffset asserts GET /nodes?limit=X&offset=Y
+// returns the correct page (in the same address-sorted order ListNodes
+// always uses) and correctly reflects has_more at the boundary.
+func TestListNodesExplicitLimitOffset(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
+
+	for _, addr := range []string{"n1:1", "n2:1", "n3:1", "n4:1", "n5:1"} {
+		if _, err := store.UpsertDiscoveredNode(ctx, addr, storage.DiscoverySourceP2P, nil, nil); err != nil {
+			t.Fatalf("upsert %s: %v", addr, err)
+		}
+	}
+
+	resp, err := http.Get(srv.URL + "/nodes?limit=2&offset=2")
+	if err != nil {
+		t.Fatalf("GET /nodes?limit=2&offset=2: %v", err)
+	}
+	defer resp.Body.Close()
+	var got struct {
+		Nodes   []api.PublicNode `json:"nodes"`
+		Total   int              `json:"total"`
+		Limit   int              `json:"limit"`
+		Offset  int              `json:"offset"`
+		HasMore bool             `json:"has_more"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got.Nodes) != 2 {
+		t.Fatalf("len(got.Nodes) = %d, want 2", len(got.Nodes))
+	}
+	if got.Total != 5 {
+		t.Fatalf("got.Total = %d, want 5", got.Total)
+	}
+	if !got.HasMore {
+		t.Error("got.HasMore = false, want true (offset 2 + limit 2 = 4 < total 5)")
+	}
+
+	// Last page: offset 4, limit 2 -> only 1 node left, HasMore false.
+	resp2, err := http.Get(srv.URL + "/nodes?limit=2&offset=4")
+	if err != nil {
+		t.Fatalf("GET /nodes?limit=2&offset=4: %v", err)
+	}
+	defer resp2.Body.Close()
+	var got2 struct {
+		Nodes   []api.PublicNode `json:"nodes"`
+		HasMore bool             `json:"has_more"`
+	}
+	if err := json.NewDecoder(resp2.Body).Decode(&got2); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got2.Nodes) != 1 {
+		t.Fatalf("len(got2.Nodes) = %d, want 1", len(got2.Nodes))
+	}
+	if got2.HasMore {
+		t.Error("got2.HasMore = true, want false (last page)")
+	}
+}
+
+// TestListNodesLimitClamp asserts a `?limit=` above the API's hard cap
+// is silently clamped rather than erroring.
+func TestListNodesLimitClamp(t *testing.T) {
+	srv, _ := newTestServer(t, nil)
+
+	resp, err := http.Get(srv.URL + "/nodes?limit=100000")
+	if err != nil {
+		t.Fatalf("GET /nodes?limit=100000: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	var got struct {
+		Limit int `json:"limit"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Limit != 500 {
+		t.Fatalf("got.Limit = %d, want 500 (clamped)", got.Limit)
+	}
+}
+
+// TestListNodesInvalidOffset asserts a negative `?offset=` is rejected
+// with 400.
+func TestListNodesInvalidOffset(t *testing.T) {
+	srv, _ := newTestServer(t, nil)
+
+	resp, err := http.Get(srv.URL + "/nodes?offset=-1")
+	if err != nil {
+		t.Fatalf("GET /nodes?offset=-1: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+}
+
+// TestTopologyDefaultCap asserts GET /topology with no params bounds the
+// returned node set once the population exceeds the cap: it lowers the
+// cap via a small `?limit=` override rather than needing 300+ real seeded
+// nodes, to exercise the same capping code path handleTopology's default
+// takes.
+func TestTopologyDefaultCap(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
+
+	// hub is the best-connected node; leaf1/leaf2/leaf3 all connect only
+	// to hub, so hub + any 2 of the leaves is a valid top-3.
+	hub, err := store.UpsertDiscoveredNode(ctx, "hub:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert hub: %v", err)
+	}
+	var leaves []uuid.UUID
+	for _, addr := range []string{"leaf1:1", "leaf2:1", "leaf3:1"} {
+		leaf, err := store.UpsertDiscoveredNode(ctx, addr, storage.DiscoverySourceP2P, nil, nil)
+		if err != nil {
+			t.Fatalf("upsert %s: %v", addr, err)
+		}
+		leaves = append(leaves, leaf.ID)
+		if err := store.RecordPeerEdgeObservation(ctx, hub.ID, leaf.ID); err != nil {
+			t.Fatalf("record edge hub->%s: %v", addr, err)
+		}
+	}
+
+	// All 4 nodes exist; cap to 3 via an explicit ?limit= override (the
+	// cheapest way to exercise the capping logic itself without seeding
+	// 300+ real nodes for the production default).
+	resp, err := http.Get(srv.URL + "/topology?limit=3")
+	if err != nil {
+		t.Fatalf("GET /topology?limit=3: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	var got struct {
+		Nodes []api.PublicNode   `json:"nodes"`
+		Edges []storage.PeerEdge `json:"edges"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got.Nodes) != 3 {
+		t.Fatalf("len(got.Nodes) = %d, want 3 (capped)", len(got.Nodes))
+	}
+	gotIDs := map[uuid.UUID]bool{}
+	for _, n := range got.Nodes {
+		gotIDs[n.ID] = true
+	}
+	if !gotIDs[hub.ID] {
+		t.Errorf("got.Nodes missing hub (highest degree), gotIDs=%v", gotIDs)
+	}
+	for _, e := range got.Edges {
+		if !gotIDs[e.FromNodeID] || !gotIDs[e.ToNodeID] {
+			t.Errorf("edge %+v has an endpoint outside the returned node set", e)
+		}
+	}
+}
+
+// TestTopologyAllTrueUnbounded asserts GET /topology?all=true always
+// returns every node/edge, ignoring the default cap.
+func TestTopologyAllTrueUnbounded(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
+
+	hub, err := store.UpsertDiscoveredNode(ctx, "hub:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert hub: %v", err)
+	}
+	for _, addr := range []string{"leaf1:1", "leaf2:1", "leaf3:1"} {
+		leaf, err := store.UpsertDiscoveredNode(ctx, addr, storage.DiscoverySourceP2P, nil, nil)
+		if err != nil {
+			t.Fatalf("upsert %s: %v", addr, err)
+		}
+		if err := store.RecordPeerEdgeObservation(ctx, hub.ID, leaf.ID); err != nil {
+			t.Fatalf("record edge hub->%s: %v", addr, err)
+		}
+	}
+
+	resp, err := http.Get(srv.URL + "/topology?all=true")
+	if err != nil {
+		t.Fatalf("GET /topology?all=true: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	var got struct {
+		Nodes []api.PublicNode   `json:"nodes"`
+		Edges []storage.PeerEdge `json:"edges"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got.Nodes) != 4 {
+		t.Fatalf("len(got.Nodes) = %d, want 4 (unbounded)", len(got.Nodes))
+	}
+	if len(got.Edges) != 3 {
+		t.Fatalf("len(got.Edges) = %d, want 3 (unbounded)", len(got.Edges))
 	}
 }
