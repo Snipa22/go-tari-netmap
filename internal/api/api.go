@@ -20,7 +20,15 @@ import (
 
 // asyncCheckTimeout bounds the best-effort health check kicked off when a
 // node is submitted via POST /nodes.
-const asyncCheckTimeout = 30 * time.Second
+//
+// This must stay >= collector.dialTimeout (internal/collector/grpc_client.go,
+// currently 180s to accommodate real-world network/Tor-circuit latency)
+// plus a small buffer for HTTP request/response overhead on top of the
+// probe itself — otherwise this timeout would prematurely truncate a
+// probe that the underlying dial timeout would otherwise have kept
+// trying, undermining the whole point of raising dialTimeout in the
+// first place.
+const asyncCheckTimeout = 190 * time.Second
 
 // MaxPendingSubmissions caps the number of unreviewed ('pending')
 // submissions the review queue will hold at once — abuse mitigation

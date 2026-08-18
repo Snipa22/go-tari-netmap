@@ -19,11 +19,20 @@ import (
 
 // dialTimeout bounds how long grpcNodeClient waits to establish a
 // connection (and, transitively, to complete each RPC via the per-call
-// context) before giving up on an addr. Unreachable nodes are a normal,
-// expected case for this collector (peers come and go, seed lists go
-// stale, etc.), so this must stay short: a hung dial to one dead peer
-// must not stall an entire discovery/poll pass.
-const dialTimeout = 5 * time.Second
+// context) before giving up on an addr.
+//
+// This is 180s, not something shorter, because real-world network/
+// Tor-circuit latency for a full P2P probe round trip (TCP/SOCKS5 dial +
+// Noise_XX handshake + identity exchange + RPC call) needs meaningfully
+// more headroom than that: live testing found a real onion peer that
+// succeeded with a manually-run 60s timeout but failed 3x in a row
+// through the production path when it used a 5s timeout.
+//
+// This is an explicit, accepted tradeoff, not something to re-litigate
+// or silently mitigate here: a poll/discovery pass with many unreachable/
+// dead peers can now take up to N × 180s in the worst case instead of
+// N × 5s, but that's preferred over missing real, slow-to-respond peers.
+const dialTimeout = 180 * time.Second
 
 // dialFunc is the shape of grpc.NewClient, extracted so tests can inject a
 // bufconn-backed dialer without needing grpcNodeClient to hardcode real

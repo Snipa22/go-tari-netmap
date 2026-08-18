@@ -12,10 +12,14 @@ import (
 
 // p2pDialTimeout bounds how long p2pNodeClient waits for a single probe
 // (handshake + identity exchange + the actual RPC call) to complete before
-// giving up on an addr. Reuses the same value as grpc_client.go's
-// dialTimeout for the same reason given there: unreachable/stale peers are
-// the normal case for this collector, so a hung probe to one dead peer
-// must not stall an entire discovery/poll pass.
+// giving up on an addr. This is deliberately an alias to grpc_client.go's
+// dialTimeout, not an independent value: the dial timeout is meant to be
+// shared across both transports (real-world network/Tor-circuit latency
+// applies equally to either), so bumping one without the other would just
+// reintroduce the same too-short-for-onion-peers problem on this path.
+// See dialTimeout's doc comment in grpc_client.go for the full reasoning
+// (including the live-tested 60s-manual-vs-5s-production finding) behind
+// its current 180s value.
 const p2pDialTimeout = dialTimeout
 
 // p2pProbeFuncs is the seam between p2pNodeClient and go-tari-lib/p2p's
