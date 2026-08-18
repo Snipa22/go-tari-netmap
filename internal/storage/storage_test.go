@@ -686,6 +686,169 @@ func TestRecordHealthCheckRequiresProbeSource(t *testing.T) {
 	}
 }
 
+// TestRecordHealthCheckPeerIdentityUpdatedAtRoundTrip verifies
+// HealthCheckInput.PeerIdentityUpdatedAt round-trips through
+// RecordHealthCheck + GetNodeHistory, and that it is left nil when not
+// set (e.g. a gRPC-sourced check, which has no equivalent concept).
+func TestRecordHealthCheckPeerIdentityUpdatedAtRoundTrip(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	n, err := store.UpsertDiscoveredNode(ctx, "node:1", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	// Postgres timestamptz is microsecond-precision; truncate so the
+	// round-tripped value compares equal.
+	identityTS := time.Now().Add(-3 * time.Hour).Truncate(time.Microsecond).UTC()
+	if err := store.RecordHealthCheck(ctx, HealthCheckInput{
+		NodeID:                n.ID,
+		Reachable:             true,
+		ProbeSource:           ProbeSourceP2P,
+		PeerIdentityUpdatedAt: &identityTS,
+	}); err != nil {
+		t.Fatalf("record p2p health check with identity timestamp: %v", err)
+	}
+	if err := store.RecordHealthCheck(ctx, HealthCheckInput{
+		NodeID:      n.ID,
+		Reachable:   true,
+		ProbeSource: ProbeSourceGRPC,
+	}); err != nil {
+		t.Fatalf("record grpc health check without identity timestamp: %v", err)
+	}
+
+	history, err := store.GetNodeHistory(ctx, n.ID, 10)
+	if err != nil {
+		t.Fatalf("get history: %v", err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("len(history) = %d, want 2", len(history))
+	}
+
+	var p2pCheck, grpcCheck *HealthCheck
+	for i := range history {
+		switch history[i].ProbeSource {
+		case ProbeSourceP2P:
+			p2pCheck = &history[i]
+		case ProbeSourceGRPC:
+			grpcCheck = &history[i]
+		}
+	}
+	if p2pCheck == nil {
+		t.Fatal("no p2p-sourced row found in history")
+	}
+	if p2pCheck.PeerIdentityUpdatedAt == nil {
+		t.Fatal("p2pCheck.PeerIdentityUpdatedAt = nil, want set")
+	}
+	if !p2pCheck.PeerIdentityUpdatedAt.Equal(identityTS) {
+		t.Errorf("p2pCheck.PeerIdentityUpdatedAt = %v, want %v", p2pCheck.PeerIdentityUpdatedAt, identityTS)
+	}
+	if grpcCheck == nil {
+		t.Fatal("no grpc-sourced row found in history")
+	}
+	if grpcCheck.PeerIdentityUpdatedAt != nil {
+		t.Errorf("grpcCheck.PeerIdentityUpdatedAt = %v, want nil", grpcCheck.PeerIdentityUpdatedAt)
+	}
+}
+
+// TestGetRecentSuccessfulHealthChecks verifies that
+// GetRecentSuccessfulHealthChecks returns only reachable=true rows,
+// newest first, respecting limit — excluding unreachable rows entirely
+// rather than just returning them with nil fields (unlike GetNodeHistory,
+// which returns everything).
+func TestGetRecentSuccessfulHealthChecks(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	n, err := store.UpsertDiscoveredNode(ctx, "node:1", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	// Interleave: unreachable, successful #1 (older), unreachable,
+	// successful #2 (newer). GetRecentSuccessfulHealthChecks must
+	// return only the two successful rows, newest (#2) first.
+	if err := store.RecordHealthCheck(ctx, HealthCheckInput{NodeID: n.ID, Reachable: false, ProbeSource: ProbeSourceGRPC}); err != nil {
+		t.Fatalf("record unreachable check 1: %v", err)
+	}
+	time.Sleep(5 * time.Millisecond)
+
+	ts1 := time.Now().Add(-2 * time.Hour).Truncate(time.Microsecond).UTC()
+	if err := store.RecordHealthCheck(ctx, HealthCheckInput{
+		NodeID: n.ID, Reachable: true, ProbeSource: ProbeSourceP2P, PeerIdentityUpdatedAt: &ts1,
+	}); err != nil {
+		t.Fatalf("record successful check 1: %v", err)
+	}
+	time.Sleep(5 * time.Millisecond)
+
+	if err := store.RecordHealthCheck(ctx, HealthCheckInput{NodeID: n.ID, Reachable: false, ProbeSource: ProbeSourceGRPC}); err != nil {
+		t.Fatalf("record unreachable check 2: %v", err)
+	}
+	time.Sleep(5 * time.Millisecond)
+
+	ts2 := time.Now().Add(-1 * time.Hour).Truncate(time.Microsecond).UTC()
+	if err := store.RecordHealthCheck(ctx, HealthCheckInput{
+		NodeID: n.ID, Reachable: true, ProbeSource: ProbeSourceP2P, PeerIdentityUpdatedAt: &ts2,
+	}); err != nil {
+		t.Fatalf("record successful check 2: %v", err)
+	}
+
+	successful, err := store.GetRecentSuccessfulHealthChecks(ctx, n.ID, 10)
+	if err != nil {
+		t.Fatalf("get recent successful health checks: %v", err)
+	}
+	if len(successful) != 2 {
+		t.Fatalf("len(successful) = %d, want 2 (unreachable rows must be excluded)", len(successful))
+	}
+	if !successful[0].Reachable || !successful[1].Reachable {
+		t.Fatalf("successful contains an unreachable row: %+v", successful)
+	}
+	// Newest first: successful check 2 before successful check 1.
+	if successful[0].PeerIdentityUpdatedAt == nil || !successful[0].PeerIdentityUpdatedAt.Equal(ts2) {
+		t.Errorf("successful[0].PeerIdentityUpdatedAt = %v, want %v", successful[0].PeerIdentityUpdatedAt, ts2)
+	}
+	if successful[1].PeerIdentityUpdatedAt == nil || !successful[1].PeerIdentityUpdatedAt.Equal(ts1) {
+		t.Errorf("successful[1].PeerIdentityUpdatedAt = %v, want %v", successful[1].PeerIdentityUpdatedAt, ts1)
+	}
+
+	// limit is respected.
+	limited, err := store.GetRecentSuccessfulHealthChecks(ctx, n.ID, 1)
+	if err != nil {
+		t.Fatalf("get recent successful health checks (limit 1): %v", err)
+	}
+	if len(limited) != 1 {
+		t.Fatalf("len(limited) = %d, want 1", len(limited))
+	}
+	if limited[0].PeerIdentityUpdatedAt == nil || !limited[0].PeerIdentityUpdatedAt.Equal(ts2) {
+		t.Errorf("limited[0].PeerIdentityUpdatedAt = %v, want %v", limited[0].PeerIdentityUpdatedAt, ts2)
+	}
+}
+
+// TestGetRecentSuccessfulHealthChecksNoSuccessfulChecks verifies that a
+// node with only unreachable health checks (or none at all) gets an
+// empty, non-nil slice back rather than an error.
+func TestGetRecentSuccessfulHealthChecksNoSuccessfulChecks(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	n, err := store.UpsertDiscoveredNode(ctx, "node:1", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if err := store.RecordHealthCheck(ctx, HealthCheckInput{NodeID: n.ID, Reachable: false, ProbeSource: ProbeSourceGRPC}); err != nil {
+		t.Fatalf("record unreachable check: %v", err)
+	}
+
+	successful, err := store.GetRecentSuccessfulHealthChecks(ctx, n.ID, 10)
+	if err != nil {
+		t.Fatalf("get recent successful health checks: %v", err)
+	}
+	if len(successful) != 0 {
+		t.Fatalf("len(successful) = %d, want 0", len(successful))
+	}
+}
+
 func TestPeerEdgesAndTopology(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

@@ -187,6 +187,17 @@ type HealthCheck struct {
 	RxtHashrate    *float64    `json:"rxt_hashrate,omitempty"`
 	C29Hashrate    *float64    `json:"c29_hashrate,omitempty"`
 	Sha3xHashrate  *float64    `json:"sha3x_hashrate,omitempty"`
+
+	// PeerIdentityUpdatedAt is the peer's own self-reported
+	// identity-signature timestamp (go-tari-lib/p2p's
+	// PeerInfo.IdentitySignature.UpdatedAt, converted from Unix
+	// seconds): when the peer itself last (re-)signed its P2P identity
+	// claim, e.g. on restart or address change. It is NOT when this
+	// health check was performed (see Timestamp for that) — see
+	// 0009_peer_identity_updated_at.sql's migration comment for the
+	// full rationale. Nil whenever the probe didn't go over P2P, the
+	// peer sent no IdentitySignature, or the check was unreachable.
+	PeerIdentityUpdatedAt *time.Time `json:"peer_identity_updated_at,omitempty"`
 }
 
 // HealthCheckInput is the input to RecordHealthCheck.
@@ -201,6 +212,10 @@ type HealthCheckInput struct {
 	RxtHashrate    *float64
 	C29Hashrate    *float64
 	Sha3xHashrate  *float64
+
+	// PeerIdentityUpdatedAt mirrors HealthCheck.PeerIdentityUpdatedAt —
+	// see its doc comment above.
+	PeerIdentityUpdatedAt *time.Time
 }
 
 // PendingSubmission is one row of the public node-submission review

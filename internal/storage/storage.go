@@ -114,6 +114,19 @@ type Store interface {
 	// node, newest first.
 	GetNodeHistory(ctx context.Context, nodeID uuid.UUID, limit int) ([]HealthCheck, error)
 
+	// GetRecentSuccessfulHealthChecks returns the most recent limit
+	// health checks for a node that were reachable (reachable = true),
+	// newest first — unlike GetNodeHistory, unreachable rows are
+	// excluded entirely rather than just left with nil fields. This
+	// exists because fields like PeerIdentityUpdatedAt (and Version,
+	// Height, etc.) are only ever populated on a successful probe, so
+	// callers that want the most recent *meaningful* value for one of
+	// those fields (e.g. the node detail page's "identity last
+	// updated" display) need the most recent successful check, not
+	// just the most recent check of any kind, which may be a failed
+	// probe with every such field nil.
+	GetRecentSuccessfulHealthChecks(ctx context.Context, nodeID uuid.UUID, limit int) ([]HealthCheck, error)
+
 	// RecordPeerEdgeObservation records a single directed peer-topology
 	// edge observation. Unlike the old UpsertPeerEdge, this is a plain
 	// append-only INSERT — no ON CONFLICT, no dedup, no updating of an
@@ -806,15 +819,42 @@ func (s *pgStore) RecordHealthCheck(ctx context.Context, in HealthCheckInput) er
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO node_health (
 			node_id, ts, reachable, probe_source, height, chain_tip_height, version,
-			latency_ms, rxt_hashrate, c29_hashrate, sha3x_hashrate
-		) VALUES ($1, now(), $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			latency_ms, rxt_hashrate, c29_hashrate, sha3x_hashrate, peer_identity_updated_at
+		) VALUES ($1, now(), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 	`, in.NodeID, in.Reachable, string(in.ProbeSource), in.Height, in.ChainTipHeight, in.Version,
-		in.LatencyMS, in.RxtHashrate, in.C29Hashrate, in.Sha3xHashrate,
+		in.LatencyMS, in.RxtHashrate, in.C29Hashrate, in.Sha3xHashrate, in.PeerIdentityUpdatedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("storage: record health check: %w", err)
 	}
 	return nil
+}
+
+// healthCheckSelectColumns is the column list (in scan order) shared by
+// GetNodeHistory and GetRecentSuccessfulHealthChecks, so both queries stay
+// byte-for-byte consistent with each other and with scanHealthCheckRows.
+const healthCheckSelectColumns = `
+	id, node_id, ts, reachable, probe_source, height, chain_tip_height, version, latency_ms,
+	rxt_hashrate, c29_hashrate, sha3x_hashrate, peer_identity_updated_at
+`
+
+// scanHealthCheckRows scans a healthCheckSelectColumns-shaped rows result
+// into a []HealthCheck. Shared by GetNodeHistory and
+// GetRecentSuccessfulHealthChecks.
+func scanHealthCheckRows(rows pgx.Rows) ([]HealthCheck, error) {
+	checks := []HealthCheck{}
+	for rows.Next() {
+		var h HealthCheck
+		if err := rows.Scan(&h.ID, &h.NodeID, &h.Timestamp, &h.Reachable, &h.ProbeSource, &h.Height, &h.ChainTipHeight,
+			&h.Version, &h.LatencyMS, &h.RxtHashrate, &h.C29Hashrate, &h.Sha3xHashrate, &h.PeerIdentityUpdatedAt); err != nil {
+			return nil, fmt.Errorf("storage: scan health check: %w", err)
+		}
+		checks = append(checks, h)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage: scan health check rows: %w", err)
+	}
+	return checks, nil
 }
 
 func (s *pgStore) GetNodeHistory(ctx context.Context, nodeID uuid.UUID, limit int) ([]HealthCheck, error) {
@@ -823,8 +863,7 @@ func (s *pgStore) GetNodeHistory(ctx context.Context, nodeID uuid.UUID, limit in
 	}
 
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, node_id, ts, reachable, probe_source, height, chain_tip_height, version, latency_ms,
-			rxt_hashrate, c29_hashrate, sha3x_hashrate
+		SELECT `+healthCheckSelectColumns+`
 		FROM node_health
 		WHERE node_id = $1
 		ORDER BY ts DESC
@@ -835,17 +874,33 @@ func (s *pgStore) GetNodeHistory(ctx context.Context, nodeID uuid.UUID, limit in
 	}
 	defer rows.Close()
 
-	checks := []HealthCheck{}
-	for rows.Next() {
-		var h HealthCheck
-		if err := rows.Scan(&h.ID, &h.NodeID, &h.Timestamp, &h.Reachable, &h.ProbeSource, &h.Height, &h.ChainTipHeight,
-			&h.Version, &h.LatencyMS, &h.RxtHashrate, &h.C29Hashrate, &h.Sha3xHashrate); err != nil {
-			return nil, fmt.Errorf("storage: scan health check: %w", err)
-		}
-		checks = append(checks, h)
-	}
-	if err := rows.Err(); err != nil {
+	checks, err := scanHealthCheckRows(rows)
+	if err != nil {
 		return nil, fmt.Errorf("storage: get node history: %w", err)
+	}
+	return checks, nil
+}
+
+func (s *pgStore) GetRecentSuccessfulHealthChecks(ctx context.Context, nodeID uuid.UUID, limit int) ([]HealthCheck, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+healthCheckSelectColumns+`
+		FROM node_health
+		WHERE node_id = $1 AND reachable = true
+		ORDER BY ts DESC
+		LIMIT $2
+	`, nodeID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("storage: get recent successful health checks: %w", err)
+	}
+	defer rows.Close()
+
+	checks, err := scanHealthCheckRows(rows)
+	if err != nil {
+		return nil, fmt.Errorf("storage: get recent successful health checks: %w", err)
 	}
 	return checks, nil
 }

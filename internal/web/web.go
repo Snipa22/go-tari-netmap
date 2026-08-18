@@ -245,6 +245,20 @@ type nodeDetailData struct {
 	// computed from the already-fetched History slice — see
 	// computeLikelyDead for exactly how it's derived.
 	LikelyDead bool
+
+	// IdentityUpdatedAt is the peer's own self-reported
+	// identity-signature timestamp (storage.HealthCheck's
+	// PeerIdentityUpdatedAt field) from the most recent successful
+	// health check, fetched separately via
+	// store.GetRecentSuccessfulHealthChecks rather than derived from
+	// History: History's newest row can be a failed probe with every
+	// such field nil, which would otherwise make this flicker to "—"
+	// between successful checks even though the peer's last-known
+	// identity timestamp hasn't actually changed. Nil if this node has
+	// no successful health check on record yet, or none carried a
+	// PeerIdentityUpdatedAt (e.g. every successful check so far was
+	// over gRPC, which has no equivalent concept).
+	IdentityUpdatedAt *time.Time
 }
 
 // topPeeredWindow is the lookback window used to compute the dashboard's
@@ -780,6 +794,20 @@ func handleNodeDetail(tmpl *template.Template, store storage.Store) http.Handler
 			return
 		}
 
+		// See nodeDetailData.IdentityUpdatedAt's doc comment for why
+		// this is its own GetRecentSuccessfulHealthChecks call rather
+		// than derived from history above: history's newest row may be
+		// a failed probe with no identity data at all.
+		recentSuccessful, err := store.GetRecentSuccessfulHealthChecks(ctx, id, 1)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		var identityUpdatedAt *time.Time
+		if len(recentSuccessful) > 0 {
+			identityUpdatedAt = recentSuccessful[0].PeerIdentityUpdatedAt
+		}
+
 		edges, err := store.ListNodeEdges(ctx, id, nodeEdgesLimit)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -787,11 +815,12 @@ func handleNodeDetail(tmpl *template.Template, store storage.Store) http.Handler
 		}
 
 		data := nodeDetailData{
-			Node:            node,
-			History:         history,
-			Identity:        view.Identity,
-			Capabilities:    view.Capabilities,
-			PublicAddresses: view.PublicAddresses,
+			Node:              node,
+			History:           history,
+			Identity:          view.Identity,
+			Capabilities:      view.Capabilities,
+			PublicAddresses:   view.PublicAddresses,
+			IdentityUpdatedAt: identityUpdatedAt,
 		}
 
 		// LikelyDead against the already-fetched 50-row history above —
