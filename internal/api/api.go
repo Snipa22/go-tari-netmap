@@ -273,11 +273,13 @@ type pollNowResponse struct {
 
 // handlePollNow forces a synchronous health-check probe of an
 // address, bypassing the discovery/registry pipeline's usual async
-// kickoff and review queue entirely. Deliberately does NOT call
-// validateSubmittedHost — this is an internal admin-only endpoint
-// (private VLAN, same trust model as the rest of the internal API),
-// and an admin must be able to force-poll local/private-network
-// addresses for testing. Contrast with handleCreateNode's SSRF check
+// kickoff and review queue entirely. It validates that the submitted
+// host is at least syntactically well-formed (validateHostSyntax), but
+// deliberately does NOT call validateSubmittedHost — this is an
+// internal admin-only endpoint (private VLAN, same trust model as the
+// rest of the internal API), and an admin must be able to force-poll
+// local/private-network addresses for testing, so the private/reserved-
+// IP SSRF check is skipped. Contrast with handleCreateNode's SSRF check
 // above: that check exists because POST /nodes is reachable by
 // untrusted public submitters, which is not the threat model here.
 func handlePollNow(store storage.Store, grpcClient, p2pClient collector.NodeClient) http.HandlerFunc {
@@ -294,6 +296,16 @@ func handlePollNow(store storage.Store, grpcClient, p2pClient collector.NodeClie
 		}
 		if req.Port < 1 || req.Port > 65535 {
 			writeError(w, http.StatusBadRequest, errors.New("port must be between 1 and 65535"))
+			return
+		}
+
+		// Syntax-only validation (must be a valid IP or a plausible
+		// .onion address) — deliberately validateHostSyntax and NOT
+		// validateSubmittedHost, since this endpoint intentionally
+		// skips the latter's private/reserved-IP SSRF check (see this
+		// handler's doc comment above).
+		if err := validateHostSyntax(req.Host); err != nil {
+			writeError(w, http.StatusBadRequest, err)
 			return
 		}
 

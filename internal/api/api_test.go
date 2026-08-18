@@ -1134,11 +1134,38 @@ func TestPollNowSkipsSSRFValidation(t *testing.T) {
 	}
 }
 
-// TestPollNowInvalid asserts empty-host and out-of-range-port requests
-// are rejected with 400 and the same error message text as
-// handleCreateNode's equivalent checks.
+// TestPollNowAcceptsPrivateIPv4 asserts POST /nodes/poll-now accepts a
+// plain RFC1918 private IPv4 host (192.168.1.1, distinct from the
+// loopback case covered by TestPollNowSkipsSSRFValidation above) and
+// probes it (200), preserving the endpoint's deliberate SSRF exemption
+// for admins who need to force-poll internal addresses.
+func TestPollNowAcceptsPrivateIPv4(t *testing.T) {
+	srv, _ := newTestServer(t, nil) // no fixture for this address -> GetInfo fails -> unreachable, still 200
+
+	body := `{"host":"192.168.1.1","port":18142}`
+	resp, err := http.Post(srv.URL+"/nodes/poll-now", "application/json", bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatalf("POST /nodes/poll-now: %v", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, http.StatusOK, respBody)
+	}
+	if strings.Contains(string(respBody), "private/reserved IP addresses are not allowed") {
+		t.Errorf("body unexpectedly contains SSRF rejection message: %s", respBody)
+	}
+}
+
+// TestPollNowInvalid asserts empty-host, out-of-range-port, and
+// malformed-host requests are rejected with 400 and the same error
+// message text as handleCreateNode's equivalent checks (for the
+// empty-host/bad-port cases) or validateHostSyntax's message (for the
+// malformed-host case) — and that the malformed-host case does not
+// create a node.
 func TestPollNowInvalid(t *testing.T) {
-	srv, _ := newTestServer(t, nil)
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
 
 	cases := []struct {
 		name    string
@@ -1148,10 +1175,20 @@ func TestPollNowInvalid(t *testing.T) {
 		{"missing host", `{"port":18142}`, "host is required"},
 		{"port too small", `{"host":"1.2.3.4","port":0}`, "port must be between 1 and 65535"},
 		{"port too large", `{"host":"1.2.3.4","port":65536}`, "port must be between 1 and 65535"},
+		{
+			"malformed onion host with leading slash",
+			`{"host":"/wyow2dp6w2ff4u2kebklkmbzwlixyhjtza5bf3pt3oxnps5hcjn76iyd.onion","port":18142}`,
+			"host must be a valid IP address or .onion address",
+		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			before, err := store.ListNodes(ctx, storage.NodeFilter{})
+			if err != nil {
+				t.Fatalf("list nodes before: %v", err)
+			}
+
 			resp, err := http.Post(srv.URL+"/nodes/poll-now", "application/json", bytes.NewBufferString(tc.body))
 			if err != nil {
 				t.Fatalf("POST /nodes/poll-now: %v", err)
@@ -1163,6 +1200,14 @@ func TestPollNowInvalid(t *testing.T) {
 			}
 			if !strings.Contains(string(respBody), tc.wantMsg) {
 				t.Errorf("body = %s, want it to contain %q", respBody, tc.wantMsg)
+			}
+
+			after, err := store.ListNodes(ctx, storage.NodeFilter{})
+			if err != nil {
+				t.Fatalf("list nodes after: %v", err)
+			}
+			if len(after) != len(before) {
+				t.Errorf("len(nodes) = %d, want unchanged %d (rejected request must not create a node)", len(after), len(before))
 			}
 		})
 	}
