@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/Snipa22/go-tari-netmap/internal/adminauth"
 	"github.com/Snipa22/go-tari-netmap/internal/collector"
 	"github.com/Snipa22/go-tari-netmap/internal/storage"
 )
@@ -46,8 +47,12 @@ var MaxPendingSubmissions = 100
 // and health data; grpcClient and p2pClient are used to kick off an async,
 // non-blocking health check via each configured transport when a new node
 // is registered via POST /nodes. Either may be nil — collector.PollOnce
-// skips a nil client's probe entirely rather than erroring.
-func NewRouter(store storage.Store, grpcClient, p2pClient collector.NodeClient) http.Handler {
+// skips a nil client's probe entirely rather than erroring. adminCreds
+// configures the HTTP Basic Auth gate in front of every /admin/* route
+// (the submission review queue and the poll-now admin tool) — see
+// internal/adminauth.Wrap's doc comment for the fail-closed-503 behavior
+// when adminCreds isn't fully configured.
+func NewRouter(store storage.Store, grpcClient, p2pClient collector.NodeClient, adminCreds adminauth.Credentials) http.Handler {
 	mux := http.NewServeMux()
 
 	// Created once and shared across every POST /nodes call (NewRouter
@@ -62,16 +67,28 @@ func NewRouter(store storage.Store, grpcClient, p2pClient collector.NodeClient) 
 
 	mux.HandleFunc("GET /nodes", handleListNodes(store))
 	mux.HandleFunc("POST /nodes", handleCreateNode(store, grpcClient, p2pClient, limiter, lockouts))
-	mux.HandleFunc("POST /nodes/poll-now", handlePollNow(store, grpcClient, p2pClient))
 	mux.HandleFunc("GET /nodes/{id}", handleGetNode(store))
 	mux.HandleFunc("GET /nodes/{id}/history", handleGetNodeHistory(store))
 	mux.HandleFunc("GET /nodes/{id}/edges", handleGetNodeEdges(store))
 	mux.HandleFunc("GET /topology", handleTopology(store))
 	mux.HandleFunc("GET /topology/top-peered", handleTopPeeredNodes(store))
 
-	mux.HandleFunc("GET /submissions", handleListSubmissions(store))
-	mux.HandleFunc("POST /submissions/{id}/approve", handleApproveSubmission(store, grpcClient, p2pClient))
-	mux.HandleFunc("POST /submissions/{id}/reject", handleRejectSubmission(store))
+	// Every /admin/* route — the submission review queue (list/approve/
+	// reject) and the poll-now admin tool — is registered on its own
+	// sub-mux and gated behind adminauth.Wrap as a single unit, so the
+	// HTTP Basic Auth (and fail-closed-503-when-unconfigured) behavior
+	// applies uniformly across all of them rather than being wired
+	// per-route. poll-now lives under /admin too, alongside the
+	// submissions sub-resource routes, rather than scattered elsewhere:
+	// it isn't a submissions sub-resource itself, but it's equally an
+	// admin-only tool, and keeping a single /admin prefix is simpler
+	// than introducing a second protected prefix for one route.
+	adminMux := http.NewServeMux()
+	adminMux.HandleFunc("GET /admin/submissions", handleListSubmissions(store))
+	adminMux.HandleFunc("POST /admin/submissions/{id}/approve", handleApproveSubmission(store, grpcClient, p2pClient))
+	adminMux.HandleFunc("POST /admin/submissions/{id}/reject", handleRejectSubmission(store))
+	adminMux.HandleFunc("POST /admin/nodes/poll-now", handlePollNow(store, grpcClient, p2pClient))
+	mux.Handle("/admin/", adminauth.Wrap(adminCreds, adminMux))
 
 	return mux
 }
@@ -316,7 +333,7 @@ func handleCreateNode(store storage.Store, grpcClient, p2pClient collector.NodeC
 	}
 }
 
-// pollNowRequest is the POST /nodes/poll-now request body: same host/port
+// pollNowRequest is the POST /admin/nodes/poll-now request body: same host/port
 // shape as createNodeRequest, minus the registry-submission-only fields
 // (Label, OwnerTag) that don't apply to a forced admin probe.
 type pollNowRequest struct {
@@ -324,7 +341,7 @@ type pollNowRequest struct {
 	Port flexPort `json:"port"`
 }
 
-// pollNowResponse is the POST /nodes/poll-now response body. Unlike
+// pollNowResponse is the POST /admin/nodes/poll-now response body. Unlike
 // every other node-returning endpoint in this file, it returns the
 // FULL, unscrubbed storage.Node (real address, real pubkey if
 // confirmed) rather than going through ScrubNode/PublicNode — this
@@ -344,11 +361,13 @@ type pollNowResponse struct {
 // host is at least syntactically well-formed (validateHostSyntax), but
 // deliberately does NOT call validateSubmittedHost — this is an
 // internal admin-only endpoint (private VLAN, same trust model as the
-// rest of the internal API), and an admin must be able to force-poll
-// local/private-network addresses for testing, so the private/reserved-
-// IP SSRF check is skipped. Contrast with handleCreateNode's SSRF check
-// above: that check exists because POST /nodes is reachable by
-// untrusted public submitters, which is not the threat model here.
+// rest of the internal API, now additionally gated by HTTP Basic Auth
+// via adminauth.Wrap in NewRouter above), and an admin must be able to
+// force-poll local/private-network addresses for testing, so the
+// private/reserved-IP SSRF check is skipped. Contrast with
+// handleCreateNode's SSRF check above: that check exists because
+// POST /nodes is reachable by untrusted public submitters, which is not
+// the threat model here.
 func handlePollNow(store storage.Store, grpcClient, p2pClient collector.NodeClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req pollNowRequest
@@ -429,8 +448,8 @@ func handleListSubmissions(store storage.Store) http.HandlerFunc {
 	}
 }
 
-// approveSubmissionResponse is the POST /submissions/{id}/approve response
-// body: the resulting promoted node alongside the now-approved
+// approveSubmissionResponse is the POST /admin/submissions/{id}/approve
+// response body: the resulting promoted node alongside the now-approved
 // submission.
 type approveSubmissionResponse struct {
 	Node       storage.Node              `json:"node"`
@@ -509,7 +528,7 @@ func handleApproveSubmission(store storage.Store, grpcClient, p2pClient collecto
 	}
 }
 
-// rejectSubmissionRequest is the optional POST /submissions/{id}/reject
+// rejectSubmissionRequest is the optional POST /admin/submissions/{id}/reject
 // request body.
 type rejectSubmissionRequest struct {
 	Reason string `json:"reason"`

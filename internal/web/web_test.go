@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Snipa22/go-tari-netmap/internal/adminauth"
 	"github.com/Snipa22/go-tari-netmap/internal/storage"
 	"github.com/Snipa22/go-tari-netmap/internal/web"
 )
@@ -100,9 +101,29 @@ func newTestStore(t *testing.T) storage.Store {
 	return store
 }
 
+// testAdminUser/testAdminPassword are the fixed HTTP Basic Auth
+// credentials used by newTestServer (and every test that exercises an
+// /admin/* route) — see newTestServerWithCreds below for the "not
+// configured" variant used to prove the fail-closed-503 behavior.
+const (
+	testAdminUser     = "admin-test-user"
+	testAdminPassword = "admin-test-password"
+)
+
 func newTestServer(t *testing.T, store storage.Store) *httptest.Server {
 	t.Helper()
-	handler, err := web.NewHandler(store)
+	return newTestServerWithCreds(t, store, adminauth.Credentials{Username: testAdminUser, Password: testAdminPassword})
+}
+
+// newTestServerWithCreds is like newTestServer but lets the caller
+// control the admin credentials web.NewHandler is built with — in
+// particular, passing a zero-value adminauth.Credentials{} simulates
+// NETMAP_ADMIN_USER/NETMAP_ADMIN_PASSWORD being unset, which must fail
+// closed (503) on every /admin/* route regardless of what's supplied on
+// the request.
+func newTestServerWithCreds(t *testing.T, store storage.Store, creds adminauth.Credentials) *httptest.Server {
+	t.Helper()
+	handler, err := web.NewHandler(store, creds)
 	if err != nil {
 		t.Fatalf("build web handler: %v", err)
 	}
@@ -123,6 +144,29 @@ func getBody(t *testing.T, url string) (int, string) {
 		t.Fatalf("read body: %v", err)
 	}
 	return resp.StatusCode, string(body)
+}
+
+// getBodyWithAuth is like getBody but sets an Authorization: Basic
+// header (via req.SetBasicAuth) using the given user/pass before
+// issuing the GET — used to exercise /admin/* routes, which require
+// valid credentials.
+func getBodyWithAuth(t *testing.T, url, user, pass string) (int, string, http.Header) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("build request for %s: %v", url, err)
+	}
+	req.SetBasicAuth(user, pass)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return resp.StatusCode, string(body), resp.Header
 }
 
 // TestDashboardHidesP2PAddress asserts GET / returns 200 and never
@@ -419,9 +463,10 @@ func TestTopologyGraphPage(t *testing.T) {
 	}
 }
 
-// TestSubmissionsPage asserts GET /submissions renders the pending
-// submissions in a plain HTML table with approve/reject htmx buttons, and
-// that a fully-reviewed (non-pending) submission does not show up.
+// TestSubmissionsPage asserts GET /admin/submissions (with valid admin
+// Basic Auth credentials) renders the pending submissions in a plain
+// HTML table with approve/reject htmx buttons, and that a
+// fully-reviewed (non-pending) submission does not show up.
 func TestSubmissionsPage(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -440,32 +485,133 @@ func TestSubmissionsPage(t *testing.T) {
 	}
 
 	srv := newTestServer(t, store)
-	status, body := getBody(t, srv.URL+"/submissions")
+	status, body, _ := getBodyWithAuth(t, srv.URL+"/admin/submissions", testAdminUser, testAdminPassword)
 	if status != http.StatusOK {
-		t.Fatalf("GET /submissions status = %d, want %d", status, http.StatusOK)
+		t.Fatalf("GET /admin/submissions status = %d, want %d", status, http.StatusOK)
 	}
 	if !strings.Contains(body, pendingAddr) {
-		t.Errorf("GET /submissions body missing pending submission's address %q", pendingAddr)
+		t.Errorf("GET /admin/submissions body missing pending submission's address %q", pendingAddr)
 	}
-	if !strings.Contains(body, fmt.Sprintf("/api/submissions/%s/approve", pending.ID)) {
-		t.Errorf("GET /submissions body missing approve htmx action for %s", pending.ID)
+	if !strings.Contains(body, fmt.Sprintf("/api/admin/submissions/%s/approve", pending.ID)) {
+		t.Errorf("GET /admin/submissions body missing approve htmx action for %s", pending.ID)
 	}
-	if !strings.Contains(body, fmt.Sprintf("/api/submissions/%s/reject", pending.ID)) {
-		t.Errorf("GET /submissions body missing reject htmx action for %s", pending.ID)
+	if !strings.Contains(body, fmt.Sprintf("/api/admin/submissions/%s/reject", pending.ID)) {
+		t.Errorf("GET /admin/submissions body missing reject htmx action for %s", pending.ID)
 	}
 	if strings.Contains(body, "5.6.7.8:18142") {
-		t.Errorf("GET /submissions body contains an already-rejected (non-pending) submission's address")
+		t.Errorf("GET /admin/submissions body contains an already-rejected (non-pending) submission's address")
 	}
 	if !strings.Contains(body, "not yet probed") {
-		t.Errorf("GET /submissions body missing the not-yet-probed indicator for %s", pending.ID)
+		t.Errorf("GET /admin/submissions body missing the not-yet-probed indicator for %s", pending.ID)
 	}
 
 	if err := store.RecordSubmissionProbeResult(ctx, pending.ID, false); err != nil {
 		t.Fatalf("record submission probe result: %v", err)
 	}
-	_, body = getBody(t, srv.URL+"/submissions")
+	_, body, _ = getBodyWithAuth(t, srv.URL+"/admin/submissions", testAdminUser, testAdminPassword)
 	if !strings.Contains(body, "unreachable") {
-		t.Errorf("GET /submissions body missing unreachable probe result for %s", pending.ID)
+		t.Errorf("GET /admin/submissions body missing unreachable probe result for %s", pending.ID)
+	}
+}
+
+// TestAdminSubmissionsRequiresAuth asserts GET /admin/submissions 401s
+// with a WWW-Authenticate header both when no Authorization header is
+// supplied and when the wrong credentials are supplied, and only
+// succeeds (200) with the correct configured credentials.
+func TestAdminSubmissionsRequiresAuth(t *testing.T) {
+	store := newTestStore(t)
+	srv := newTestServer(t, store)
+
+	// No Authorization header at all.
+	status, _ := getBody(t, srv.URL+"/admin/submissions")
+	if status != http.StatusUnauthorized {
+		t.Errorf("no-auth GET /admin/submissions status = %d, want %d", status, http.StatusUnauthorized)
+	}
+	resp, err := http.Get(srv.URL + "/admin/submissions")
+	if err != nil {
+		t.Fatalf("GET /admin/submissions: %v", err)
+	}
+	resp.Body.Close()
+	if wa := resp.Header.Get("WWW-Authenticate"); !strings.Contains(wa, "Basic") {
+		t.Errorf("no-auth GET /admin/submissions WWW-Authenticate = %q, want it to contain %q", wa, "Basic")
+	}
+
+	// Wrong credentials.
+	status, _, headers := getBodyWithAuth(t, srv.URL+"/admin/submissions", "wrong-user", "wrong-password")
+	if status != http.StatusUnauthorized {
+		t.Errorf("wrong-auth GET /admin/submissions status = %d, want %d", status, http.StatusUnauthorized)
+	}
+	if wa := headers.Get("WWW-Authenticate"); !strings.Contains(wa, "Basic") {
+		t.Errorf("wrong-auth GET /admin/submissions WWW-Authenticate = %q, want it to contain %q", wa, "Basic")
+	}
+
+	// Correct credentials.
+	status, _, _ = getBodyWithAuth(t, srv.URL+"/admin/submissions", testAdminUser, testAdminPassword)
+	if status != http.StatusOK {
+		t.Errorf("correct-auth GET /admin/submissions status = %d, want %d", status, http.StatusOK)
+	}
+}
+
+// TestAdminSubmissionsDisabledWhenCredsNotConfigured asserts that when
+// web.NewHandler is built with an unconfigured (zero-value)
+// adminauth.Credentials — simulating NETMAP_ADMIN_USER/
+// NETMAP_ADMIN_PASSWORD being unset — GET /admin/submissions returns 503
+// for every request, even one supplying a plausible-looking guessed
+// Basic Auth header, and specifically NOT 401/200/404.
+func TestAdminSubmissionsDisabledWhenCredsNotConfigured(t *testing.T) {
+	store := newTestStore(t)
+	srv := newTestServerWithCreds(t, store, adminauth.Credentials{})
+
+	// No Authorization header.
+	status, _ := getBody(t, srv.URL+"/admin/submissions")
+	if status != http.StatusServiceUnavailable {
+		t.Errorf("no-auth GET /admin/submissions status = %d, want %d", status, http.StatusServiceUnavailable)
+	}
+
+	// A plausible guessed credential pair must not slip through.
+	for _, creds := range [][2]string{{"admin", "admin"}, {"admin", ""}} {
+		status, _, _ := getBodyWithAuth(t, srv.URL+"/admin/submissions", creds[0], creds[1])
+		if status != http.StatusServiceUnavailable {
+			t.Errorf("guessed-auth (%q/%q) GET /admin/submissions status = %d, want %d", creds[0], creds[1], status, http.StatusServiceUnavailable)
+		}
+		if status == http.StatusUnauthorized || status == http.StatusOK || status == http.StatusNotFound {
+			t.Errorf("guessed-auth (%q/%q) GET /admin/submissions status = %d, must not be 401/200/404", creds[0], creds[1], status)
+		}
+	}
+}
+
+// TestNonAdminRoutesRemainUnauthenticated is the most important
+// regression test in this dispatch: it proves the adminauth gate is
+// wired ONLY around /admin/*, not more broadly, by hitting every
+// non-admin web route with zero Authorization header (even though this
+// test's server IS built with admin credentials configured) and
+// asserting each still succeeds exactly as before.
+func TestNonAdminRoutesRemainUnauthenticated(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	node, err := store.UpsertDiscoveredNode(ctx, "1.2.3.4:18142", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert node: %v", err)
+	}
+
+	srv := newTestServer(t, store)
+
+	status, _ := getBody(t, srv.URL+"/")
+	if status != http.StatusOK {
+		t.Errorf("no-auth GET / status = %d, want %d", status, http.StatusOK)
+	}
+	status, _ = getBody(t, srv.URL+"/topology")
+	if status != http.StatusOK {
+		t.Errorf("no-auth GET /topology status = %d, want %d", status, http.StatusOK)
+	}
+	status, _ = getBody(t, srv.URL+"/nodes/"+node.ID.String())
+	if status != http.StatusOK {
+		t.Errorf("no-auth GET /nodes/%s status = %d, want %d", node.ID, status, http.StatusOK)
+	}
+	status, _ = getBody(t, srv.URL+"/static/style.css")
+	if status != http.StatusOK {
+		t.Errorf("no-auth GET /static/style.css status = %d, want %d", status, http.StatusOK)
 	}
 }
 

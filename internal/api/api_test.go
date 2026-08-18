@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Snipa22/go-tari-netmap/internal/adminauth"
 	"github.com/Snipa22/go-tari-netmap/internal/api"
 	"github.com/Snipa22/go-tari-netmap/internal/collector"
 	"github.com/Snipa22/go-tari-netmap/internal/storage"
@@ -130,7 +131,28 @@ func (f *fakeClient) GetInfo(ctx context.Context, addr string) (collector.NodeIn
 	return info, nil
 }
 
+// testAdminUser/testAdminPassword are the fixed HTTP Basic Auth
+// credentials newTestServer builds api.NewRouter with — see
+// newTestServerWithCreds below for the "not configured" variant used to
+// prove the fail-closed-503 behavior, and doAdminRequest for the
+// request helper that authenticates against these.
+const (
+	testAdminUser     = "admin-test-user"
+	testAdminPassword = "admin-test-password"
+)
+
 func newTestServer(t *testing.T, client collector.NodeClient) (*httptest.Server, storage.Store) {
+	t.Helper()
+	return newTestServerWithCreds(t, client, adminauth.Credentials{Username: testAdminUser, Password: testAdminPassword})
+}
+
+// newTestServerWithCreds is like newTestServer but lets the caller
+// control the admin credentials api.NewRouter is built with — in
+// particular, passing a zero-value adminauth.Credentials{} simulates
+// NETMAP_ADMIN_USER/NETMAP_ADMIN_PASSWORD being unset, which must fail
+// closed (503) on every /admin/* route regardless of what's supplied on
+// the request.
+func newTestServerWithCreds(t *testing.T, client collector.NodeClient, creds adminauth.Credentials) (*httptest.Server, storage.Store) {
 	t.Helper()
 	store := newTestStore(t)
 	if client == nil {
@@ -139,7 +161,7 @@ func newTestServer(t *testing.T, client collector.NodeClient) (*httptest.Server,
 	// p2pClient is nil here: these tests only exercise the gRPC-labeled
 	// async health-check kickoff path; dual-probe behavior is covered by
 	// internal/collector's own tests.
-	srv := httptest.NewServer(api.NewRouter(store, client, nil))
+	srv := httptest.NewServer(api.NewRouter(store, client, nil, creds))
 	t.Cleanup(srv.Close)
 	return srv, store
 }
@@ -147,6 +169,26 @@ func newTestServer(t *testing.T, client collector.NodeClient) (*httptest.Server,
 // strPtr is a small helper for building *string literals inline in test
 // assertions/fixtures.
 func strPtr(s string) *string { return &s }
+
+// doAdminRequest issues method to url (with an optional body) with valid
+// admin Basic Auth credentials set via req.SetBasicAuth — used by every
+// test hitting an /admin/* route below.
+func doAdminRequest(t *testing.T, method, url, contentType string, body io.Reader) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		t.Fatalf("build %s %s request: %v", method, url, err)
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	req.SetBasicAuth(testAdminUser, testAdminPassword)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, url, err)
+	}
+	return resp
+}
 
 func TestHealthz(t *testing.T) {
 	srv, _ := newTestServer(t, nil)
@@ -717,8 +759,8 @@ func TestScrubbingP2PVsRegistry(t *testing.T) {
 	}
 }
 
-// TestListSubmissions asserts GET /submissions defaults to listing
-// pending submissions and honors the status query param.
+// TestListSubmissions asserts GET /admin/submissions defaults to
+// listing pending submissions and honors the status query param.
 func TestListSubmissions(t *testing.T) {
 	srv, store := newTestServer(t, nil)
 	ctx := context.Background()
@@ -728,10 +770,7 @@ func TestListSubmissions(t *testing.T) {
 		t.Fatalf("create pending submission: %v", err)
 	}
 
-	resp, err := http.Get(srv.URL + "/submissions")
-	if err != nil {
-		t.Fatalf("GET /submissions: %v", err)
-	}
+	resp := doAdminRequest(t, http.MethodGet, srv.URL+"/admin/submissions", "", nil)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
@@ -762,10 +801,7 @@ func TestApproveSubmission(t *testing.T) {
 		t.Fatalf("create pending submission: %v", err)
 	}
 
-	resp, err := http.Post(fmt.Sprintf("%s/submissions/%s/approve", srv.URL, submission.ID), "application/json", nil)
-	if err != nil {
-		t.Fatalf("POST /submissions/{id}/approve: %v", err)
-	}
+	resp := doAdminRequest(t, http.MethodPost, fmt.Sprintf("%s/admin/submissions/%s/approve", srv.URL, submission.ID), "application/json", nil)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -847,10 +883,7 @@ func TestApproveSubmissionNotPending(t *testing.T) {
 		t.Fatalf("reject: %v", err)
 	}
 
-	resp, err := http.Post(fmt.Sprintf("%s/submissions/%s/approve", srv.URL, submission.ID), "application/json", nil)
-	if err != nil {
-		t.Fatalf("POST /submissions/{id}/approve: %v", err)
-	}
+	resp := doAdminRequest(t, http.MethodPost, fmt.Sprintf("%s/admin/submissions/%s/approve", srv.URL, submission.ID), "application/json", nil)
 	defer resp.Body.Close()
 	if resp.StatusCode < 400 {
 		t.Fatalf("status = %d, want an error status (submission already reviewed)", resp.StatusCode)
@@ -884,10 +917,7 @@ func TestApproveSubmissionAddressBecameOptedIn(t *testing.T) {
 		t.Fatalf("upsert competing node: %v", err)
 	}
 
-	resp, err := http.Post(fmt.Sprintf("%s/submissions/%s/approve", srv.URL, submission.ID), "application/json", nil)
-	if err != nil {
-		t.Fatalf("POST /submissions/{id}/approve: %v", err)
-	}
+	resp := doAdminRequest(t, http.MethodPost, fmt.Sprintf("%s/admin/submissions/%s/approve", srv.URL, submission.ID), "application/json", nil)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusConflict {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusConflict)
@@ -915,14 +945,11 @@ func TestRejectSubmission(t *testing.T) {
 		t.Fatalf("create pending submission: %v", err)
 	}
 
-	resp, err := http.Post(
-		fmt.Sprintf("%s/submissions/%s/reject", srv.URL, submission.ID),
+	resp := doAdminRequest(t, http.MethodPost,
+		fmt.Sprintf("%s/admin/submissions/%s/reject", srv.URL, submission.ID),
 		"application/json",
 		bytes.NewBufferString(`{"reason":"looks like spam"}`),
 	)
-	if err != nil {
-		t.Fatalf("POST /submissions/{id}/reject: %v", err)
-	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
@@ -959,10 +986,7 @@ func TestRejectSubmissionEmptyBody(t *testing.T) {
 		t.Fatalf("create pending submission: %v", err)
 	}
 
-	resp, err := http.Post(fmt.Sprintf("%s/submissions/%s/reject", srv.URL, submission.ID), "application/json", nil)
-	if err != nil {
-		t.Fatalf("POST /submissions/{id}/reject: %v", err)
-	}
+	resp := doAdminRequest(t, http.MethodPost, fmt.Sprintf("%s/admin/submissions/%s/reject", srv.URL, submission.ID), "application/json", nil)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -993,14 +1017,11 @@ func TestRejectSubmissionMalformedBody(t *testing.T) {
 		t.Fatalf("create pending submission: %v", err)
 	}
 
-	resp, err := http.Post(
-		fmt.Sprintf("%s/submissions/%s/reject", srv.URL, submission.ID),
+	resp := doAdminRequest(t, http.MethodPost,
+		fmt.Sprintf("%s/admin/submissions/%s/reject", srv.URL, submission.ID),
 		"application/json",
 		bytes.NewBufferString(`{not json`),
 	)
-	if err != nil {
-		t.Fatalf("POST /submissions/{id}/reject: %v", err)
-	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
@@ -1180,7 +1201,7 @@ func TestCreateNodeInvalidSubmissionLockout(t *testing.T) {
 	}
 }
 
-// TestPollNowCreatesNewNode asserts POST /nodes/poll-now against a
+// TestPollNowCreatesNewNode asserts POST /admin/nodes/poll-now against a
 // brand-new host:port creates exactly one node, synchronously probes it,
 // and returns the resulting node state (pubkey confirmed) in the
 // response body.
@@ -1194,10 +1215,7 @@ func TestPollNowCreatesNewNode(t *testing.T) {
 	ctx := context.Background()
 
 	body := `{"host":"203.0.113.20","port":18142}`
-	resp, err := http.Post(srv.URL+"/nodes/poll-now", "application/json", bytes.NewBufferString(body))
-	if err != nil {
-		t.Fatalf("POST /nodes/poll-now: %v", err)
-	}
+	resp := doAdminRequest(t, http.MethodPost, srv.URL+"/admin/nodes/poll-now", "application/json", bytes.NewBufferString(body))
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
@@ -1233,9 +1251,9 @@ func TestPollNowCreatesNewNode(t *testing.T) {
 	}
 }
 
-// TestPollNowReusesExistingNode asserts POST /nodes/poll-now against an
-// already-known address reuses the existing node row (same ID) rather
-// than creating a duplicate.
+// TestPollNowReusesExistingNode asserts POST /admin/nodes/poll-now
+// against an already-known address reuses the existing node row (same
+// ID) rather than creating a duplicate.
 func TestPollNowReusesExistingNode(t *testing.T) {
 	const addr = "203.0.113.21:18142"
 	client := &fakeClient{info: map[string]collector.NodeInfo{
@@ -1255,10 +1273,7 @@ func TestPollNowReusesExistingNode(t *testing.T) {
 	}
 
 	body := fmt.Sprintf(`{"host":"203.0.113.21","port":18142}`)
-	resp, err := http.Post(srv.URL+"/nodes/poll-now", "application/json", bytes.NewBufferString(body))
-	if err != nil {
-		t.Fatalf("POST /nodes/poll-now: %v", err)
-	}
+	resp := doAdminRequest(t, http.MethodPost, srv.URL+"/admin/nodes/poll-now", "application/json", bytes.NewBufferString(body))
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
@@ -1284,18 +1299,18 @@ func TestPollNowReusesExistingNode(t *testing.T) {
 	}
 }
 
-// TestPollNowSkipsSSRFValidation asserts POST /nodes/poll-now does NOT
-// apply the SSRF/private-IP validation that POST /nodes does — it must
-// accept a private-IP host and probe it (200, even when the probe
-// itself fails/is unreachable), in contrast to POST /nodes rejecting the
-// exact same host with a 400 and the SSRF error message.
+// TestPollNowSkipsSSRFValidation asserts POST /admin/nodes/poll-now
+// does NOT apply the SSRF/private-IP validation that POST /nodes does —
+// it must accept a private-IP host and probe it (200, even when the
+// probe itself fails/is unreachable), in contrast to POST /nodes
+// rejecting the exact same host with a 400 and the SSRF error message.
 func TestPollNowSkipsSSRFValidation(t *testing.T) {
 	srv, _ := newTestServer(t, nil) // no fixture for this address -> GetInfo fails -> unreachable
 
 	body := `{"host":"127.0.0.1","port":18142}`
 
-	// Contrast: POST /nodes rejects this exact host with the SSRF
-	// message.
+	// Contrast: POST /nodes (public, unauthenticated) rejects this
+	// exact host with the SSRF message.
 	createResp, err := http.Post(srv.URL+"/nodes", "application/json", bytes.NewBufferString(body))
 	if err != nil {
 		t.Fatalf("POST /nodes: %v", err)
@@ -1309,34 +1324,28 @@ func TestPollNowSkipsSSRFValidation(t *testing.T) {
 		t.Errorf("POST /nodes body missing SSRF rejection message: %s", createBody)
 	}
 
-	// POST /nodes/poll-now must accept the same host.
-	pollResp, err := http.Post(srv.URL+"/nodes/poll-now", "application/json", bytes.NewBufferString(body))
-	if err != nil {
-		t.Fatalf("POST /nodes/poll-now: %v", err)
-	}
+	// POST /admin/nodes/poll-now must accept the same host.
+	pollResp := doAdminRequest(t, http.MethodPost, srv.URL+"/admin/nodes/poll-now", "application/json", bytes.NewBufferString(body))
 	defer pollResp.Body.Close()
 	pollBody, _ := io.ReadAll(pollResp.Body)
 	if pollResp.StatusCode != http.StatusOK {
-		t.Fatalf("POST /nodes/poll-now status = %d, want %d (body: %s)", pollResp.StatusCode, http.StatusOK, pollBody)
+		t.Fatalf("POST /admin/nodes/poll-now status = %d, want %d (body: %s)", pollResp.StatusCode, http.StatusOK, pollBody)
 	}
 	if strings.Contains(string(pollBody), "private/reserved IP addresses are not allowed") {
-		t.Errorf("POST /nodes/poll-now body unexpectedly contains SSRF rejection message: %s", pollBody)
+		t.Errorf("POST /admin/nodes/poll-now body unexpectedly contains SSRF rejection message: %s", pollBody)
 	}
 }
 
-// TestPollNowAcceptsPrivateIPv4 asserts POST /nodes/poll-now accepts a
-// plain RFC1918 private IPv4 host (192.168.1.1, distinct from the
-// loopback case covered by TestPollNowSkipsSSRFValidation above) and
-// probes it (200), preserving the endpoint's deliberate SSRF exemption
-// for admins who need to force-poll internal addresses.
+// TestPollNowAcceptsPrivateIPv4 asserts POST /admin/nodes/poll-now
+// accepts a plain RFC1918 private IPv4 host (192.168.1.1, distinct from
+// the loopback case covered by TestPollNowSkipsSSRFValidation above)
+// and probes it (200), preserving the endpoint's deliberate SSRF
+// exemption for admins who need to force-poll internal addresses.
 func TestPollNowAcceptsPrivateIPv4(t *testing.T) {
 	srv, _ := newTestServer(t, nil) // no fixture for this address -> GetInfo fails -> unreachable, still 200
 
 	body := `{"host":"192.168.1.1","port":18142}`
-	resp, err := http.Post(srv.URL+"/nodes/poll-now", "application/json", bytes.NewBufferString(body))
-	if err != nil {
-		t.Fatalf("POST /nodes/poll-now: %v", err)
-	}
+	resp := doAdminRequest(t, http.MethodPost, srv.URL+"/admin/nodes/poll-now", "application/json", bytes.NewBufferString(body))
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
@@ -1379,10 +1388,7 @@ func TestPollNowInvalid(t *testing.T) {
 				t.Fatalf("list nodes before: %v", err)
 			}
 
-			resp, err := http.Post(srv.URL+"/nodes/poll-now", "application/json", bytes.NewBufferString(tc.body))
-			if err != nil {
-				t.Fatalf("POST /nodes/poll-now: %v", err)
-			}
+			resp := doAdminRequest(t, http.MethodPost, srv.URL+"/admin/nodes/poll-now", "application/json", bytes.NewBufferString(tc.body))
 			defer resp.Body.Close()
 			respBody, _ := io.ReadAll(resp.Body)
 			if resp.StatusCode != http.StatusBadRequest {
@@ -1855,4 +1861,255 @@ func TestTopologyInvalidMaxEdges(t *testing.T) {
 			t.Errorf("max_edges=%s: status = %d, want %d", v, resp.StatusCode, http.StatusBadRequest)
 		}
 	}
+}
+
+// doRequestWithAuth issues method to url (with an optional body),
+// setting an Authorization: Basic header for user/pass via
+// req.SetBasicAuth — used below to exercise the WRONG-credentials case
+// against /admin/* routes (doAdminRequest above always uses the correct
+// testAdminUser/testAdminPassword).
+func doRequestWithAuth(t *testing.T, method, url, contentType, user, pass string, body io.Reader) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		t.Fatalf("build %s %s request: %v", method, url, err)
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	req.SetBasicAuth(user, pass)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, url, err)
+	}
+	return resp
+}
+
+// assertRequires401 asserts that method/url (with an optional body
+// factory, called fresh for each of the two sub-cases since an
+// io.Reader can only be consumed once) 401s with a WWW-Authenticate
+// header containing "Basic" both with no Authorization header at all
+// and with a wrong username/password pair.
+func assertRequires401(t *testing.T, method, url, contentType string, bodyFn func() io.Reader) {
+	t.Helper()
+
+	// No Authorization header at all.
+	req, err := http.NewRequest(method, url, bodyFn())
+	if err != nil {
+		t.Fatalf("build %s %s request: %v", method, url, err)
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s (no auth): %v", method, url, err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("no-auth %s %s status = %d, want %d", method, url, resp.StatusCode, http.StatusUnauthorized)
+	}
+	if wa := resp.Header.Get("WWW-Authenticate"); !strings.Contains(wa, "Basic") {
+		t.Errorf("no-auth %s %s WWW-Authenticate = %q, want it to contain %q", method, url, wa, "Basic")
+	}
+
+	// Wrong username/password.
+	resp2 := doRequestWithAuth(t, method, url, contentType, "wrong-user", "wrong-password", bodyFn())
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusUnauthorized {
+		t.Errorf("wrong-auth %s %s status = %d, want %d", method, url, resp2.StatusCode, http.StatusUnauthorized)
+	}
+	if wa := resp2.Header.Get("WWW-Authenticate"); !strings.Contains(wa, "Basic") {
+		t.Errorf("wrong-auth %s %s WWW-Authenticate = %q, want it to contain %q", method, url, wa, "Basic")
+	}
+}
+
+// TestAdminSubmissionsRequiresAuth asserts GET /admin/submissions 401s
+// (with a WWW-Authenticate header) with no auth and with wrong auth, and
+// succeeds (200) with the correct configured credentials.
+func TestAdminSubmissionsRequiresAuth(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
+
+	if _, err := store.CreatePendingSubmission(ctx, "a:1", nil, nil); err != nil {
+		t.Fatalf("create pending submission: %v", err)
+	}
+
+	url := srv.URL + "/admin/submissions"
+	assertRequires401(t, http.MethodGet, url, "", func() io.Reader { return nil })
+
+	resp := doAdminRequest(t, http.MethodGet, url, "", nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("correct-auth GET /admin/submissions status = %d, want %d (body: %s)", resp.StatusCode, http.StatusOK, body)
+	}
+}
+
+// TestAdminApproveSubmissionRequiresAuth asserts
+// POST /admin/submissions/{id}/approve 401s with no auth and with wrong
+// auth, and succeeds (200) with the correct configured credentials.
+func TestAdminApproveSubmissionRequiresAuth(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
+
+	submission, err := store.CreatePendingSubmission(ctx, "203.0.113.30:18142", nil, nil)
+	if err != nil {
+		t.Fatalf("create pending submission: %v", err)
+	}
+
+	url := fmt.Sprintf("%s/admin/submissions/%s/approve", srv.URL, submission.ID)
+	assertRequires401(t, http.MethodPost, url, "application/json", func() io.Reader { return nil })
+
+	resp := doAdminRequest(t, http.MethodPost, url, "application/json", nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("correct-auth POST /admin/submissions/{id}/approve status = %d, want %d (body: %s)", resp.StatusCode, http.StatusOK, body)
+	}
+}
+
+// TestAdminRejectSubmissionRequiresAuth asserts
+// POST /admin/submissions/{id}/reject 401s with no auth and with wrong
+// auth, and succeeds (200) with the correct configured credentials.
+func TestAdminRejectSubmissionRequiresAuth(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
+
+	submission, err := store.CreatePendingSubmission(ctx, "a:1", nil, nil)
+	if err != nil {
+		t.Fatalf("create pending submission: %v", err)
+	}
+
+	url := fmt.Sprintf("%s/admin/submissions/%s/reject", srv.URL, submission.ID)
+	assertRequires401(t, http.MethodPost, url, "application/json", func() io.Reader { return nil })
+
+	resp := doAdminRequest(t, http.MethodPost, url, "application/json", nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("correct-auth POST /admin/submissions/{id}/reject status = %d, want %d (body: %s)", resp.StatusCode, http.StatusOK, body)
+	}
+}
+
+// TestAdminPollNowRequiresAuth asserts POST /admin/nodes/poll-now 401s
+// with no auth and with wrong auth, and succeeds (200) with the correct
+// configured credentials.
+func TestAdminPollNowRequiresAuth(t *testing.T) {
+	srv, _ := newTestServer(t, nil)
+
+	url := srv.URL + "/admin/nodes/poll-now"
+	body := `{"host":"203.0.113.31","port":18142}`
+	assertRequires401(t, http.MethodPost, url, "application/json", func() io.Reader { return bytes.NewBufferString(body) })
+
+	resp := doAdminRequest(t, http.MethodPost, url, "application/json", bytes.NewBufferString(body))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("correct-auth POST /admin/nodes/poll-now status = %d, want %d (body: %s)", resp.StatusCode, http.StatusOK, respBody)
+	}
+}
+
+// TestAdminRoutesDisabledWhenCredsNotConfigured asserts that when
+// api.NewRouter is built with an unconfigured (zero-value)
+// adminauth.Credentials — simulating NETMAP_ADMIN_USER/
+// NETMAP_ADMIN_PASSWORD being unset — every /admin/* route returns 503
+// for every request, even one supplying a plausible-looking guessed
+// Basic Auth header, and specifically NOT 401/200/404. This must hold
+// regardless of whether the underlying resource (a submission id) even
+// exists, since the fail-closed handler must never reach the real
+// route logic at all.
+func TestAdminRoutesDisabledWhenCredsNotConfigured(t *testing.T) {
+	srv, _ := newTestServerWithCreds(t, nil, adminauth.Credentials{})
+
+	fakeID := uuid.New()
+	routes := []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/admin/submissions"},
+		{http.MethodPost, fmt.Sprintf("/admin/submissions/%s/approve", fakeID)},
+		{http.MethodPost, fmt.Sprintf("/admin/submissions/%s/reject", fakeID)},
+		{http.MethodPost, "/admin/nodes/poll-now"},
+	}
+
+	for _, rt := range routes {
+		url := srv.URL + rt.path
+
+		// No Authorization header.
+		req, err := http.NewRequest(rt.method, url, nil)
+		if err != nil {
+			t.Fatalf("build %s %s request: %v", rt.method, url, err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s (no auth): %v", rt.method, url, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Errorf("no-auth %s %s status = %d, want %d", rt.method, url, resp.StatusCode, http.StatusServiceUnavailable)
+		}
+
+		// A plausible guessed credential pair must not slip through
+		// either.
+		for _, creds := range [][2]string{{"admin", "admin"}, {"admin", ""}} {
+			resp := doRequestWithAuth(t, rt.method, url, "", creds[0], creds[1], nil)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusServiceUnavailable {
+				t.Errorf("guessed-auth (%q/%q) %s %s status = %d, want %d", creds[0], creds[1], rt.method, url, resp.StatusCode, http.StatusServiceUnavailable)
+			}
+			if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNotFound {
+				t.Errorf("guessed-auth (%q/%q) %s %s status = %d, must not be 401/200/404", creds[0], creds[1], rt.method, url, resp.StatusCode)
+			}
+		}
+	}
+}
+
+// TestNonAdminAPIRoutesRemainUnauthenticated is the most important
+// regression test in this dispatch: it proves the adminauth gate is
+// wired ONLY around /admin/*, not more broadly, by hitting every
+// non-admin API route with zero Authorization header (even though this
+// test's server IS built with admin credentials configured, via
+// newTestServer) and asserting each still succeeds exactly as before.
+func TestNonAdminAPIRoutesRemainUnauthenticated(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
+
+	node, err := store.UpsertDiscoveredNode(ctx, "1.2.3.4:18142", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert node: %v", err)
+	}
+
+	assertStatus := func(label string, wantStatus int, resp *http.Response, err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("%s: %v", label, err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != wantStatus {
+			body, _ := io.ReadAll(resp.Body)
+			t.Errorf("no-auth %s status = %d, want %d (body: %s)", label, resp.StatusCode, wantStatus, body)
+		}
+	}
+
+	resp, err := http.Get(srv.URL + "/healthz")
+	assertStatus("GET /healthz", http.StatusOK, resp, err)
+	resp, err = http.Get(srv.URL + "/nodes")
+	assertStatus("GET /nodes", http.StatusOK, resp, err)
+	resp, err = http.Get(srv.URL + "/nodes/" + node.ID.String())
+	assertStatus("GET /nodes/{id}", http.StatusOK, resp, err)
+	resp, err = http.Get(srv.URL + "/nodes/" + node.ID.String() + "/history")
+	assertStatus("GET /nodes/{id}/history", http.StatusOK, resp, err)
+	resp, err = http.Get(srv.URL + "/topology")
+	assertStatus("GET /topology", http.StatusOK, resp, err)
+	resp, err = http.Get(srv.URL + "/topology/top-peered")
+	assertStatus("GET /topology/top-peered", http.StatusOK, resp, err)
+
+	// POST /nodes: public node registration, exercised as a full
+	// request with a real body (same shape as TestCreateNodeValid).
+	// Its normal, pre-existing success status is 202 Accepted (queued
+	// for review), not 200 — see handleCreateNode.
+	createBody := `{"host":"198.51.100.99","port":18142,"label":"regression check","owner_tag":"pool-y"}`
+	resp, err = http.Post(srv.URL+"/nodes", "application/json", bytes.NewBufferString(createBody))
+	assertStatus("POST /nodes", http.StatusAccepted, resp, err)
 }

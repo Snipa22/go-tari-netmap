@@ -1,6 +1,8 @@
 // Package web serves the go-tari-netmap dashboard: a server-rendered htmx +
 // Go html/template UI. No separate JS framework, no frontend build step.
-// Public, no auth gate by design.
+// Public, no auth gate by design — except the /admin/* sub-area (the
+// submission review page), which is HTTP Basic Auth-gated via
+// internal/adminauth; see NewHandler.
 package web
 
 import (
@@ -15,6 +17,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/Snipa22/go-tari-netmap/internal/adminauth"
 	"github.com/Snipa22/go-tari-netmap/internal/api"
 	"github.com/Snipa22/go-tari-netmap/internal/storage"
 )
@@ -234,8 +237,11 @@ func formatDuration(d time.Duration) string {
 // NewHandler returns an http.Handler serving the dashboard: a homepage
 // summary + node table (with a registry-submission form posted via htmx
 // directly to the /api/nodes JSON API), a per-node detail/history page,
-// and the static CSS stylesheet backing both.
-func NewHandler(store storage.Store) (http.Handler, error) {
+// the static CSS stylesheet backing both, and the HTTP Basic Auth-gated
+// /admin/submissions review page. adminCreds configures that gate — see
+// internal/adminauth.Wrap's doc comment for the fail-closed-503 behavior
+// when adminCreds isn't fully configured.
+func NewHandler(store storage.Store, adminCreds adminauth.Credentials) (http.Handler, error) {
 	// derefBool is registered as a template func because Go's
 	// text/template `{{if}}` truth test on a pointer only checks
 	// non-nil-ness, not the pointed-to value — a *bool pointing at
@@ -253,8 +259,18 @@ func NewHandler(store storage.Store) (http.Handler, error) {
 	mux.HandleFunc("GET /{$}", handleDashboard(tmpl, store))
 	mux.HandleFunc("GET /nodes/{id}", handleNodeDetail(tmpl, store))
 	mux.HandleFunc("GET /topology", handleTopologyGraph(tmpl))
-	mux.HandleFunc("GET /submissions", handleSubmissions(tmpl, store))
 	mux.HandleFunc("GET /static/style.css", handleStaticCSS)
+
+	// The submission review page moved under /admin/* (see this
+	// package's and internal/api's NewRouter doc comments) — it's the
+	// only web-layer admin route today, but registered on its own
+	// sub-mux (rather than directly on the top-level mux) so the
+	// adminauth.Wrap gate below covers the whole /admin/ prefix
+	// uniformly, matching internal/api.NewRouter's structure.
+	adminMux := http.NewServeMux()
+	adminMux.HandleFunc("GET /admin/submissions", handleSubmissions(tmpl, store))
+	mux.Handle("/admin/", adminauth.Wrap(adminCreds, adminMux))
+
 	return mux, nil
 }
 
@@ -444,10 +460,12 @@ type submissionsData struct {
 // handleSubmissions serves the human-facing submission review page: a
 // server-rendered (Go html/template, not client-side JS) table of pending
 // submissions, with Approve/Reject buttons that post directly to the JSON
-// /api/submissions/{id}/approve and /reject endpoints via htmx. This is a
-// distinct route from the JSON GET /api/submissions endpoint registered
-// in internal/api — same path, different mux, following this package's
-// established web-vs-JSON-API split (see NewHandler's doc comment).
+// /api/admin/submissions/{id}/approve and /reject endpoints via htmx.
+// This is a distinct route from the JSON GET /api/admin/submissions
+// endpoint registered in internal/api — same path (under /admin),
+// different mux, following this package's established web-vs-JSON-API
+// split (see NewHandler's doc comment). Both this page and the JSON
+// endpoints it posts to sit behind the same adminauth.Wrap gate.
 func handleSubmissions(tmpl *template.Template, store storage.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		submissions, err := store.ListPendingSubmissions(r.Context(), "pending")
