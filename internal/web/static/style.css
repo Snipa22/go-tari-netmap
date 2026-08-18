@@ -29,6 +29,12 @@
   --badge-registry-fg: #4bd18a;
   --badge-dualstack-bg: rgba(240, 154, 55, 0.18);
   --badge-dualstack-fg: #f09a37;
+  --badge-likely-dead-bg: rgba(230, 80, 80, 0.16);
+  --badge-likely-dead-fg: #e65050;
+  --badge-reachable-bg: rgba(75, 209, 138, 0.16);
+  --badge-reachable-fg: #4bd18a;
+  --badge-unreachable-bg: rgba(230, 80, 80, 0.16);
+  --badge-unreachable-fg: #e65050;
 }
 
 * {
@@ -318,6 +324,21 @@ tbody tr:hover {
 .badge-dualstack {
   background: var(--badge-dualstack-bg);
   color: var(--badge-dualstack-fg);
+}
+
+.badge-likely-dead {
+  background: var(--badge-likely-dead-bg);
+  color: var(--badge-likely-dead-fg);
+}
+
+.badge-reachable {
+  background: var(--badge-reachable-bg);
+  color: var(--badge-reachable-fg);
+}
+
+.badge-unreachable {
+  background: var(--badge-unreachable-bg);
+  color: var(--badge-unreachable-fg);
 }
 
 /* Identity + capability display helpers */

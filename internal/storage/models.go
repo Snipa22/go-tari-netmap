@@ -90,6 +90,17 @@ type NodeFilter struct {
 	// OFFSET). Zero means no offset. Offset is meaningful even with
 	// Limit == 0 (skip N, return the rest).
 	Offset int
+
+	// ReachableSince, if non-nil, restricts results to nodes with at
+	// least one node_health row where reachable = true AND
+	// ts >= *ReachableSince. A nil ReachableSince (the zero value)
+	// means "no filtering" — this is a critical invariant: a
+	// zero-value NodeFilter{} must remain completely unaffected by
+	// this field's mere existence, since internal callers (e.g. the
+	// collector's Poll loop, which calls ListNodes with a bare
+	// storage.NodeFilter{}) rely on seeing every node, unconditionally,
+	// forever.
+	ReachableSince *time.Time
 }
 
 // TopologyFilter filters/caps the result of ListTopology. A zero-value

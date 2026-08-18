@@ -177,8 +177,16 @@ func TestDashboardHidesP2PAddress(t *testing.T) {
 	ctx := context.Background()
 
 	const p2pAddr = "1.2.3.4:18142"
-	if _, err := store.UpsertDiscoveredNode(ctx, p2pAddr, storage.DiscoverySourceP2P, nil, nil); err != nil {
+	n, err := store.UpsertDiscoveredNode(ctx, p2pAddr, storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
 		t.Fatalf("upsert p2p node: %v", err)
+	}
+	// The dashboard's main Nodes table only shows nodes reachable
+	// within dashboardReachableWindow (see web.go); record a recent
+	// reachable health check so this node still shows up in that table
+	// for the "unconfirmed" badge assertion below.
+	if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{NodeID: n.ID, Reachable: true, ProbeSource: storage.ProbeSourceP2P}); err != nil {
+		t.Fatalf("record health check: %v", err)
 	}
 
 	srv := newTestServer(t, store)
@@ -320,6 +328,187 @@ func TestDashboardTopPeeredOnionClearnetCounts(t *testing.T) {
 	}
 }
 
+// TestDashboardReachableWithinWindowFilter exercises the dashboard's
+// main Nodes table reachability filter end to end:
+//
+//   - fresh: a node with a recent (well within dashboardReachableWindow)
+//     reachable=true health check, a version string, and a Height —
+//     must appear in the main table, with its timestamp, a "reachable"
+//     badge, and its version rendered.
+//   - stale: a node whose ONLY health check is reachable=true but older
+//     than dashboardReachableWindow — must be EXCLUDED from the main
+//     table, even though it's genuinely been seen before.
+//   - unreachable: a node with a recent health check that is
+//     reachable=false — must be EXCLUDED from the main table (the
+//     filter requires reachable=true, not just "probed recently"), and
+//     its row would show an "unreachable" badge if it were ever shown
+//     elsewhere.
+//   - never probed: a node with zero health check history — must be
+//     EXCLUDED from the main table, and never contributes a raw Go
+//     zero-value ("<nil>", "0001-01-01...", etc.) anywhere.
+//
+// Despite three of the four nodes being excluded from the table, the
+// "Total nodes" summary card must still count all four — the whole
+// point of keeping Counts.Total driven by the unfiltered allNodes query.
+func TestDashboardReachableWithinWindowFilter(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	fresh, err := store.UpsertDiscoveredNode(ctx, "fresh:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert fresh: %v", err)
+	}
+	version := "tari/1.2.3"
+	height := int64(4242)
+	if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{
+		NodeID: fresh.ID, Reachable: true, ProbeSource: storage.ProbeSourceGRPC,
+		Version: &version, Height: &height,
+	}); err != nil {
+		t.Fatalf("record health check for fresh: %v", err)
+	}
+
+	stale, err := store.UpsertDiscoveredNode(ctx, "stale:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert stale: %v", err)
+	}
+	// storage.Store's RecordHealthCheck always stamps ts = now(), so a
+	// row older than dashboardReachableWindow (24h) must be inserted
+	// directly via a raw connection to the same test database (same
+	// pattern as TestDashboardTopPeeredOnionClearnetCounts above).
+	pool, err := pgxpool.New(ctx, testDSN())
+	if err != nil {
+		t.Fatalf("connect to test db: %v", err)
+	}
+	defer pool.Close()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO node_health (node_id, ts, reachable, probe_source)
+		VALUES ($1, now() - interval '48 hours', true, 'grpc')
+	`, stale.ID); err != nil {
+		t.Fatalf("insert stale reachable health check: %v", err)
+	}
+
+	unreachable, err := store.UpsertDiscoveredNode(ctx, "unreachable:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert unreachable: %v", err)
+	}
+	if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{NodeID: unreachable.ID, Reachable: false, ProbeSource: storage.ProbeSourceGRPC}); err != nil {
+		t.Fatalf("record health check for unreachable: %v", err)
+	}
+
+	neverProbed, err := store.UpsertDiscoveredNode(ctx, "never-probed:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert never-probed: %v", err)
+	}
+
+	srv := newTestServer(t, store)
+	status, body := getBody(t, srv.URL+"/")
+	if status != http.StatusOK {
+		t.Fatalf("GET / status = %d, want %d", status, http.StatusOK)
+	}
+
+	// Summary count: all 4 nodes, regardless of reachability filtering.
+	if !strings.Contains(body, `<div class="card-value">4</div>`) {
+		t.Errorf("GET / body's Total nodes card doesn't show the whole population (4):\n%s", body)
+	}
+
+	// All four nodes are p2p_discovered (never opted in), so their raw
+	// addresses are privacy-scrubbed regardless of the reachability
+	// filter — presence/absence in the main table is instead checked
+	// via each node's /nodes/{id} link, which is never scrubbed.
+	freshLink := fmt.Sprintf(`href="/nodes/%s"`, fresh.ID)
+	staleLink := fmt.Sprintf(`href="/nodes/%s"`, stale.ID)
+	unreachableLink := fmt.Sprintf(`href="/nodes/%s"`, unreachable.ID)
+	neverProbedLink := fmt.Sprintf(`href="/nodes/%s"`, neverProbed.ID)
+
+	if !strings.Contains(body, freshLink) {
+		t.Errorf("GET / body missing the reachable-within-window node's link %q", freshLink)
+	}
+	if !strings.Contains(body, "badge-reachable") {
+		t.Errorf("GET / body missing a badge-reachable for the fresh node")
+	}
+	if !strings.Contains(body, version) {
+		t.Errorf("GET / body missing the fresh node's version %q", version)
+	}
+
+	if strings.Contains(body, staleLink) {
+		t.Errorf("GET / body contains the stale (reachable, but outside the window) node's link %q, want excluded", staleLink)
+	}
+	if strings.Contains(body, unreachableLink) {
+		t.Errorf("GET / body contains the unreachable node's link %q, want excluded", unreachableLink)
+	}
+	if strings.Contains(body, neverProbedLink) {
+		t.Errorf("GET / body contains the never-probed node's link %q, want excluded", neverProbedLink)
+	}
+}
+
+// TestNodeDetailLikelyDeadBadge exercises the "likely dead" heuristic
+// (3+ history entries, zero of them Reachable == true) against three
+// cases:
+//
+//   - deadNode: 3 history entries, all Reachable: false -> LikelyDead
+//     true, badge-likely-dead rendered.
+//   - flakyNode: 3 history entries, one of them Reachable: true ->
+//     LikelyDead false (a single success rules it out), no badge.
+//   - fewProbesNode: only 2 history entries, both Reachable: false ->
+//     LikelyDead false (not enough probes to conclude anything), no
+//     badge — proves the >= 3 threshold is enforced, not just "any
+//     unreachable".
+func TestNodeDetailLikelyDeadBadge(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	deadNode, err := store.UpsertDiscoveredNode(ctx, "dead:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert deadNode: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{NodeID: deadNode.ID, Reachable: false, ProbeSource: storage.ProbeSourceGRPC}); err != nil {
+			t.Fatalf("record health check %d for deadNode: %v", i, err)
+		}
+	}
+
+	flakyNode, err := store.UpsertDiscoveredNode(ctx, "flaky:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert flakyNode: %v", err)
+	}
+	if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{NodeID: flakyNode.ID, Reachable: false, ProbeSource: storage.ProbeSourceGRPC}); err != nil {
+		t.Fatalf("record health check 1 for flakyNode: %v", err)
+	}
+	if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{NodeID: flakyNode.ID, Reachable: true, ProbeSource: storage.ProbeSourceGRPC}); err != nil {
+		t.Fatalf("record health check 2 for flakyNode: %v", err)
+	}
+	if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{NodeID: flakyNode.ID, Reachable: false, ProbeSource: storage.ProbeSourceGRPC}); err != nil {
+		t.Fatalf("record health check 3 for flakyNode: %v", err)
+	}
+
+	fewProbesNode, err := store.UpsertDiscoveredNode(ctx, "fewprobes:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert fewProbesNode: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{NodeID: fewProbesNode.ID, Reachable: false, ProbeSource: storage.ProbeSourceGRPC}); err != nil {
+			t.Fatalf("record health check %d for fewProbesNode: %v", i, err)
+		}
+	}
+
+	srv := newTestServer(t, store)
+
+	_, deadBody := getBody(t, srv.URL+"/nodes/"+deadNode.ID.String())
+	if !strings.Contains(deadBody, "badge-likely-dead") {
+		t.Errorf("GET /nodes/%s body missing badge-likely-dead for a node with 3+ probes, zero successes", deadNode.ID)
+	}
+
+	_, flakyBody := getBody(t, srv.URL+"/nodes/"+flakyNode.ID.String())
+	if strings.Contains(flakyBody, "badge-likely-dead") {
+		t.Errorf("GET /nodes/%s body contains badge-likely-dead for a node with at least one successful probe", flakyNode.ID)
+	}
+
+	_, fewProbesBody := getBody(t, srv.URL+"/nodes/"+fewProbesNode.ID.String())
+	if strings.Contains(fewProbesBody, "badge-likely-dead") {
+		t.Errorf("GET /nodes/%s body contains badge-likely-dead for a node with fewer than 3 probes", fewProbesNode.ID)
+	}
+}
+
 // TestNodeDetailHidesP2PAddress asserts GET /nodes/{id} returns 200 and
 // never includes the node's own raw address when it was only
 // p2p_discovered, but does show a registry_submitted node's opted-in
@@ -382,6 +571,13 @@ func TestDualStackBadgeShownForOptedInNodeWithBothTransports(t *testing.T) {
 	}
 	if _, err := store.UpsertConfirmedNode(ctx, onionAddr, pubkey, storage.DiscoverySourceRegistry); err != nil {
 		t.Fatalf("upsert confirmed onion: %v", err)
+	}
+	// The dashboard's main Nodes table only shows nodes reachable
+	// within dashboardReachableWindow (see web.go); record a recent
+	// reachable health check so this node still shows up there for the
+	// badge-dualstack assertion below.
+	if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{NodeID: node.ID, Reachable: true, ProbeSource: storage.ProbeSourceGRPC}); err != nil {
+		t.Fatalf("record health check: %v", err)
 	}
 
 	srv := newTestServer(t, store)
@@ -450,6 +646,13 @@ func TestOptedInNodeWithMultipleAddressesShowsAllAddresses(t *testing.T) {
 	}
 	if _, err := store.UpsertConfirmedNode(ctx, onionAddr, pubkey, storage.DiscoverySourceBoth); err != nil {
 		t.Fatalf("upsert confirmed onion: %v", err)
+	}
+	// The dashboard's main Nodes table only shows nodes reachable
+	// within dashboardReachableWindow (see web.go); record a recent
+	// reachable health check so this node still shows up there for the
+	// address assertions below.
+	if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{NodeID: node.ID, Reachable: true, ProbeSource: storage.ProbeSourceGRPC}); err != nil {
+		t.Fatalf("record health check: %v", err)
 	}
 
 	srv := newTestServer(t, store)
@@ -720,10 +923,19 @@ func TestDashboardNodePagination(t *testing.T) {
 
 	// Seed 5 nodes with addresses that sort n1..n5 (ListNodes orders by
 	// address), and a small page size via ?limit= so 2 pages of 3 (3+2)
-	// exercise the boundary without needing 50+ real nodes.
+	// exercise the boundary without needing 50+ real nodes. Each also
+	// gets a recent reachable=true health check so all 5 remain visible
+	// in the dashboard's main Nodes table under the new
+	// dashboardReachableWindow filter (see web.go) — this test is about
+	// pagination, not the reachability filter, so all nodes are kept
+	// "reachable" to isolate that.
 	for _, addr := range []string{"n1:1", "n2:1", "n3:1", "n4:1", "n5:1"} {
-		if _, err := store.UpsertDiscoveredNode(ctx, addr, storage.DiscoverySourceP2P, nil, nil); err != nil {
+		n, err := store.UpsertDiscoveredNode(ctx, addr, storage.DiscoverySourceP2P, nil, nil)
+		if err != nil {
 			t.Fatalf("upsert %s: %v", addr, err)
+		}
+		if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{NodeID: n.ID, Reachable: true, ProbeSource: storage.ProbeSourceP2P}); err != nil {
+			t.Fatalf("record health check for %s: %v", addr, err)
 		}
 	}
 

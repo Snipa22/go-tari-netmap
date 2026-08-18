@@ -88,8 +88,12 @@ type Store interface {
 	// (e.g. the collector's Poll/Discover loops) depend on and must keep
 	// getting forever. filter.Limit/filter.Offset, when set (Limit > 0
 	// and/or Offset > 0), apply real SQL LIMIT/OFFSET pagination on top
-	// of any DiscoverySource filtering; this is strictly opt-in — a zero
-	// Limit never truncates the result set.
+	// of any DiscoverySource/ReachableSince filtering; this is strictly
+	// opt-in — a zero Limit never truncates the result set.
+	// filter.ReachableSince, when non-nil, further restricts results to
+	// nodes with at least one reachable=true node_health row at or
+	// after that time (see NodeFilter's doc comment) — also strictly
+	// opt-in, a nil ReachableSince never filters anything out.
 	ListNodes(ctx context.Context, filter NodeFilter) ([]Node, error)
 
 	// CountNodes returns the total number of nodes matching filter's
@@ -725,6 +729,16 @@ func (s *pgStore) ListNodes(ctx context.Context, filter NodeFilter) ([]Node, err
 	if filter.DiscoverySource != "" {
 		args = append(args, string(filter.DiscoverySource))
 		query += fmt.Sprintf(" WHERE discovery_source = $%d", len(args))
+	}
+
+	if filter.ReachableSince != nil {
+		args = append(args, *filter.ReachableSince)
+		clause := fmt.Sprintf("EXISTS (SELECT 1 FROM node_health nh WHERE nh.node_id = nodes.id AND nh.reachable AND nh.ts >= $%d)", len(args))
+		if filter.DiscoverySource != "" {
+			query += " AND " + clause
+		} else {
+			query += " WHERE " + clause
+		}
 	}
 
 	query += " ORDER BY address"
