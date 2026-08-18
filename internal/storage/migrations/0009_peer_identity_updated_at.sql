@@ -1,0 +1,25 @@
+-- 0009_peer_identity_updated_at.sql
+--
+-- Adds a peer_identity_updated_at column to node_health, capturing the
+-- peer's own self-reported identity-signature timestamp: when the peer
+-- itself last (re-)signed its P2P identity claim (e.g. on restart or
+-- address change), per go-tari-lib/p2p's PeerInfo.IdentitySignature.
+-- UpdatedAt (see internal/collector/p2p_client.go's GetInfo).
+--
+-- This is NOT a record of when we (or anyone else) last successfully
+-- contacted this peer — that's what the existing node_health.ts column
+-- (the row's own timestamp) already records. peer_identity_updated_at is
+-- purely a claim the peer makes about itself, captured at zero extra
+-- network cost since it's already present in the same probeIdentity
+-- response already being parsed for PublicKey/Version.
+--
+-- Nullable: stays NULL for every existing row (this data didn't exist
+-- before), and for any future row where probeIdentity failed or the peer
+-- sent no IdentitySignature at all (see PeerInfo.IdentitySignature's doc
+-- comment in go-tari-lib: "nil if the peer didn't send one").
+--
+-- This migration must always succeed for the binary to start, same as
+-- 0001/0003/0004/0005/0006 (no "_optional" marker) — see
+-- internal/storage/migrate.go for how that distinction is enforced.
+
+ALTER TABLE node_health ADD COLUMN IF NOT EXISTS peer_identity_updated_at timestamptz NULL;
