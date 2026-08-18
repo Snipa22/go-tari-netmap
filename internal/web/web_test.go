@@ -203,6 +203,41 @@ func TestNodeDetailNotFound(t *testing.T) {
 	}
 }
 
+// TestTopologyGraphPage asserts GET /topology returns 200, renders the
+// vis-network CDN script tag and the graph container, and never embeds a
+// p2p_discovered node's raw address into the page — the page fetches
+// node/edge data client-side from the already-scrubbed GET /api/topology
+// endpoint rather than the handler passing raw Go data into the template,
+// but this test still guards against a future regression that starts
+// passing node data server-side.
+func TestTopologyGraphPage(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	const p2pAddr = "1.2.3.4:18142"
+	if _, err := store.UpsertDiscoveredNode(ctx, p2pAddr, storage.DiscoverySourceP2P, nil, nil); err != nil {
+		t.Fatalf("upsert p2p node: %v", err)
+	}
+
+	srv := newTestServer(t, store)
+	status, body := getBody(t, srv.URL+"/topology")
+	if status != http.StatusOK {
+		t.Fatalf("GET /topology status = %d, want %d", status, http.StatusOK)
+	}
+	if !strings.Contains(body, "vis-network") {
+		t.Errorf("GET /topology body missing vis-network script tag")
+	}
+	if !strings.Contains(body, `id="graph"`) {
+		t.Errorf("GET /topology body missing graph container element")
+	}
+	if !strings.Contains(body, "/api/topology") {
+		t.Errorf("GET /topology body missing client-side fetch of /api/topology")
+	}
+	if strings.Contains(body, p2pAddr) {
+		t.Errorf("GET /topology body contains p2p node's raw address %q", p2pAddr)
+	}
+}
+
 // TestStaticStylesheetServed asserts the CSS route is wired up and
 // returns a text/css response.
 func TestStaticStylesheetServed(t *testing.T) {
