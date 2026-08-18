@@ -1656,6 +1656,98 @@ func TestTopologyDefaultCap(t *testing.T) {
 	}
 }
 
+// TestTopPeeredNodesOnionClearnetCounts asserts GET /topology/top-peered's
+// response includes correct onion_peer_count/clearnet_peer_count fields
+// for a hub node whose distinct peers are a mix of onion-only,
+// clearnet-only, and dual-stack (both an onion AND a clearnet address
+// known) — mirroring
+// storage.TestTopPeeredNodesOnionClearnetBreakdown's setup, but asserted
+// through the public JSON API response instead of storage.NodeDegree
+// directly.
+func TestTopPeeredNodesOnionClearnetCounts(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
+
+	const onionAddr = "abcdefghijklmnopqrstuvwxyz234567.onion:18142"
+	const clearnetAddr = "203.0.113.5:18142"
+	const dualStackPrimaryAddr = "203.0.113.9:18142"
+	const dualStackOnionAddr = "qrstuvwxyzabcdefghijklmnop234567.onion:18142"
+
+	hub, err := store.UpsertDiscoveredNode(ctx, "hub-api:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert hub: %v", err)
+	}
+	onionOnlyPeer, err := store.UpsertDiscoveredNode(ctx, onionAddr, storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert onion-only peer: %v", err)
+	}
+	clearnetOnlyPeer, err := store.UpsertDiscoveredNode(ctx, clearnetAddr, storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert clearnet-only peer: %v", err)
+	}
+	dualStackPeer, err := store.UpsertDiscoveredNode(ctx, dualStackPrimaryAddr, storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert dual-stack peer: %v", err)
+	}
+
+	// storage.Store doesn't expose the raw pool, so add the dual-stack
+	// peer's second address via a direct connection to the same test
+	// database instead (same DSN newTestServer's store was built with).
+	pool, err := pgxpool.New(ctx, testDSN())
+	if err != nil {
+		t.Fatalf("connect to test db: %v", err)
+	}
+	defer pool.Close()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO node_addresses (node_id, address, first_seen, last_seen)
+		VALUES ($1, $2, now(), now())
+	`, dualStackPeer.ID, dualStackOnionAddr); err != nil {
+		t.Fatalf("insert dual-stack peer's onion address: %v", err)
+	}
+
+	for _, e := range []struct{ from, to uuid.UUID }{
+		{hub.ID, onionOnlyPeer.ID},
+		{hub.ID, clearnetOnlyPeer.ID},
+		{hub.ID, dualStackPeer.ID},
+	} {
+		if err := store.RecordPeerEdgeObservation(ctx, e.from, e.to); err != nil {
+			t.Fatalf("record edge observation %v -> %v: %v", e.from, e.to, err)
+		}
+	}
+
+	resp, err := http.Get(srv.URL + "/topology/top-peered")
+	if err != nil {
+		t.Fatalf("GET /topology/top-peered: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	var got []api.PublicNodeDegree
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	var hubRow *api.PublicNodeDegree
+	for i := range got {
+		if got[i].NodeID == hub.ID {
+			hubRow = &got[i]
+			break
+		}
+	}
+	if hubRow == nil {
+		t.Fatalf("hub %v not found in GET /topology/top-peered response: %+v", hub.ID, got)
+	}
+
+	if hubRow.OnionPeerCount != 2 {
+		t.Errorf("hub OnionPeerCount = %d, want 2 (onion-only peer + dual-stack peer)", hubRow.OnionPeerCount)
+	}
+	if hubRow.ClearnetPeerCount != 2 {
+		t.Errorf("hub ClearnetPeerCount = %d, want 2 (clearnet-only peer + dual-stack peer)", hubRow.ClearnetPeerCount)
+	}
+}
+
 // TestTopologyAllTrueUnbounded asserts GET /topology?all=true always
 // returns every node/edge, ignoring the default cap.
 func TestTopologyAllTrueUnbounded(t *testing.T) {
