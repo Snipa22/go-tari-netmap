@@ -669,6 +669,14 @@ type nodeEdgesResponse struct {
 // that case, and mirroring that "empty, not an error" semantics here
 // means the client-side expand logic doesn't need a special case for a
 // leaf node with no (yet-discovered) peers.
+//
+// Confirmed-neighbors-only filtering: both the returned nodes and edges
+// are restricted to neighbors with a non-empty PublicKey (the same
+// "confirmed" convention as PublicNode.PublicKey/ScrubNode — see
+// privacy.go). This is Alex's call: unconfirmed peers are noise (only
+// ~3% of the ~3100+ real nodes in the network are confirmed) and an
+// unconfirmed node has no pubkey identity worth showing anyway, so
+// there's nothing useful to reveal by expanding into one.
 func handleGetNodeEdges(store storage.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id, err := uuid.Parse(r.PathValue("id"))
@@ -722,6 +730,7 @@ func handleGetNodeEdges(store storage.Store) http.HandlerFunc {
 		}
 
 		nodes := make([]PublicNode, 0, len(neighborIDs))
+		confirmedNeighbors := make(map[uuid.UUID]struct{}, len(neighborIDs))
 		for _, nid := range neighborIDs {
 			n, err := store.GetNode(r.Context(), nid)
 			if err != nil {
@@ -734,13 +743,37 @@ func handleGetNodeEdges(store storage.Store) http.HandlerFunc {
 				writeError(w, http.StatusInternalServerError, err)
 				return
 			}
+			// Confirmed-only: skip neighbors with no PublicKey (see
+			// this handler's doc comment). Unconfirmed neighbors are
+			// filtered here rather than downstream so their edges
+			// below can be excluded too via confirmedNeighbors.
+			if len(n.PublicKey) == 0 {
+				continue
+			}
+			confirmedNeighbors[nid] = struct{}{}
 			nodes = append(nodes, ScrubNode(n, addrsByNode[nid]))
+		}
+
+		// Drop any edge whose other endpoint (not the requested node
+		// itself) isn't in confirmedNeighbors — i.e. edges to a
+		// neighbor that got filtered out above as unconfirmed. Without
+		// this, the response would contain dangling edges pointing at
+		// neighbor ids that never appear in Nodes.
+		confirmedEdges := make([]storage.PeerEdge, 0, len(edges))
+		for _, e := range edges {
+			other := e.FromNodeID
+			if other == id {
+				other = e.ToNodeID
+			}
+			if _, ok := confirmedNeighbors[other]; ok {
+				confirmedEdges = append(confirmedEdges, e)
+			}
 		}
 
 		// edges carry only from_node_id/to_node_id UUIDs (see
 		// storage.PeerEdge) — no address data, so no scrubbing needed,
 		// same as handleTopology's edges.
-		writeJSON(w, http.StatusOK, nodeEdgesResponse{Nodes: nodes, Edges: edges})
+		writeJSON(w, http.StatusOK, nodeEdgesResponse{Nodes: nodes, Edges: confirmedEdges})
 	}
 }
 
