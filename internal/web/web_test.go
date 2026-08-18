@@ -226,6 +226,100 @@ func TestDashboardTopPeeredIdentityIsLink(t *testing.T) {
 	}
 }
 
+// TestDashboardTopPeeredOnionClearnetCounts asserts the dashboard's "top
+// peered" panel renders the new "Onion peers"/"Clearnet peers" column
+// headers and the hub row's correct per-node counts, for a hub whose
+// distinct peers are a mix of onion-only, clearnet-only, and dual-stack
+// (both an onion AND a clearnet address known).
+func TestDashboardTopPeeredOnionClearnetCounts(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	const onionAddr = "abcdefghijklmnopqrstuvwxyz234567.onion:18142"
+	const clearnetAddr = "203.0.113.5:18142"
+	const dualStackPrimaryAddr = "203.0.113.9:18142"
+	const dualStackOnionAddr = "qrstuvwxyzabcdefghijklmnop234567.onion:18142"
+
+	hub, err := store.UpsertDiscoveredNode(ctx, "hub-web:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert hub: %v", err)
+	}
+	onionOnlyPeer, err := store.UpsertDiscoveredNode(ctx, onionAddr, storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert onion-only peer: %v", err)
+	}
+	clearnetOnlyPeer, err := store.UpsertDiscoveredNode(ctx, clearnetAddr, storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert clearnet-only peer: %v", err)
+	}
+	dualStackPeer, err := store.UpsertDiscoveredNode(ctx, dualStackPrimaryAddr, storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert dual-stack peer: %v", err)
+	}
+
+	// storage.Store doesn't expose the raw pool, so add the dual-stack
+	// peer's second address via a direct connection to the same test
+	// database instead (same DSN newTestStore's store was built with).
+	pool, err := pgxpool.New(ctx, testDSN())
+	if err != nil {
+		t.Fatalf("connect to test db: %v", err)
+	}
+	defer pool.Close()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO node_addresses (node_id, address, first_seen, last_seen)
+		VALUES ($1, $2, now(), now())
+	`, dualStackPeer.ID, dualStackOnionAddr); err != nil {
+		t.Fatalf("insert dual-stack peer's onion address: %v", err)
+	}
+
+	for _, e := range []struct{ from, to string }{} {
+		_ = e
+	}
+	for _, peerID := range []interface{ String() string }{onionOnlyPeer.ID, clearnetOnlyPeer.ID, dualStackPeer.ID} {
+		_ = peerID
+	}
+	if err := store.RecordPeerEdgeObservation(ctx, hub.ID, onionOnlyPeer.ID); err != nil {
+		t.Fatalf("record edge hub->onionOnlyPeer: %v", err)
+	}
+	if err := store.RecordPeerEdgeObservation(ctx, hub.ID, clearnetOnlyPeer.ID); err != nil {
+		t.Fatalf("record edge hub->clearnetOnlyPeer: %v", err)
+	}
+	if err := store.RecordPeerEdgeObservation(ctx, hub.ID, dualStackPeer.ID); err != nil {
+		t.Fatalf("record edge hub->dualStackPeer: %v", err)
+	}
+
+	srv := newTestServer(t, store)
+	status, body := getBody(t, srv.URL+"/")
+	if status != http.StatusOK {
+		t.Fatalf("GET / status = %d, want %d", status, http.StatusOK)
+	}
+
+	if !strings.Contains(body, "Onion peers") {
+		t.Errorf("GET / body missing top-peered panel's %q column header", "Onion peers")
+	}
+	if !strings.Contains(body, "Clearnet peers") {
+		t.Errorf("GET / body missing top-peered panel's %q column header", "Clearnet peers")
+	}
+
+	hubIdx := strings.Index(body, fmt.Sprintf(`href="/nodes/%s"`, hub.ID))
+	if hubIdx == -1 {
+		t.Fatalf("GET / body missing top-peered identity link for hub node %s", hub.ID)
+	}
+	// The hub's row is a single <tr>...</tr> block containing that link;
+	// slice out just that row so the <td>3</td>-style assertions below
+	// can't accidentally match some other row/section of the page.
+	rowStart := strings.LastIndex(body[:hubIdx], "<tr>")
+	rowEnd := strings.Index(body[hubIdx:], "</tr>")
+	if rowStart == -1 || rowEnd == -1 {
+		t.Fatalf("could not isolate hub's <tr> row in GET / body")
+	}
+	hubRow := body[rowStart : hubIdx+rowEnd]
+
+	if !strings.Contains(hubRow, "<td>2</td>") {
+		t.Errorf("hub row missing OnionPeerCount/ClearnetPeerCount cell %q; row = %s", "<td>2</td>", hubRow)
+	}
+}
+
 // TestNodeDetailHidesP2PAddress asserts GET /nodes/{id} returns 200 and
 // never includes the node's own raw address when it was only
 // p2p_discovered, but does show a registry_submitted node's opted-in

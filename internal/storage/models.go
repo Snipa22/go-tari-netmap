@@ -123,11 +123,13 @@ type PeerEdge struct {
 // distinct other nodes it has an observed peer-edge with (in either
 // direction) within the queried time window.
 type NodeDegree struct {
-	NodeID    uuid.UUID `json:"node_id"`
-	Address   string    `json:"address"`
-	Degree    int       `json:"degree"`
-	InDegree  int       `json:"in_degree"`
-	OutDegree int       `json:"out_degree"`
+	NodeID            uuid.UUID `json:"node_id"`
+	Address           string    `json:"address"`
+	Degree            int       `json:"degree"`
+	InDegree          int       `json:"in_degree"`
+	OutDegree         int       `json:"out_degree"`
+	OnionPeerCount    int       `json:"onion_peer_count"`
+	ClearnetPeerCount int       `json:"clearnet_peer_count"`
 }
 
 // HealthCheck is one recorded health-check result for a node.

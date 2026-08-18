@@ -75,6 +75,8 @@
             <th>Degree</th>
             <th>In</th>
             <th>Out</th>
+            <th>Onion peers</th>
+            <th>Clearnet peers</th>
           </tr>
         </thead>
         <tbody>
@@ -105,9 +107,11 @@
             <td>{{.Degree}}</td>
             <td>{{.InDegree}}</td>
             <td>{{.OutDegree}}</td>
+            <td>{{.OnionPeerCount}}</td>
+            <td>{{.ClearnetPeerCount}}</td>
           </tr>
           {{else}}
-          <tr><td colspan="6" class="empty-note">No peer connections observed in the last hour.</td></tr>
+          <tr><td colspan="8" class="empty-note">No peer connections observed in the last hour.</td></tr>
           {{end}}
         </tbody>
       </table>

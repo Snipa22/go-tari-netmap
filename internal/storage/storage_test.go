@@ -771,6 +771,92 @@ func TestTopPeeredNodes(t *testing.T) {
 	}
 }
 
+// TestTopPeeredNodesOnionClearnetBreakdown verifies that TopPeeredNodes'
+// OnionPeerCount/ClearnetPeerCount fields correctly classify a hub node's
+// distinct peers by their OWN known node_addresses: one peer with only an
+// onion address, one peer with only a clearnet (IPv4) address, and one
+// dual-stack peer with BOTH an onion and a clearnet address recorded (two
+// separate node_addresses rows on the same node, inserted directly via
+// raw SQL following TestMigrationBackfillsNodeAddresses' established
+// pattern for that). The dual-stack peer must count toward BOTH numbers.
+func TestTopPeeredNodesOnionClearnetBreakdown(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	ps := store.(*pgStore)
+
+	const onionAddr = "abcdefghijklmnopqrstuvwxyz234567.onion:18142"
+	const clearnetAddr = "203.0.113.5:18142"
+	const dualStackPrimaryAddr = "203.0.113.9:18142"
+	const dualStackOnionAddr = "qrstuvwxyzabcdefghijklmnop234567.onion:18142"
+
+	hub, err := store.UpsertDiscoveredNode(ctx, "hub2:1", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert hub: %v", err)
+	}
+	onionOnlyPeer, err := store.UpsertDiscoveredNode(ctx, onionAddr, DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert onion-only peer: %v", err)
+	}
+	clearnetOnlyPeer, err := store.UpsertDiscoveredNode(ctx, clearnetAddr, DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert clearnet-only peer: %v", err)
+	}
+	dualStackPeer, err := store.UpsertDiscoveredNode(ctx, dualStackPrimaryAddr, DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert dual-stack peer: %v", err)
+	}
+	// Give the dual-stack peer a SECOND node_addresses row (its onion
+	// address) alongside the clearnet address it was created with above.
+	if _, err := ps.pool.Exec(ctx, `
+		INSERT INTO node_addresses (node_id, address, first_seen, last_seen)
+		VALUES ($1, $2, now(), now())
+	`, dualStackPeer.ID, dualStackOnionAddr); err != nil {
+		t.Fatalf("insert dual-stack peer's onion address: %v", err)
+	}
+
+	for _, e := range []struct{ from, to uuid.UUID }{
+		{hub.ID, onionOnlyPeer.ID},
+		{hub.ID, clearnetOnlyPeer.ID},
+		{hub.ID, dualStackPeer.ID},
+	} {
+		if err := store.RecordPeerEdgeObservation(ctx, e.from, e.to); err != nil {
+			t.Fatalf("record edge observation %v -> %v: %v", e.from, e.to, err)
+		}
+	}
+
+	since := time.Now().Add(-time.Hour)
+	top, err := store.TopPeeredNodes(ctx, since, 10)
+	if err != nil {
+		t.Fatalf("top peered nodes: %v", err)
+	}
+
+	var hubRow *NodeDegree
+	for i := range top {
+		if top[i].NodeID == hub.ID {
+			hubRow = &top[i]
+			break
+		}
+	}
+	if hubRow == nil {
+		t.Fatalf("hub %v not found in top peered nodes result: %+v", hub.ID, top)
+	}
+
+	if hubRow.Degree != 3 {
+		t.Fatalf("hub Degree = %d, want 3", hubRow.Degree)
+	}
+	// onion-only peer + dual-stack peer = 2.
+	if hubRow.OnionPeerCount != 2 {
+		t.Errorf("hub OnionPeerCount = %d, want 2 (onion-only peer + dual-stack peer)", hubRow.OnionPeerCount)
+	}
+	// clearnet-only peer + dual-stack peer = 2.
+	if hubRow.ClearnetPeerCount != 2 {
+		t.Errorf("hub ClearnetPeerCount = %d, want 2 (clearnet-only peer + dual-stack peer)", hubRow.ClearnetPeerCount)
+	}
+
+	t.Logf("hub row: degree=%d onion_peer_count=%d clearnet_peer_count=%d (dual-stack peer %v counted in both)",
+		hubRow.Degree, hubRow.OnionPeerCount, hubRow.ClearnetPeerCount, dualStackPeer.ID)
+}
+
 // TestListNodeEdges verifies that ListNodeEdges returns edges in both
 // directions for a node (as either the from or to side) and respects the
 // limit parameter.

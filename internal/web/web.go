@@ -122,13 +122,15 @@ type dashboardNodeRow struct {
 // privacy-scrubbed identity plus its connectivity stats from
 // storage.TopPeeredNodes.
 type topPeeredRow struct {
-	ID              uuid.UUID
-	Identity        identity
-	Capabilities    capabilities
-	PublicAddresses []string
-	Degree          int
-	InDegree        int
-	OutDegree       int
+	ID                uuid.UUID
+	Identity          identity
+	Capabilities      capabilities
+	PublicAddresses   []string
+	Degree            int
+	InDegree          int
+	OutDegree         int
+	OnionPeerCount    int
+	ClearnetPeerCount int
 }
 
 // dashboardData is the template data for index.html.tmpl.
@@ -421,13 +423,15 @@ func handleDashboard(tmpl *template.Template, store storage.Store) http.HandlerF
 			}
 			view := scrubForDisplay(n, addrs)
 			data.TopPeered = append(data.TopPeered, topPeeredRow{
-				ID:              nd.NodeID,
-				Identity:        view.Identity,
-				Capabilities:    view.Capabilities,
-				PublicAddresses: view.PublicAddresses,
-				Degree:          nd.Degree,
-				InDegree:        nd.InDegree,
-				OutDegree:       nd.OutDegree,
+				ID:                nd.NodeID,
+				Identity:          view.Identity,
+				Capabilities:      view.Capabilities,
+				PublicAddresses:   view.PublicAddresses,
+				Degree:            nd.Degree,
+				InDegree:          nd.InDegree,
+				OutDegree:         nd.OutDegree,
+				OnionPeerCount:    nd.OnionPeerCount,
+				ClearnetPeerCount: nd.ClearnetPeerCount,
 			})
 		}
 

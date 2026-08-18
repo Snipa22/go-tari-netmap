@@ -1004,6 +1004,21 @@ func (s *pgStore) ListTopology(ctx context.Context, filter TopologyFilter) ([]No
 // though each individual edge observation is directed. InDegree/OutDegree
 // are also computed (distinct predecessors/successors respectively) for
 // callers that want the directed breakdown too.
+//
+// OnionPeerCount/ClearnetPeerCount further break the undirected peer set
+// down by what's known about each peer's OWN addresses (via
+// node_addresses, not the ranked node's addresses): OnionPeerCount is how
+// many distinct peers have at least one node_addresses row that looks
+// like a `.onion` address, and ClearnetPeerCount is how many distinct
+// peers have at least one node_addresses row that parses as an IPv4 or
+// IPv6 address. A peer with both a known onion address and a known
+// clearnet address counts in BOTH numbers — which of a peer's addresses
+// was actually used for a given edge observation isn't tracked, only
+// that the two nodes are known peers, so peers are classified by their
+// overall known capabilities, mirroring
+// PublicNode.HasOnion/HasIPv4/HasIPv6 in internal/api/privacy.go (that
+// classification is intentionally re-implemented here in SQL rather than
+// imported, since internal/storage must not depend on internal/api).
 func (s *pgStore) TopPeeredNodes(ctx context.Context, since time.Time, limit int) ([]NodeDegree, error) {
 	if limit <= 0 {
 		limit = 20
@@ -1035,13 +1050,44 @@ func (s *pgStore) TopPeeredNodes(ctx context.Context, since time.Time, limit int
 			FROM peer_edge_observations
 			WHERE observed_at >= $1
 			GROUP BY to_node_id
+		),
+		onion_peer_counts AS (
+			SELECT u.node_id, count(DISTINCT u.other_node_id) AS onion_peer_count
+			FROM undirected u
+			WHERE EXISTS (
+				SELECT 1 FROM node_addresses na
+				WHERE na.node_id = u.other_node_id
+				  AND na.address ILIKE '%.onion%'
+			)
+			GROUP BY u.node_id
+		),
+		clearnet_peer_counts AS (
+			SELECT u.node_id, count(DISTINCT u.other_node_id) AS clearnet_peer_count
+			FROM undirected u
+			WHERE EXISTS (
+				SELECT 1 FROM node_addresses na
+				WHERE na.node_id = u.other_node_id
+				  AND na.address NOT ILIKE '%.onion%'
+				  AND (
+					-- host:port with an IPv4 dotted-quad host.
+					na.address ~ '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}:[0-9]+$'
+					-- [host]:port with a bracketed IPv6 host (the
+					-- textual form net.JoinHostPort/net.SplitHostPort
+					-- use, matching classifyAddress's Go-side handling).
+					OR na.address ~ '^\[[0-9a-fA-F:]+\]:[0-9]+$'
+				  )
+			)
+			GROUP BY u.node_id
 		)
 		SELECT n.id, n.address, d.degree,
-			COALESCE(ind.in_degree, 0), COALESCE(outd.out_degree, 0)
+			COALESCE(ind.in_degree, 0), COALESCE(outd.out_degree, 0),
+			COALESCE(opc.onion_peer_count, 0), COALESCE(cpc.clearnet_peer_count, 0)
 		FROM degrees d
 		JOIN nodes n ON n.id = d.node_id
 		LEFT JOIN in_degrees ind ON ind.node_id = d.node_id
 		LEFT JOIN out_degrees outd ON outd.node_id = d.node_id
+		LEFT JOIN onion_peer_counts opc ON opc.node_id = d.node_id
+		LEFT JOIN clearnet_peer_counts cpc ON cpc.node_id = d.node_id
 		ORDER BY d.degree DESC
 		LIMIT $2
 	`, since, limit)
@@ -1053,7 +1099,10 @@ func (s *pgStore) TopPeeredNodes(ctx context.Context, since time.Time, limit int
 	out := []NodeDegree{}
 	for rows.Next() {
 		var nd NodeDegree
-		if err := rows.Scan(&nd.NodeID, &nd.Address, &nd.Degree, &nd.InDegree, &nd.OutDegree); err != nil {
+		if err := rows.Scan(
+			&nd.NodeID, &nd.Address, &nd.Degree, &nd.InDegree, &nd.OutDegree,
+			&nd.OnionPeerCount, &nd.ClearnetPeerCount,
+		); err != nil {
 			return nil, fmt.Errorf("storage: scan node degree: %w", err)
 		}
 		out = append(out, nd)
