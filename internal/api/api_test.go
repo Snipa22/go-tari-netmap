@@ -93,7 +93,7 @@ func newTestStore(t *testing.T) storage.Store {
 	if err != nil {
 		t.Fatalf("connect for truncate: %v", err)
 	}
-	if _, err := pool.Exec(ctx, "TRUNCATE TABLE node_health, peer_edge_observations, node_addresses, nodes CASCADE"); err != nil {
+	if _, err := pool.Exec(ctx, "TRUNCATE TABLE node_health, peer_edge_observations, node_addresses, pending_submissions, nodes CASCADE"); err != nil {
 		pool.Close()
 		t.Fatalf("truncate test tables: %v", err)
 	}
@@ -136,6 +136,10 @@ func newTestServer(t *testing.T, client collector.NodeClient) (*httptest.Server,
 	return srv, store
 }
 
+// strPtr is a small helper for building *string literals inline in test
+// assertions/fixtures.
+func strPtr(s string) *string { return &s }
+
 func TestHealthz(t *testing.T) {
 	srv, _ := newTestServer(t, nil)
 
@@ -149,12 +153,13 @@ func TestHealthz(t *testing.T) {
 	}
 }
 
+// TestCreateNodeValid asserts a genuinely new address queues a pending
+// submission (202 Accepted) rather than instantly publishing a node: no
+// node is created, and the response body reflects the pending
+// submission.
 func TestCreateNodeValid(t *testing.T) {
-	height := int64(42)
-	client := &fakeClient{info: map[string]collector.NodeInfo{
-		"1.2.3.4:18142": {Reachable: true, Height: &height},
-	}}
-	srv, store := newTestServer(t, client)
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
 
 	body := `{"host":"1.2.3.4","port":18142,"label":"my node","owner_tag":"pool-x"}`
 	resp, err := http.Post(srv.URL+"/nodes", "application/json", bytes.NewBufferString(body))
@@ -162,49 +167,92 @@ func TestCreateNodeValid(t *testing.T) {
 		t.Fatalf("POST /nodes: %v", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusCreated)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusAccepted)
 	}
 
-	var node storage.Node
-	if err := json.NewDecoder(resp.Body).Decode(&node); err != nil {
+	var submission storage.PendingSubmission
+	if err := json.NewDecoder(resp.Body).Decode(&submission); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if node.Address != "1.2.3.4:18142" {
-		t.Errorf("address = %q, want %q", node.Address, "1.2.3.4:18142")
+	if submission.Address != "1.2.3.4:18142" {
+		t.Errorf("address = %q, want %q", submission.Address, "1.2.3.4:18142")
 	}
-	if node.DiscoverySource != storage.DiscoverySourceRegistry {
-		t.Errorf("discovery_source = %q, want %q", node.DiscoverySource, storage.DiscoverySourceRegistry)
+	if submission.Status != storage.SubmissionStatusPending {
+		t.Errorf("status = %q, want %q", submission.Status, storage.SubmissionStatusPending)
 	}
-	if node.Label == nil || *node.Label != "my node" {
-		t.Errorf("label = %v, want %q", node.Label, "my node")
+	if submission.Label == nil || *submission.Label != "my node" {
+		t.Errorf("label = %v, want %q", submission.Label, "my node")
 	}
-	if owner, _ := node.Tags["owner"].(string); owner != "pool-x" {
-		t.Errorf("tags[owner] = %v, want %q", node.Tags["owner"], "pool-x")
+	if submission.OwnerTag == nil || *submission.OwnerTag != "pool-x" {
+		t.Errorf("owner_tag = %v, want %q", submission.OwnerTag, "pool-x")
 	}
 
-	// The async health-check kickoff should record a health check shortly
-	// after the POST returns, without the POST itself having waited on it.
+	nodes, err := store.ListNodes(ctx, storage.NodeFilter{})
+	if err != nil {
+		t.Fatalf("list nodes: %v", err)
+	}
+	if len(nodes) != 0 {
+		t.Fatalf("len(nodes) = %d, want 0 (submission must not auto-publish a node)", len(nodes))
+	}
+}
+
+// TestCreateNodeAlreadyOptedInConflicts asserts submitting an address
+// that already belongs to a publicly opted-in node (registry_submitted
+// or both) is rejected with 409, and the existing node's data is left
+// completely unchanged — the whole point of this check is to prevent a
+// second submitter from silently merging into (and overwriting) someone
+// else's already-registered node.
+func TestCreateNodeAlreadyOptedInConflicts(t *testing.T) {
+	srv, store := newTestServer(t, nil)
 	ctx := context.Background()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		history, err := store.GetNodeHistory(ctx, node.ID, 1)
-		if err != nil {
-			t.Fatalf("get node history: %v", err)
-		}
-		if len(history) == 1 {
-			if !history[0].Reachable {
-				t.Errorf("expected async health check to report reachable = true")
-			}
-			if history[0].Height == nil || *history[0].Height != height {
-				t.Errorf("height = %v, want %d", history[0].Height, height)
-			}
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("timed out waiting for async health-check kickoff to record a health check")
-		}
-		time.Sleep(20 * time.Millisecond)
+
+	const addr = "23.226.69.178:18189"
+	original, err := store.UpsertDiscoveredNode(ctx, addr, storage.DiscoverySourceRegistry,
+		map[string]any{"owner": "Jagtech"}, strPtr("Jagtech node"))
+	if err != nil {
+		t.Fatalf("upsert original node: %v", err)
+	}
+	originalLastSeen := original.LastSeen
+
+	body := `{"host":"23.226.69.178","port":18189,"label":"steal this node","owner_tag":"attacker"}`
+	resp, err := http.Post(srv.URL+"/nodes", "application/json", bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatalf("POST /nodes: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusConflict)
+	}
+
+	got, err := store.GetNode(ctx, original.ID)
+	if err != nil {
+		t.Fatalf("get node: %v", err)
+	}
+	if got.Label == nil || *got.Label != "Jagtech node" {
+		t.Errorf("label = %v, want unchanged %q", got.Label, "Jagtech node")
+	}
+	if owner, _ := got.Tags["owner"].(string); owner != "Jagtech" {
+		t.Errorf("tags[owner] = %v, want unchanged %q", got.Tags["owner"], "Jagtech")
+	}
+	if !got.LastSeen.Equal(originalLastSeen) {
+		t.Errorf("last_seen changed: got %v, want unchanged %v", got.LastSeen, originalLastSeen)
+	}
+
+	nodes, err := store.ListNodes(ctx, storage.NodeFilter{})
+	if err != nil {
+		t.Fatalf("list nodes: %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("len(nodes) = %d, want 1 (no new node created)", len(nodes))
+	}
+
+	pending, err := store.ListPendingSubmissions(ctx, "pending")
+	if err != nil {
+		t.Fatalf("list pending submissions: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("len(pending) = %d, want 0 (conflict must not queue a submission either)", len(pending))
 	}
 }
 
@@ -468,5 +516,295 @@ func TestScrubbingP2PVsRegistry(t *testing.T) {
 	}
 	if !strings.Contains(topologyBody, registryAddr) {
 		t.Errorf("GET /topology body missing registry node's address %q:\n%s", registryAddr, topologyBody)
+	}
+}
+
+// TestListSubmissions asserts GET /submissions defaults to listing
+// pending submissions and honors the status query param.
+func TestListSubmissions(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
+
+	pending, err := store.CreatePendingSubmission(ctx, "a:1", nil, nil)
+	if err != nil {
+		t.Fatalf("create pending submission: %v", err)
+	}
+
+	resp, err := http.Get(srv.URL + "/submissions")
+	if err != nil {
+		t.Fatalf("GET /submissions: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	var got []storage.PendingSubmission
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != pending.ID {
+		t.Fatalf("got = %+v, want just %v", got, pending.ID)
+	}
+}
+
+// TestApproveSubmission asserts approving a pending submission returns
+// 200, creates the real node with DiscoverySourceRegistry, sets
+// promoted_node_id, and kicks off the same async health-check goroutine
+// that used to run directly from POST /nodes.
+func TestApproveSubmission(t *testing.T) {
+	height := int64(42)
+	client := &fakeClient{info: map[string]collector.NodeInfo{
+		"1.2.3.4:18142": {Reachable: true, Height: &height},
+	}}
+	srv, store := newTestServer(t, client)
+	ctx := context.Background()
+
+	submission, err := store.CreatePendingSubmission(ctx, "1.2.3.4:18142", strPtr("my node"), strPtr("pool-x"))
+	if err != nil {
+		t.Fatalf("create pending submission: %v", err)
+	}
+
+	resp, err := http.Post(fmt.Sprintf("%s/submissions/%s/approve", srv.URL, submission.ID), "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST /submissions/{id}/approve: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, http.StatusOK, body)
+	}
+
+	var got struct {
+		Node       storage.Node              `json:"node"`
+		Submission storage.PendingSubmission `json:"submission"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Node.Address != "1.2.3.4:18142" {
+		t.Errorf("node.address = %q, want %q", got.Node.Address, "1.2.3.4:18142")
+	}
+	if got.Node.DiscoverySource != storage.DiscoverySourceRegistry {
+		t.Errorf("node.discovery_source = %q, want %q", got.Node.DiscoverySource, storage.DiscoverySourceRegistry)
+	}
+	if got.Node.Label == nil || *got.Node.Label != "my node" {
+		t.Errorf("node.label = %v, want %q", got.Node.Label, "my node")
+	}
+	if owner, _ := got.Node.Tags["owner"].(string); owner != "pool-x" {
+		t.Errorf("node.tags[owner] = %v, want %q", got.Node.Tags["owner"], "pool-x")
+	}
+	if got.Submission.Status != storage.SubmissionStatusApproved {
+		t.Errorf("submission.status = %q, want %q", got.Submission.Status, storage.SubmissionStatusApproved)
+	}
+	if got.Submission.PromotedNodeID == nil || *got.Submission.PromotedNodeID != got.Node.ID {
+		t.Errorf("submission.promoted_node_id = %v, want %v", got.Submission.PromotedNodeID, got.Node.ID)
+	}
+
+	// Persisted state must agree with the response.
+	persisted, err := store.GetPendingSubmission(ctx, submission.ID)
+	if err != nil {
+		t.Fatalf("get pending submission: %v", err)
+	}
+	if persisted.Status != storage.SubmissionStatusApproved {
+		t.Errorf("persisted status = %q, want %q", persisted.Status, storage.SubmissionStatusApproved)
+	}
+
+	// The async health-check kickoff should record a health check
+	// shortly after the POST returns, without the POST itself having
+	// waited on it — same assertion technique as the old
+	// TestCreateNodeValid used before submissions required approval.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		history, err := store.GetNodeHistory(ctx, got.Node.ID, 1)
+		if err != nil {
+			t.Fatalf("get node history: %v", err)
+		}
+		if len(history) == 1 {
+			if !history[0].Reachable {
+				t.Errorf("expected async health check to report reachable = true")
+			}
+			if history[0].Height == nil || *history[0].Height != height {
+				t.Errorf("height = %v, want %d", history[0].Height, height)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for async health-check kickoff to record a health check")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestApproveSubmissionNotPending asserts approving an already-decided
+// submission (rejected here) errors rather than double-processing it.
+func TestApproveSubmissionNotPending(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
+
+	submission, err := store.CreatePendingSubmission(ctx, "a:1", nil, nil)
+	if err != nil {
+		t.Fatalf("create pending submission: %v", err)
+	}
+	if err := store.RejectPendingSubmission(ctx, submission.ID, nil); err != nil {
+		t.Fatalf("reject: %v", err)
+	}
+
+	resp, err := http.Post(fmt.Sprintf("%s/submissions/%s/approve", srv.URL, submission.ID), "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST /submissions/{id}/approve: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 400 {
+		t.Fatalf("status = %d, want an error status (submission already reviewed)", resp.StatusCode)
+	}
+
+	nodes, err := store.ListNodes(ctx, storage.NodeFilter{})
+	if err != nil {
+		t.Fatalf("list nodes: %v", err)
+	}
+	if len(nodes) != 0 {
+		t.Fatalf("len(nodes) = %d, want 0 (approving an already-rejected submission must not create a node)", len(nodes))
+	}
+}
+
+// TestApproveSubmissionAddressBecameOptedIn asserts that if the address
+// became publicly opted-in AFTER the submission was queued but BEFORE
+// it's approved, approval is rejected with a conflict and the submission
+// is left pending (not auto-rejected) for a human to explicitly decide.
+func TestApproveSubmissionAddressBecameOptedIn(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
+
+	submission, err := store.CreatePendingSubmission(ctx, "a:1", nil, nil)
+	if err != nil {
+		t.Fatalf("create pending submission: %v", err)
+	}
+
+	// Someone else's submission for the same address gets approved
+	// first (simulated directly here), making it publicly opted-in.
+	if _, err := store.UpsertDiscoveredNode(ctx, "a:1", storage.DiscoverySourceRegistry, nil, nil); err != nil {
+		t.Fatalf("upsert competing node: %v", err)
+	}
+
+	resp, err := http.Post(fmt.Sprintf("%s/submissions/%s/approve", srv.URL, submission.ID), "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST /submissions/{id}/approve: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusConflict)
+	}
+
+	// The submission must remain pending — not auto-flipped to rejected.
+	got, err := store.GetPendingSubmission(ctx, submission.ID)
+	if err != nil {
+		t.Fatalf("get pending submission: %v", err)
+	}
+	if got.Status != storage.SubmissionStatusPending {
+		t.Errorf("status = %q, want %q (left for a human decision)", got.Status, storage.SubmissionStatusPending)
+	}
+}
+
+// TestRejectSubmission asserts rejecting a pending submission returns
+// 200, flips its status to rejected with the given reason, and never
+// touches the nodes table.
+func TestRejectSubmission(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
+
+	submission, err := store.CreatePendingSubmission(ctx, "a:1", nil, nil)
+	if err != nil {
+		t.Fatalf("create pending submission: %v", err)
+	}
+
+	resp, err := http.Post(
+		fmt.Sprintf("%s/submissions/%s/reject", srv.URL, submission.ID),
+		"application/json",
+		bytes.NewBufferString(`{"reason":"looks like spam"}`),
+	)
+	if err != nil {
+		t.Fatalf("POST /submissions/{id}/reject: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	var got storage.PendingSubmission
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Status != storage.SubmissionStatusRejected {
+		t.Errorf("status = %q, want %q", got.Status, storage.SubmissionStatusRejected)
+	}
+	if got.RejectionReason == nil || *got.RejectionReason != "looks like spam" {
+		t.Errorf("rejection_reason = %v, want %q", got.RejectionReason, "looks like spam")
+	}
+
+	nodes, err := store.ListNodes(ctx, storage.NodeFilter{})
+	if err != nil {
+		t.Fatalf("list nodes: %v", err)
+	}
+	if len(nodes) != 0 {
+		t.Fatalf("len(nodes) = %d, want 0 (rejection must never touch the nodes table)", len(nodes))
+	}
+}
+
+// TestRejectSubmissionEmptyBody asserts an empty request body is
+// accepted (no reason set) rather than erroring on EOF.
+func TestRejectSubmissionEmptyBody(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
+
+	submission, err := store.CreatePendingSubmission(ctx, "a:1", nil, nil)
+	if err != nil {
+		t.Fatalf("create pending submission: %v", err)
+	}
+
+	resp, err := http.Post(fmt.Sprintf("%s/submissions/%s/reject", srv.URL, submission.ID), "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST /submissions/{id}/reject: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, http.StatusOK, body)
+	}
+
+	var got storage.PendingSubmission
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Status != storage.SubmissionStatusRejected {
+		t.Errorf("status = %q, want %q", got.Status, storage.SubmissionStatusRejected)
+	}
+	if got.RejectionReason != nil {
+		t.Errorf("rejection_reason = %v, want nil", got.RejectionReason)
+	}
+}
+
+// TestRejectSubmissionMalformedBody asserts a genuinely malformed JSON
+// body (not just empty) is a 400, distinguishing "no body" from "bad
+// body".
+func TestRejectSubmissionMalformedBody(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
+
+	submission, err := store.CreatePendingSubmission(ctx, "a:1", nil, nil)
+	if err != nil {
+		t.Fatalf("create pending submission: %v", err)
+	}
+
+	resp, err := http.Post(
+		fmt.Sprintf("%s/submissions/%s/reject", srv.URL, submission.ID),
+		"application/json",
+		bytes.NewBufferString(`{not json`),
+	)
+	if err != nil {
+		t.Fatalf("POST /submissions/{id}/reject: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
 	}
 }
