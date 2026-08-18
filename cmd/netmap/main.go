@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Snipa22/go-tari-netmap/internal/adminauth"
 	"github.com/Snipa22/go-tari-netmap/internal/api"
 	"github.com/Snipa22/go-tari-netmap/internal/collector"
 	"github.com/Snipa22/go-tari-netmap/internal/storage"
@@ -81,14 +82,28 @@ func main() {
 		}
 	}()
 
-	webHandler, err := web.NewHandler(store)
+	// NETMAP_ADMIN_USER / NETMAP_ADMIN_PASSWORD gate every /admin/*
+	// route (the submission review queue and the poll-now admin tool)
+	// behind HTTP Basic Auth — see internal/adminauth.Wrap. If either
+	// is empty/unset, the admin area fails closed (503 on every
+	// request) rather than falling back to a default/blank credential
+	// pair; see adminauth.Credentials.Configured's doc comment.
+	adminCreds := adminauth.Credentials{
+		Username: os.Getenv("NETMAP_ADMIN_USER"),
+		Password: os.Getenv("NETMAP_ADMIN_PASSWORD"),
+	}
+	if !adminCreds.Configured() {
+		log.Printf("NETMAP_ADMIN_USER/NETMAP_ADMIN_PASSWORD not both set — /admin routes are disabled (503)")
+	}
+
+	webHandler, err := web.NewHandler(store, adminCreds)
 	if err != nil {
 		log.Fatalf("failed to build web handler: %v", err)
 	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/", webHandler)
-	mux.Handle("/api/", http.StripPrefix("/api", api.NewRouter(store, grpcClient, p2pClient)))
+	mux.Handle("/api/", http.StripPrefix("/api", api.NewRouter(store, grpcClient, p2pClient, adminCreds)))
 
 	srv := &http.Server{Addr: *addr, Handler: mux}
 

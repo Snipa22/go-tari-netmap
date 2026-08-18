@@ -12,7 +12,7 @@
     <nav>
       <a href="/">Dashboard</a>
       <a href="/topology">Topology</a>
-      <a href="/submissions">Submissions</a>
+      <a href="/admin/submissions">Submissions</a>
     </nav>
   </header>
 
@@ -51,8 +51,8 @@
               {{end}}
             </td>
             <td>
-              <button class="btn-approve" hx-post="/api/submissions/{{.ID}}/approve" hx-target="closest tr" hx-swap="outerHTML">Approve</button>
-              <button class="btn-reject" hx-post="/api/submissions/{{.ID}}/reject" hx-confirm="Reject this submission?" hx-target="closest tr" hx-swap="outerHTML">Reject</button>
+              <button class="btn-approve" hx-post="/api/admin/submissions/{{.ID}}/approve" hx-target="closest tr" hx-swap="outerHTML">Approve</button>
+              <button class="btn-reject" hx-post="/api/admin/submissions/{{.ID}}/reject" hx-confirm="Reject this submission?" hx-target="closest tr" hx-swap="outerHTML">Reject</button>
             </td>
           </tr>
           {{else}}
