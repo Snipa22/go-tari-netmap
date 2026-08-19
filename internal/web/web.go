@@ -259,6 +259,17 @@ type nodeDetailData struct {
 	// PeerIdentityUpdatedAt (e.g. every successful check so far was
 	// over gRPC, which has no equivalent concept).
 	IdentityUpdatedAt *time.Time
+
+	// LastKnownVersion is the node's self-reported client version
+	// (storage.HealthCheck's Version field) from the same most-recent
+	// successful health check used for IdentityUpdatedAt above, for
+	// the same reason: History's newest row can be a failed probe with
+	// Version nil, which would otherwise make this flicker to "—"
+	// between successful checks even though the last-known version
+	// hasn't actually changed. Nil if this node has no successful
+	// health check on record yet, or that check didn't carry a
+	// Version.
+	LastKnownVersion *string
 }
 
 // topPeeredWindow is the lookback window used to compute the dashboard's
@@ -804,8 +815,10 @@ func handleNodeDetail(tmpl *template.Template, store storage.Store) http.Handler
 			return
 		}
 		var identityUpdatedAt *time.Time
+		var lastKnownVersion *string
 		if len(recentSuccessful) > 0 {
 			identityUpdatedAt = recentSuccessful[0].PeerIdentityUpdatedAt
+			lastKnownVersion = recentSuccessful[0].Version
 		}
 
 		edges, err := store.ListNodeEdges(ctx, id, nodeEdgesLimit)
@@ -821,6 +834,7 @@ func handleNodeDetail(tmpl *template.Template, store storage.Store) http.Handler
 			Capabilities:      view.Capabilities,
 			PublicAddresses:   view.PublicAddresses,
 			IdentityUpdatedAt: identityUpdatedAt,
+			LastKnownVersion:  lastKnownVersion,
 		}
 
 		// LikelyDead against the already-fetched 50-row history above —
