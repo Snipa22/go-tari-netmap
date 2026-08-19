@@ -233,8 +233,21 @@ type peerEdgeRow struct {
 
 // nodeDetailData is the template data for node_detail.html.tmpl.
 type nodeDetailData struct {
-	Node    storage.Node
+	Node storage.Node
+
+	// History is the unfiltered (reachable and unreachable alike) most
+	// recent health checks for this node. It is used only for
+	// computeLikelyDead below — it is not rendered directly by the
+	// template anymore. See RecentSuccessfulChecks for what actually
+	// backs the "Recent history" table.
 	History []storage.HealthCheck
+
+	// RecentSuccessfulChecks holds the newest few (up to 3)
+	// successful-only health checks, used to populate the "Recent
+	// history" table. Unlike History above, this excludes unreachable
+	// probes entirely rather than showing them with blank fields, so
+	// the table only shows rows with meaningful data.
+	RecentSuccessfulChecks []storage.HealthCheck
 
 	Identity        identity
 	Capabilities    capabilities
@@ -808,8 +821,10 @@ func handleNodeDetail(tmpl *template.Template, store storage.Store) http.Handler
 		// See nodeDetailData.IdentityUpdatedAt's doc comment for why
 		// this is its own GetRecentSuccessfulHealthChecks call rather
 		// than derived from history above: history's newest row may be
-		// a failed probe with no identity data at all.
-		recentSuccessful, err := store.GetRecentSuccessfulHealthChecks(ctx, id, 1)
+		// a failed probe with no identity data at all. Limit is 3, per
+		// Alex's explicit 2-3 request, so the "Recent history" table
+		// has a few rows to show rather than just one.
+		recentSuccessful, err := store.GetRecentSuccessfulHealthChecks(ctx, id, 3)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -828,13 +843,14 @@ func handleNodeDetail(tmpl *template.Template, store storage.Store) http.Handler
 		}
 
 		data := nodeDetailData{
-			Node:              node,
-			History:           history,
-			Identity:          view.Identity,
-			Capabilities:      view.Capabilities,
-			PublicAddresses:   view.PublicAddresses,
-			IdentityUpdatedAt: identityUpdatedAt,
-			LastKnownVersion:  lastKnownVersion,
+			Node:                   node,
+			History:                history,
+			RecentSuccessfulChecks: recentSuccessful,
+			Identity:               view.Identity,
+			Capabilities:           view.Capabilities,
+			PublicAddresses:        view.PublicAddresses,
+			IdentityUpdatedAt:      identityUpdatedAt,
+			LastKnownVersion:       lastKnownVersion,
 		}
 
 		// LikelyDead against the already-fetched 50-row history above —

@@ -716,6 +716,127 @@ func TestNodeDetailLikelyDeadBadge(t *testing.T) {
 	}
 }
 
+// TestNodeDetailRecentHistoryShowsOnlySuccessful asserts the "Recent
+// history" table only ever renders successful (Reachable == true) health
+// checks, even when the node's full history is a real mix of successes
+// and failures — see nodeDetailData.RecentSuccessfulChecks's doc comment
+// for why it's sourced from GetRecentSuccessfulHealthChecks rather than
+// the raw History slice. It also proves the up-to-3 cap: a node with at
+// least 4 successful checks on record must still render at most 3 rows.
+func TestNodeDetailRecentHistoryShowsOnlySuccessful(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	node, err := store.UpsertDiscoveredNode(ctx, "mixed-history:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert node: %v", err)
+	}
+
+	// A real production-like pattern: failures interspersed with
+	// successes, more failures than successes overall, but still with
+	// at least 4 successes so the cap at 3 is actually exercised (not
+	// just coincidentally satisfied by there being <= 3 successes to
+	// begin with).
+	reachablePattern := []bool{false, true, false, true, false, true, false, true, false}
+	successCount := 0
+	for i, reachable := range reachablePattern {
+		if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{
+			NodeID:      node.ID,
+			Reachable:   reachable,
+			ProbeSource: storage.ProbeSourceGRPC,
+		}); err != nil {
+			t.Fatalf("record health check %d (reachable=%v): %v", i, reachable, err)
+		}
+		if reachable {
+			successCount++
+		}
+	}
+	if successCount < 4 {
+		t.Fatalf("test setup bug: seeded only %d successful checks, want >= 4 to exercise the cap", successCount)
+	}
+
+	srv := newTestServer(t, store)
+
+	status, body := getBody(t, srv.URL+"/nodes/"+node.ID.String())
+	if status != http.StatusOK {
+		t.Fatalf("GET /nodes/%s status = %d, want %d", node.ID, status, http.StatusOK)
+	}
+
+	// Scope the assertion to the "Recent history" table section only.
+	// The page's other table ("Peer connections") has no boolean
+	// Reachable-like true/false <td> columns — its columns are
+	// Direction, Peer identity, First seen, Last seen (see
+	// node_detail.html.tmpl) — so slicing the body at these two <h2>
+	// section markers is sufficient to isolate the table under test
+	// without risking a false match from elsewhere on the page.
+	const startMarker = "<h2>Recent history</h2>"
+	const endMarker = "<h2>Peer connections</h2>"
+	start := strings.Index(body, startMarker)
+	end := strings.Index(body, endMarker)
+	if start == -1 || end == -1 || end < start {
+		t.Fatalf("could not locate \"Recent history\"/\"Peer connections\" section markers in body: %s", body)
+	}
+	section := body[start:end]
+
+	if strings.Contains(section, "<td>false</td>") {
+		t.Errorf("GET /nodes/%s \"Recent history\" section contains <td>false</td>, want only successful checks rendered\nsection: %s", node.ID, section)
+	}
+
+	trueCount := strings.Count(section, "<td>true</td>")
+	if trueCount == 0 {
+		t.Errorf("GET /nodes/%s \"Recent history\" section contains no <td>true</td> rows, want at least one", node.ID)
+	}
+	if trueCount > 3 {
+		t.Errorf("GET /nodes/%s \"Recent history\" section contains %d <td>true</td> rows, want at most 3 (the RecentSuccessfulChecks cap) even though %d successful checks were recorded", node.ID, trueCount, successCount)
+	}
+}
+
+// TestNodeDetailLikelyDeadStillWorksWithFilteredHistoryTable proves the
+// "likely dead" badge (computed from the unfiltered History slice — see
+// computeLikelyDead) still renders correctly for a node whose "Recent
+// history" table is now empty, because RecentSuccessfulChecks filters
+// out a node with no successful checks at all. In other words: the
+// badge's correctness does not depend on the visible table having any
+// rows.
+func TestNodeDetailLikelyDeadStillWorksWithFilteredHistoryTable(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	node, err := store.UpsertDiscoveredNode(ctx, "dead-empty-table:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert node: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{NodeID: node.ID, Reachable: false, ProbeSource: storage.ProbeSourceGRPC}); err != nil {
+			t.Fatalf("record health check %d: %v", i, err)
+		}
+	}
+
+	srv := newTestServer(t, store)
+
+	status, body := getBody(t, srv.URL+"/nodes/"+node.ID.String())
+	if status != http.StatusOK {
+		t.Fatalf("GET /nodes/%s status = %d, want %d", node.ID, status, http.StatusOK)
+	}
+
+	if !strings.Contains(body, "badge-likely-dead") {
+		t.Errorf("GET /nodes/%s body missing badge-likely-dead for a node with 3+ probes, zero successes", node.ID)
+	}
+
+	const startMarker = "<h2>Recent history</h2>"
+	const endMarker = "<h2>Peer connections</h2>"
+	start := strings.Index(body, startMarker)
+	end := strings.Index(body, endMarker)
+	if start == -1 || end == -1 || end < start {
+		t.Fatalf("could not locate \"Recent history\"/\"Peer connections\" section markers in body: %s", body)
+	}
+	section := body[start:end]
+
+	if !strings.Contains(section, "No health checks recorded yet.") {
+		t.Errorf("GET /nodes/%s \"Recent history\" section should show the empty-state message for a node with zero successful checks, even though it's likely dead\nsection: %s", node.ID, section)
+	}
+}
+
 // TestNodeDetailIdentityUpdatedAt asserts GET /nodes/{id} shows the peer's
 // self-reported identity-signature timestamp (from the most recent
 // successful health check's PeerIdentityUpdatedAt), and that it reflects
