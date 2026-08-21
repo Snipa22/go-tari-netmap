@@ -636,6 +636,12 @@ func TestPollIntervalUsesPoolOwnedCadence(t *testing.T) {
 // entries to conclude anything — so it still gets the normal
 // PollIntervalUnconfirmed cadence, while a confirmed node gets
 // PollIntervalGeneric.
+//
+// unconfirmedNode's FirstSeen is explicitly backdated past
+// NewNodeCheckpoint3 so this test continues to exercise the flat
+// steady-state PollIntervalUnconfirmed cadence in isolation from the new
+// age-based checkpoint schedule (see NewNodeCheckpoint1/2/3), which would
+// otherwise apply to a freshly-discovered node (age ~= 0).
 func TestPollIntervalUsesUnconfirmedCadenceForPlaceholderNodes(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -644,6 +650,7 @@ func TestPollIntervalUsesUnconfirmedCadenceForPlaceholderNodes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed unconfirmed node: %v", err)
 	}
+	unconfirmedNode.FirstSeen = time.Now().Add(-90 * time.Minute)
 	confirmedNode, err := store.UpsertConfirmedNode(ctx, "confirmed:1", []byte{0x01, 0x02}, storage.DiscoverySourceP2P)
 	if err != nil {
 		t.Fatalf("seed confirmed node: %v", err)
@@ -685,6 +692,12 @@ func recordHistory(t *testing.T, ctx context.Context, store storage.Store, nodeI
 // TestPollIntervalBacksOffLikelyDeadUnconfirmedNode covers scenario (a):
 // an unconfirmed node with 3+ consecutive failed probes and zero
 // successes is backed off to PollIntervalLikelyDead.
+//
+// node's FirstSeen is explicitly backdated past NewNodeCheckpoint3 so
+// this test exercises the likely-dead logic in isolation from the new
+// age-based checkpoint schedule — collectorLikelyDead is only ever
+// reachable once age >= NewNodeCheckpoint3 anyway (see pollInterval's doc
+// comment on the precedence rule).
 func TestPollIntervalBacksOffLikelyDeadUnconfirmedNode(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -693,6 +706,7 @@ func TestPollIntervalBacksOffLikelyDeadUnconfirmedNode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed node: %v", err)
 	}
+	node.FirstSeen = time.Now().Add(-90 * time.Minute)
 	recordHistory(t, ctx, store, node.ID, false, false, false)
 
 	c := New(Config{})
@@ -707,6 +721,10 @@ func TestPollIntervalBacksOffLikelyDeadUnconfirmedNode(t *testing.T) {
 // covers scenario (b): fewer than 3 history entries (even if all
 // failures) is not enough to conclude "likely dead", so the node stays
 // on the normal PollIntervalUnconfirmed cadence.
+//
+// Both nodes' FirstSeen are explicitly backdated past NewNodeCheckpoint3
+// so this test exercises the history-count logic in isolation from the
+// new age-based checkpoint schedule.
 func TestPollIntervalUnconfirmedNodeWithFewHistoryEntriesStaysUnconfirmed(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -715,12 +733,14 @@ func TestPollIntervalUnconfirmedNodeWithFewHistoryEntriesStaysUnconfirmed(t *tes
 	if err != nil {
 		t.Fatalf("seed node: %v", err)
 	}
+	oneFailure.FirstSeen = time.Now().Add(-90 * time.Minute)
 	recordHistory(t, ctx, store, oneFailure.ID, false)
 
 	twoFailures, err := store.UpsertDiscoveredNode(ctx, "two-failures:1", storage.DiscoverySourceP2P, nil, nil)
 	if err != nil {
 		t.Fatalf("seed node: %v", err)
 	}
+	twoFailures.FirstSeen = time.Now().Add(-90 * time.Minute)
 	recordHistory(t, ctx, store, twoFailures.ID, false, false)
 
 	c := New(Config{})
@@ -738,6 +758,10 @@ func TestPollIntervalUnconfirmedNodeWithFewHistoryEntriesStaysUnconfirmed(t *tes
 // scenario (c): 3+ history entries but at least one Reachable == true
 // means the node is not likely-dead, so it stays on
 // PollIntervalUnconfirmed.
+//
+// node's FirstSeen is explicitly backdated past NewNodeCheckpoint3 so
+// this test exercises the likely-dead logic in isolation from the new
+// age-based checkpoint schedule.
 func TestPollIntervalUnconfirmedNodeWithAnySuccessStaysUnconfirmed(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -746,6 +770,7 @@ func TestPollIntervalUnconfirmedNodeWithAnySuccessStaysUnconfirmed(t *testing.T)
 	if err != nil {
 		t.Fatalf("seed node: %v", err)
 	}
+	node.FirstSeen = time.Now().Add(-90 * time.Minute)
 	recordHistory(t, ctx, store, node.ID, false, true, false)
 
 	c := New(Config{})
@@ -799,6 +824,149 @@ func TestPollIntervalConfirmedPoolOwnedNodeUnaffectedByHistory(t *testing.T) {
 
 	if got := c.pollInterval(ctx, node); got != PollIntervalPoolOwned {
 		t.Errorf("pollInterval(confirmed, pool-owned, 3+ failures) = %v, want %v", got, PollIntervalPoolOwned)
+	}
+}
+
+// checkpointTolerance bounds how far off a checkpoint-schedule pollInterval
+// result is allowed to be from its expected "time remaining until the
+// checkpoint" value, to absorb test-execution wall-clock slop without
+// weakening the assertion that this is genuinely an age-based countdown
+// (not a flat interval).
+const checkpointTolerance = 30 * time.Second
+
+// TestPollIntervalEscalatingCheckpointForVeryNewNode covers scenario (a):
+// a brand-new unconfirmed node (age ~3min since FirstSeen), with no
+// history, gets a pollInterval landing at the ~15-minute-since-FirstSeen
+// mark (NewNodeCheckpoint1) -- i.e. ~12 minutes from now, NOT a flat 15
+// minutes.
+func TestPollIntervalEscalatingCheckpointForVeryNewNode(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	node, err := store.UpsertDiscoveredNode(ctx, "checkpoint1:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+	node.FirstSeen = time.Now().Add(-3 * time.Minute)
+
+	c := New(Config{})
+	c.Storage = store
+
+	want := NewNodeCheckpoint1 - 3*time.Minute // ~12 minutes
+	got := c.pollInterval(ctx, node)
+	if diff := got - want; diff < -checkpointTolerance || diff > checkpointTolerance {
+		t.Errorf("pollInterval(3min-old unconfirmed) = %v, want within %v of %v", got, checkpointTolerance, want)
+	}
+	if got >= PollIntervalUnconfirmed {
+		t.Errorf("pollInterval(3min-old unconfirmed) = %v, want less than flat PollIntervalUnconfirmed = %v", got, PollIntervalUnconfirmed)
+	}
+}
+
+// TestPollIntervalEscalatingCheckpointForModeratelyNewNode covers scenario
+// (b): an unconfirmed node aged ~20min since FirstSeen, with no/
+// insufficient history, gets a pollInterval landing at the
+// ~30-minute-since-FirstSeen mark (NewNodeCheckpoint2) -- i.e. ~10 minutes
+// from now.
+func TestPollIntervalEscalatingCheckpointForModeratelyNewNode(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	node, err := store.UpsertDiscoveredNode(ctx, "checkpoint2:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+	node.FirstSeen = time.Now().Add(-20 * time.Minute)
+
+	c := New(Config{})
+	c.Storage = store
+
+	want := NewNodeCheckpoint2 - 20*time.Minute // ~10 minutes
+	got := c.pollInterval(ctx, node)
+	if diff := got - want; diff < -checkpointTolerance || diff > checkpointTolerance {
+		t.Errorf("pollInterval(20min-old unconfirmed) = %v, want within %v of %v", got, checkpointTolerance, want)
+	}
+}
+
+// TestPollIntervalPastAllCheckpointsFallsBackToFlatUnconfirmed covers
+// scenario (c): a node aged past all 3 checkpoints (>= 60min since
+// FirstSeen) with fewer than 3 history entries falls through to the
+// existing flat PollIntervalUnconfirmed steady-state, not another
+// checkpoint calculation and not likely-dead.
+func TestPollIntervalPastAllCheckpointsFallsBackToFlatUnconfirmed(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	node, err := store.UpsertDiscoveredNode(ctx, "past-checkpoints-unconfirmed:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+	node.FirstSeen = time.Now().Add(-90 * time.Minute)
+	recordHistory(t, ctx, store, node.ID, false)
+
+	c := New(Config{})
+	c.Storage = store
+
+	if got := c.pollInterval(ctx, node); got != PollIntervalUnconfirmed {
+		t.Errorf("pollInterval(past checkpoints, 1 failure) = %v, want %v", got, PollIntervalUnconfirmed)
+	}
+}
+
+// TestPollIntervalPastAllCheckpointsFallsBackToLikelyDead covers scenario
+// (d): a node aged past all 3 checkpoints (>= 60min since FirstSeen) with
+// 3+ failed history entries and zero successes returns
+// PollIntervalLikelyDead -- confirming the prior commit's behavior still
+// works correctly once gated behind "past all 3 checkpoints".
+func TestPollIntervalPastAllCheckpointsFallsBackToLikelyDead(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	node, err := store.UpsertDiscoveredNode(ctx, "past-checkpoints-likely-dead:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+	node.FirstSeen = time.Now().Add(-90 * time.Minute)
+	recordHistory(t, ctx, store, node.ID, false, false, false)
+
+	c := New(Config{})
+	c.Storage = store
+
+	if got := c.pollInterval(ctx, node); got != PollIntervalLikelyDead {
+		t.Errorf("pollInterval(past checkpoints, 3+ failures) = %v, want %v", got, PollIntervalLikelyDead)
+	}
+}
+
+// TestPollIntervalCheckpointPrecedesLikelyDeadForVeryNewNode covers
+// scenario (e) and is a deliberate, confirmed precedence check: a node
+// well within its first checkpoint window (age ~10min since FirstSeen,
+// under NewNodeCheckpoint1's 15min) that ALREADY has 3+ failed history
+// entries (e.g. from aggressive early polling) must still get the
+// checkpoint-based duration, NOT PollIntervalLikelyDead. The age-based
+// checkpoint schedule takes priority over collectorLikelyDead for a
+// node's entire first hour -- collectorLikelyDead is simply never
+// consulted (GetNodeHistory is never even called) until age >=
+// NewNodeCheckpoint3. This is intentional per pollInterval's doc comment,
+// not an oversight.
+func TestPollIntervalCheckpointPrecedesLikelyDeadForVeryNewNode(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	node, err := store.UpsertDiscoveredNode(ctx, "very-new-but-failing:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+	node.FirstSeen = time.Now().Add(-10 * time.Minute)
+	recordHistory(t, ctx, store, node.ID, false, false, false)
+
+	c := New(Config{})
+	c.Storage = store
+
+	want := NewNodeCheckpoint1 - 10*time.Minute // ~5 minutes
+	got := c.pollInterval(ctx, node)
+	if got == PollIntervalLikelyDead {
+		t.Fatalf("pollInterval(10min-old unconfirmed, 3+ failures) = %v (PollIntervalLikelyDead), want checkpoint-based duration -- age-based checkpoints must take precedence over likely-dead for the first hour", got)
+	}
+	if diff := got - want; diff < -checkpointTolerance || diff > checkpointTolerance {
+		t.Errorf("pollInterval(10min-old unconfirmed, 3+ failures) = %v, want within %v of %v", got, checkpointTolerance, want)
 	}
 }
 

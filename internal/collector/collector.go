@@ -53,6 +53,28 @@ const PollIntervalUnconfirmed = 15 * time.Minute
 // rediscovered as reachable.
 const PollIntervalLikelyDead = 24 * time.Hour
 
+// NewNodeCheckpoint1, NewNodeCheckpoint2, and NewNodeCheckpoint3 are
+// AGE-SINCE-storage.Node.FirstSeen thresholds (NOT fixed retry counts, and
+// NOT offsets from each other/from "now") that make up an escalating
+// fast-checkpoint schedule for brand-new unconfirmed nodes
+// (Node.PublicKey == nil): such a node is polled at ~15min, then ~30min,
+// then ~60min after it was first seen, so that a real, live node gets a
+// few close-together chances to be directly probed (and thus confirmed)
+// soon after discovery, without polling so aggressively that it violates
+// node-politeness norms.
+//
+// A node graduates out of this schedule the instant it confirms
+// (PublicKey != nil) — see pollInterval's doc comment, this happens by
+// construction with no extra code needed. A node that is still
+// unconfirmed once all three checkpoints have elapsed (age >=
+// NewNodeCheckpoint3) falls back to the existing
+// PollIntervalLikelyDead/PollIntervalUnconfirmed logic, unchanged.
+const (
+	NewNodeCheckpoint1 = 15 * time.Minute
+	NewNodeCheckpoint2 = 30 * time.Minute
+	NewNodeCheckpoint3 = 60 * time.Minute
+)
+
 // DiscoveryIntervalGeneric is the minimum interval between discovery-walk
 // dials of an already-known generic node. Enforced for the same
 // politeness reasons as PollIntervalGeneric.
@@ -558,21 +580,56 @@ func collectorLikelyDead(history []storage.HealthCheck) bool {
 // pollInterval returns the poll cadence for n based on whether it is an
 // unconfirmed placeholder node or tagged pool-owned.
 //
-// Unconfirmed placeholder nodes (n.PublicKey == nil) are additionally
-// checked against collectorLikelyDead: an unconfirmed node with 3+
-// consecutive failed probes and zero successes is backed off to
-// PollIntervalLikelyDead instead of the normal PollIntervalUnconfirmed
-// cadence (see PollIntervalLikelyDead's doc comment for the rationale).
-// On a GetNodeHistory error, this falls back to PollIntervalUnconfirmed
-// (fail safe: a transient DB error must not over-penalize a node's poll
-// cadence) and logs the error.
+// Unconfirmed placeholder nodes (n.PublicKey == nil) go through an
+// escalating age-based checkpoint schedule BEFORE the likely-dead check
+// is ever consulted:
 //
-// Confirmed nodes (n.PublicKey != nil) are completely unaffected by this
-// heuristic: GetNodeHistory is never called for them, and their cadence
+//   - age < NewNodeCheckpoint1 (15min since n.FirstSeen): next poll lands
+//     at the 15min mark.
+//   - age < NewNodeCheckpoint2 (30min): next poll lands at the 30min mark.
+//   - age < NewNodeCheckpoint3 (60min): next poll lands at the 60min mark.
+//   - age >= NewNodeCheckpoint3: falls through to the existing
+//     collectorLikelyDead-gated logic below.
+//
+// IMPORTANT, DELIBERATE PRECEDENCE RULE: the age-based checkpoint
+// schedule is checked FIRST and takes priority over collectorLikelyDead
+// for a node's first hour, even if that node already has 3+ failed probes
+// in its history. That is, a node younger than NewNodeCheckpoint3 never
+// gets PollIntervalLikelyDead, no matter how many times it has failed —
+// it stays on the checkpoint schedule until the full hour has elapsed.
+// This is intentional (confirmed with stakeholders), not an oversight: a
+// brand-new node deserves its full run of close-together checkpoint
+// probes before being written off as likely-dead. collectorLikelyDead is
+// only ever consulted once age >= NewNodeCheckpoint3, i.e. once all three
+// checkpoints have passed while the node is still unconfirmed.
+//
+// Once past all three checkpoints, an unconfirmed node is checked against
+// collectorLikelyDead exactly as before: 3+ consecutive failed probes
+// with zero successes backs it off to PollIntervalLikelyDead instead of
+// the normal PollIntervalUnconfirmed cadence (see PollIntervalLikelyDead's
+// doc comment for the rationale). On a GetNodeHistory error, this falls
+// back to PollIntervalUnconfirmed (fail safe: a transient DB error must
+// not over-penalize a node's poll cadence) and logs the error.
+//
+// Confirmed nodes (n.PublicKey != nil) are completely unaffected by any of
+// the above: neither the checkpoint schedule nor GetNodeHistory/
+// collectorLikelyDead is ever consulted for them — a node graduates out
+// of both the instant it confirms, by construction, since that flips it
+// onto this else branch on the very next pollInterval call. Their cadence
 // is exactly isPoolOwned's PollIntervalPoolOwned / PollIntervalGeneric
 // choice, as before.
 func (c *Collector) pollInterval(ctx context.Context, n storage.Node) time.Duration {
 	if n.PublicKey == nil {
+		age := time.Since(n.FirstSeen)
+		switch {
+		case age < NewNodeCheckpoint1:
+			return NewNodeCheckpoint1 - age
+		case age < NewNodeCheckpoint2:
+			return NewNodeCheckpoint2 - age
+		case age < NewNodeCheckpoint3:
+			return NewNodeCheckpoint3 - age
+		}
+
 		history, err := c.Storage.GetNodeHistory(ctx, n.ID, 3)
 		if err != nil {
 			log.Printf("collector: get node history for %s: %v", n.Address, err)
