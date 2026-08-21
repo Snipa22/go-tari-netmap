@@ -11,6 +11,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/google/uuid"
+
 	"github.com/Snipa22/go-tari-netmap/internal/storage"
 )
 
@@ -615,31 +617,188 @@ func TestPollNilP2PClientSkipsP2PProbe(t *testing.T) {
 }
 
 func TestPollIntervalUsesPoolOwnedCadence(t *testing.T) {
+	ctx := context.Background()
 	poolOwned := storage.Node{PublicKey: []byte{0x01, 0x02}, Tags: map[string]any{"pool_owned": true}}
 	regular := storage.Node{PublicKey: []byte{0x03, 0x04}, Tags: map[string]any{}}
 
 	c := New(Config{})
-	if got := c.pollInterval(poolOwned); got != PollIntervalPoolOwned {
+	if got := c.pollInterval(ctx, poolOwned); got != PollIntervalPoolOwned {
 		t.Errorf("pollInterval(pool-owned) = %v, want %v", got, PollIntervalPoolOwned)
 	}
-	if got := c.pollInterval(regular); got != PollIntervalGeneric {
+	if got := c.pollInterval(ctx, regular); got != PollIntervalGeneric {
 		t.Errorf("pollInterval(regular) = %v, want %v", got, PollIntervalGeneric)
 	}
 }
 
+// TestPollIntervalUsesUnconfirmedCadenceForPlaceholderNodes covers
+// scenario (d): an unconfirmed placeholder node with zero history is not
+// (and cannot be) likely-dead — collectorLikelyDead needs 3+ history
+// entries to conclude anything — so it still gets the normal
+// PollIntervalUnconfirmed cadence, while a confirmed node gets
+// PollIntervalGeneric.
 func TestPollIntervalUsesUnconfirmedCadenceForPlaceholderNodes(t *testing.T) {
-	unconfirmed := storage.Node{PublicKey: nil, Tags: map[string]any{}}
-	confirmed := storage.Node{PublicKey: []byte{0x01, 0x02}, Tags: map[string]any{}}
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	unconfirmedNode, err := store.UpsertDiscoveredNode(ctx, "unconfirmed:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("seed unconfirmed node: %v", err)
+	}
+	confirmedNode, err := store.UpsertConfirmedNode(ctx, "confirmed:1", []byte{0x01, 0x02}, storage.DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("seed confirmed node: %v", err)
+	}
 
 	c := New(Config{})
-	if got := c.pollInterval(unconfirmed); got != PollIntervalUnconfirmed {
-		t.Errorf("pollInterval(unconfirmed) = %v, want %v", got, PollIntervalUnconfirmed)
+	c.Storage = store
+
+	if got := c.pollInterval(ctx, unconfirmedNode); got != PollIntervalUnconfirmed {
+		t.Errorf("pollInterval(unconfirmed, no history) = %v, want %v", got, PollIntervalUnconfirmed)
 	}
-	if got := c.pollInterval(confirmed); got != PollIntervalGeneric {
+	if got := c.pollInterval(ctx, confirmedNode); got != PollIntervalGeneric {
 		t.Errorf("pollInterval(confirmed) = %v, want %v", got, PollIntervalGeneric)
 	}
 	if PollIntervalUnconfirmed >= PollIntervalGeneric {
 		t.Errorf("PollIntervalUnconfirmed = %v, want shorter than PollIntervalGeneric = %v", PollIntervalUnconfirmed, PollIntervalGeneric)
+	}
+}
+
+// recordHistory records n health checks for nodeID, in order, with
+// reachable taken from the given sequence (recorded oldest-first so that
+// GetNodeHistory's newest-first ordering matches reachable's order
+// reversed — callers here only care about the aggregate
+// collectorLikelyDead result, which is order-independent, so this detail
+// doesn't otherwise matter).
+func recordHistory(t *testing.T, ctx context.Context, store storage.Store, nodeID uuid.UUID, reachable ...bool) {
+	t.Helper()
+	for _, r := range reachable {
+		if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{
+			NodeID:      nodeID,
+			Reachable:   r,
+			ProbeSource: storage.ProbeSourceGRPC,
+		}); err != nil {
+			t.Fatalf("record health check: %v", err)
+		}
+	}
+}
+
+// TestPollIntervalBacksOffLikelyDeadUnconfirmedNode covers scenario (a):
+// an unconfirmed node with 3+ consecutive failed probes and zero
+// successes is backed off to PollIntervalLikelyDead.
+func TestPollIntervalBacksOffLikelyDeadUnconfirmedNode(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	node, err := store.UpsertDiscoveredNode(ctx, "likely-dead:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+	recordHistory(t, ctx, store, node.ID, false, false, false)
+
+	c := New(Config{})
+	c.Storage = store
+
+	if got := c.pollInterval(ctx, node); got != PollIntervalLikelyDead {
+		t.Errorf("pollInterval(likely-dead unconfirmed) = %v, want %v", got, PollIntervalLikelyDead)
+	}
+}
+
+// TestPollIntervalUnconfirmedNodeWithFewHistoryEntriesStaysUnconfirmed
+// covers scenario (b): fewer than 3 history entries (even if all
+// failures) is not enough to conclude "likely dead", so the node stays
+// on the normal PollIntervalUnconfirmed cadence.
+func TestPollIntervalUnconfirmedNodeWithFewHistoryEntriesStaysUnconfirmed(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	oneFailure, err := store.UpsertDiscoveredNode(ctx, "one-failure:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+	recordHistory(t, ctx, store, oneFailure.ID, false)
+
+	twoFailures, err := store.UpsertDiscoveredNode(ctx, "two-failures:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+	recordHistory(t, ctx, store, twoFailures.ID, false, false)
+
+	c := New(Config{})
+	c.Storage = store
+
+	if got := c.pollInterval(ctx, oneFailure); got != PollIntervalUnconfirmed {
+		t.Errorf("pollInterval(1 failure) = %v, want %v", got, PollIntervalUnconfirmed)
+	}
+	if got := c.pollInterval(ctx, twoFailures); got != PollIntervalUnconfirmed {
+		t.Errorf("pollInterval(2 failures) = %v, want %v", got, PollIntervalUnconfirmed)
+	}
+}
+
+// TestPollIntervalUnconfirmedNodeWithAnySuccessStaysUnconfirmed covers
+// scenario (c): 3+ history entries but at least one Reachable == true
+// means the node is not likely-dead, so it stays on
+// PollIntervalUnconfirmed.
+func TestPollIntervalUnconfirmedNodeWithAnySuccessStaysUnconfirmed(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	node, err := store.UpsertDiscoveredNode(ctx, "mixed-history:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+	recordHistory(t, ctx, store, node.ID, false, true, false)
+
+	c := New(Config{})
+	c.Storage = store
+
+	if got := c.pollInterval(ctx, node); got != PollIntervalUnconfirmed {
+		t.Errorf("pollInterval(mixed history, unconfirmed) = %v, want %v", got, PollIntervalUnconfirmed)
+	}
+}
+
+// TestPollIntervalConfirmedNodeUnaffectedByHistory covers scenario (e): a
+// confirmed, non-pool-owned node with 3+ failed history entries (which
+// would satisfy collectorLikelyDead if it were checked) still gets
+// PollIntervalGeneric — confirmed nodes are never subject to the
+// likely-dead backoff at all, and GetNodeHistory must not even be called
+// for them.
+func TestPollIntervalConfirmedNodeUnaffectedByHistory(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	node, err := store.UpsertConfirmedNode(ctx, "confirmed-dead-history:1", []byte{0x05, 0x06}, storage.DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+	recordHistory(t, ctx, store, node.ID, false, false, false)
+
+	c := New(Config{})
+	c.Storage = store
+
+	if got := c.pollInterval(ctx, node); got != PollIntervalGeneric {
+		t.Errorf("pollInterval(confirmed, 3+ failures) = %v, want %v (confirmed nodes must be unaffected)", got, PollIntervalGeneric)
+	}
+}
+
+// TestPollIntervalConfirmedPoolOwnedNodeUnaffectedByHistory covers
+// scenario (f): a confirmed, pool-owned node still returns
+// PollIntervalPoolOwned regardless of its history.
+func TestPollIntervalConfirmedPoolOwnedNodeUnaffectedByHistory(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	node, err := store.UpsertConfirmedNode(ctx, "pool-owned-dead-history:1", []byte{0x07, 0x08}, storage.DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+	node.Tags = map[string]any{"pool_owned": true}
+	recordHistory(t, ctx, store, node.ID, false, false, false)
+
+	c := New(Config{})
+	c.Storage = store
+
+	if got := c.pollInterval(ctx, node); got != PollIntervalPoolOwned {
+		t.Errorf("pollInterval(confirmed, pool-owned, 3+ failures) = %v, want %v", got, PollIntervalPoolOwned)
 	}
 }
 

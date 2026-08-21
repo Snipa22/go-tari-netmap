@@ -40,6 +40,19 @@ const PollIntervalPoolOwned = 5 * time.Minute
 // node-politeness norms.
 const PollIntervalUnconfirmed = 15 * time.Minute
 
+// PollIntervalLikelyDead is the poll interval for unconfirmed placeholder
+// nodes (Node.PublicKey == nil) that have failed 3+ consecutive probes
+// with zero successes — "likely dead" per the same heuristic as web.go's
+// computeLikelyDead (see collectorLikelyDead in this file). Such nodes are
+// checked on roughly daily instead of every PollIntervalUnconfirmed,
+// since they are overwhelmingly likely to be permanently-gone gossip
+// ghosts: Tari's gossip protocol has no upstream expiry mechanism, so a
+// peer-walk keeps re-reporting addresses of nodes that will never come
+// back. This is a backoff, not a permanent skip — a genuinely revived
+// node is still polled, just less often, so it will eventually be
+// rediscovered as reachable.
+const PollIntervalLikelyDead = 24 * time.Hour
+
 // DiscoveryIntervalGeneric is the minimum interval between discovery-walk
 // dials of an already-known generic node. Enforced for the same
 // politeness reasons as PollIntervalGeneric.
@@ -428,7 +441,7 @@ func (c *Collector) Poll(ctx context.Context) error {
 		if !c.due(n.Address, now) {
 			continue
 		}
-		c.setNextPoll(n.Address, now.Add(c.pollInterval(n)))
+		c.setNextPoll(n.Address, now.Add(c.pollInterval(ctx, n)))
 		if jitter := c.dialJitter(); jitter > 0 {
 			time.Sleep(jitter)
 		}
@@ -523,10 +536,51 @@ func pollOnceWithSource(ctx context.Context, client NodeClient, store storage.St
 	})
 }
 
+// collectorLikelyDead mirrors web.go's computeLikelyDead (see
+// internal/web/web.go) -- same "3+ probes, zero successes" heuristic --
+// duplicated here rather than imported because internal/collector must
+// not import internal/web (wrong direction in the package dependency
+// graph: web depends on collector's types/behavior, not vice versa).
+// Keep this in sync with computeLikelyDead if that heuristic ever
+// changes.
+func collectorLikelyDead(history []storage.HealthCheck) bool {
+	if len(history) < 3 {
+		return false
+	}
+	for _, h := range history {
+		if h.Reachable {
+			return false
+		}
+	}
+	return true
+}
+
 // pollInterval returns the poll cadence for n based on whether it is an
 // unconfirmed placeholder node or tagged pool-owned.
-func (c *Collector) pollInterval(n storage.Node) time.Duration {
+//
+// Unconfirmed placeholder nodes (n.PublicKey == nil) are additionally
+// checked against collectorLikelyDead: an unconfirmed node with 3+
+// consecutive failed probes and zero successes is backed off to
+// PollIntervalLikelyDead instead of the normal PollIntervalUnconfirmed
+// cadence (see PollIntervalLikelyDead's doc comment for the rationale).
+// On a GetNodeHistory error, this falls back to PollIntervalUnconfirmed
+// (fail safe: a transient DB error must not over-penalize a node's poll
+// cadence) and logs the error.
+//
+// Confirmed nodes (n.PublicKey != nil) are completely unaffected by this
+// heuristic: GetNodeHistory is never called for them, and their cadence
+// is exactly isPoolOwned's PollIntervalPoolOwned / PollIntervalGeneric
+// choice, as before.
+func (c *Collector) pollInterval(ctx context.Context, n storage.Node) time.Duration {
 	if n.PublicKey == nil {
+		history, err := c.Storage.GetNodeHistory(ctx, n.ID, 3)
+		if err != nil {
+			log.Printf("collector: get node history for %s: %v", n.Address, err)
+			return PollIntervalUnconfirmed
+		}
+		if collectorLikelyDead(history) {
+			return PollIntervalLikelyDead
+		}
 		return PollIntervalUnconfirmed
 	}
 	if isPoolOwned(n) {
