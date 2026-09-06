@@ -81,15 +81,27 @@ type p2pNodeClient struct {
 	// probeChainMetadata/probeGetPeers, for the same reason (reaching
 	// onion peers) — see GetInfo's doc comment.
 	socksProxyAddr string
+
+	// networkByte is passed through to probeChainMetadata/probeGetPeers/
+	// probeIdentity via p2p.ProbeOptions.NetworkByte, selecting which
+	// Tari network's wire protocol byte this client's P2P handshakes
+	// advertise (e.g. MainNet vs a testnet like Esmeralda). The zero
+	// value is p2p.NetworkByteMainNet (0x00), preserving the exact
+	// pre-existing zero-config behavior for any caller (existing or
+	// future) that doesn't set it explicitly — see
+	// NewP2PClient/NewP2PClientWithOptions.
+	networkByte byte
 }
 
 // NewP2PClient returns a NodeClient backed by real go-tari-lib/p2p calls
 // against Tari nodes over the comms/RPC-over-P2P transport. It takes no
 // required args: each method probes the addr passed to it, per-call. The
-// returned client dials directly (no SOCKS proxy) — see
-// NewP2PClientWithSocksProxy for `.onion` peer support.
+// returned client dials directly (no SOCKS proxy) and targets MainNet
+// (p2p.NetworkByteMainNet) — see NewP2PClientWithSocksProxy for `.onion`
+// peer support, or NewP2PClientWithOptions to target a different Tari
+// network (e.g. a testnet).
 func NewP2PClient() NodeClient {
-	return &p2pNodeClient{probes: realP2PProbeFuncs{}}
+	return NewP2PClientWithOptions("", p2p.NetworkByteMainNet)
 }
 
 // NewP2PClientWithSocksProxy returns a NodeClient identical to
@@ -100,7 +112,18 @@ func NewP2PClient() NodeClient {
 // non-`.onion` addresses — see p2p.ProbeOptions's doc comment in
 // go-tari-lib.
 func NewP2PClientWithSocksProxy(proxyAddr string) NodeClient {
-	return &p2pNodeClient{probes: realP2PProbeFuncs{}, socksProxyAddr: proxyAddr}
+	return NewP2PClientWithOptions(proxyAddr, p2p.NetworkByteMainNet)
+}
+
+// NewP2PClientWithOptions returns a NodeClient identical to
+// NewP2PClient's/NewP2PClientWithSocksProxy's, additionally letting the
+// caller pick which Tari network's peers this client will successfully
+// probe, via networkByte — a p2p.ProbeOptions.NetworkByte value (e.g.
+// p2p.NetworkByteMainNet, p2p.NetworkByteEsmeralda, etc. — the named
+// constants live in go-tari-lib's p2p package). socksProxyAddr behaves
+// exactly as in NewP2PClientWithSocksProxy (pass "" to dial directly).
+func NewP2PClientWithOptions(socksProxyAddr string, networkByte byte) NodeClient {
+	return &p2pNodeClient{probes: realP2PProbeFuncs{}, socksProxyAddr: socksProxyAddr, networkByte: networkByte}
 }
 
 // GetInfo implements NodeClient.
@@ -139,7 +162,7 @@ func (c *p2pNodeClient) GetInfo(ctx context.Context, addr string) (NodeInfo, err
 	ctx, cancel := context.WithTimeout(ctx, p2pDialTimeout)
 	defer cancel()
 
-	meta, err := c.probes.probeChainMetadata(ctx, addr, p2p.ProbeOptions{SocksProxyAddr: c.socksProxyAddr})
+	meta, err := c.probes.probeChainMetadata(ctx, addr, p2p.ProbeOptions{SocksProxyAddr: c.socksProxyAddr, NetworkByte: c.networkByte})
 	if err != nil {
 		return NodeInfo{}, fmt.Errorf("p2p ProbeChainMetadata %s: %w", addr, err)
 	}
@@ -148,7 +171,7 @@ func (c *p2pNodeClient) GetInfo(ctx context.Context, addr string) (NodeInfo, err
 		Reachable: true,
 	}
 
-	if peerInfo, err := c.probes.probeIdentity(ctx, addr, p2p.ProbeOptions{SocksProxyAddr: c.socksProxyAddr}); err != nil {
+	if peerInfo, err := c.probes.probeIdentity(ctx, addr, p2p.ProbeOptions{SocksProxyAddr: c.socksProxyAddr, NetworkByte: c.networkByte}); err != nil {
 		log.Printf("p2p GetInfo %s: probeIdentity failed (non-fatal, PublicKey left nil): %v", addr, err)
 	} else {
 		info.PublicKey = peerInfo.RemoteStaticPubKey
@@ -186,7 +209,7 @@ func (c *p2pNodeClient) GetPeers(ctx context.Context, addr string) ([]Discovered
 	ctx, cancel := context.WithTimeout(ctx, p2pDialTimeout)
 	defer cancel()
 
-	peers, err := c.probes.probeGetPeers(ctx, addr, p2p.DefaultGetPeersRequest(), p2p.ProbeOptions{SocksProxyAddr: c.socksProxyAddr})
+	peers, err := c.probes.probeGetPeers(ctx, addr, p2p.DefaultGetPeersRequest(), p2p.ProbeOptions{SocksProxyAddr: c.socksProxyAddr, NetworkByte: c.networkByte})
 	if err != nil {
 		return nil, fmt.Errorf("p2p ProbeGetPeers %s: %w", addr, err)
 	}
