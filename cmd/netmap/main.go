@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -54,12 +55,23 @@ func main() {
 	// 127.0.0.1:9050), used to reach `.onion` Tari peers over this
 	// transport. Empty/unset (the default) disables it, matching the
 	// pre-existing zero-config behavior.
-	var p2pClient collector.NodeClient
-	if socksProxyAddr := os.Getenv("NETMAP_SOCKS_PROXY_ADDR"); socksProxyAddr != "" {
-		p2pClient = collector.NewP2PClientWithSocksProxy(socksProxyAddr)
-	} else {
-		p2pClient = collector.NewP2PClient()
+	socksProxyAddr := os.Getenv("NETMAP_SOCKS_PROXY_ADDR")
+
+	// NETMAP_NETWORK_BYTE is a decimal string representation of the raw
+	// Tari P2P wire network byte (e.g. "0" for MainNet, "38" for
+	// Esmeralda since p2p.NetworkByteEsmeralda = 0x26 = 38 decimal),
+	// letting a second deployed instance of this binary monitor a
+	// different Tari network's peers. Empty/unset (the default) selects
+	// MainNet (0x00), matching the pre-existing zero-config behavior.
+	var networkByte byte
+	if v := os.Getenv("NETMAP_NETWORK_BYTE"); v != "" {
+		n, err := strconv.ParseUint(v, 10, 8)
+		if err != nil {
+			log.Fatalf("invalid NETMAP_NETWORK_BYTE %q: %v", v, err)
+		}
+		networkByte = byte(n)
 	}
+	p2pClient := collector.NewP2PClientWithOptions(socksProxyAddr, networkByte)
 
 	c := collector.New(collector.Config{
 		SeedNodes: parseSeedNodes(os.Getenv("NETMAP_SEED_NODES")),

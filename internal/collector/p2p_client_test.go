@@ -284,6 +284,9 @@ func TestNewP2PClientReturnsRealProbes(t *testing.T) {
 	if client.socksProxyAddr != "" {
 		t.Errorf("NewP2PClient().socksProxyAddr = %q, want \"\"", client.socksProxyAddr)
 	}
+	if client.networkByte != p2p.NetworkByteMainNet {
+		t.Errorf("NewP2PClient().networkByte = %v, want p2p.NetworkByteMainNet (%v)", client.networkByte, p2p.NetworkByteMainNet)
+	}
 }
 
 // TestNewP2PClientWithSocksProxyReturnsRealProbes mirrors
@@ -365,5 +368,78 @@ func TestP2PClientPassesThroughSocksProxyAddr(t *testing.T) {
 	}
 	if fake.lastIdentityOpts.SocksProxyAddr != proxyAddr {
 		t.Errorf("lastIdentityOpts.SocksProxyAddr = %q, want %q", fake.lastIdentityOpts.SocksProxyAddr, proxyAddr)
+	}
+}
+
+// TestNewP2PClientWithOptionsReturnsRealProbes verifies that
+// NewP2PClientWithOptions stores both the given socksProxyAddr and
+// networkByte on the returned client, mirroring
+// TestNewP2PClientWithSocksProxyReturnsRealProbes.
+func TestNewP2PClientWithOptionsReturnsRealProbes(t *testing.T) {
+	client, ok := NewP2PClientWithOptions("127.0.0.1:9050", p2p.NetworkByteEsmeralda).(*p2pNodeClient)
+	if !ok {
+		t.Fatalf("NewP2PClientWithOptions(...) = %T, want *p2pNodeClient", NewP2PClientWithOptions("127.0.0.1:9050", p2p.NetworkByteEsmeralda))
+	}
+	if _, ok := client.probes.(realP2PProbeFuncs); !ok {
+		t.Errorf("NewP2PClientWithOptions(...).probes = %T, want realP2PProbeFuncs", client.probes)
+	}
+	if client.socksProxyAddr != "127.0.0.1:9050" {
+		t.Errorf("NewP2PClientWithOptions(...).socksProxyAddr = %q, want %q", client.socksProxyAddr, "127.0.0.1:9050")
+	}
+	if client.networkByte != p2p.NetworkByteEsmeralda {
+		t.Errorf("NewP2PClientWithOptions(...).networkByte = %v, want %v", client.networkByte, p2p.NetworkByteEsmeralda)
+	}
+}
+
+// TestP2PClientGetInfoPassesThroughNetworkByte verifies that a
+// p2pNodeClient constructed with a non-default networkByte passes that
+// same byte through in the p2p.ProbeOptions given to both
+// probeChainMetadata and probeIdentity during GetInfo.
+func TestP2PClientGetInfoPassesThroughNetworkByte(t *testing.T) {
+	fake := &fakeP2PProbeFuncs{
+		chainMetadata: &p2p.ChainMetadataInfo{},
+		identity:      &p2p.PeerInfo{},
+	}
+	client, ok := NewP2PClientWithOptions("", p2p.NetworkByteEsmeralda).(*p2pNodeClient)
+	if !ok {
+		t.Fatalf("NewP2PClientWithOptions(...) = %T, want *p2pNodeClient", NewP2PClientWithOptions("", p2p.NetworkByteEsmeralda))
+	}
+	client.probes = fake
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if _, err := client.GetInfo(ctx, "127.0.0.1:18189"); err != nil {
+		t.Fatalf("GetInfo: %v", err)
+	}
+
+	if fake.lastChainMetadataOpts.NetworkByte != p2p.NetworkByteEsmeralda {
+		t.Errorf("lastChainMetadataOpts.NetworkByte = %v, want %v", fake.lastChainMetadataOpts.NetworkByte, p2p.NetworkByteEsmeralda)
+	}
+	if fake.lastIdentityOpts.NetworkByte != p2p.NetworkByteEsmeralda {
+		t.Errorf("lastIdentityOpts.NetworkByte = %v, want %v", fake.lastIdentityOpts.NetworkByte, p2p.NetworkByteEsmeralda)
+	}
+}
+
+// TestP2PClientGetPeersPassesThroughNetworkByte mirrors
+// TestP2PClientGetInfoPassesThroughNetworkByte for GetPeers/
+// probeGetPeers.
+func TestP2PClientGetPeersPassesThroughNetworkByte(t *testing.T) {
+	fake := &fakeP2PProbeFuncs{}
+	client, ok := NewP2PClientWithOptions("", p2p.NetworkByteEsmeralda).(*p2pNodeClient)
+	if !ok {
+		t.Fatalf("NewP2PClientWithOptions(...) = %T, want *p2pNodeClient", NewP2PClientWithOptions("", p2p.NetworkByteEsmeralda))
+	}
+	client.probes = fake
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if _, err := client.GetPeers(ctx, "127.0.0.1:18189"); err != nil {
+		t.Fatalf("GetPeers: %v", err)
+	}
+
+	if fake.lastGetPeersOpts.NetworkByte != p2p.NetworkByteEsmeralda {
+		t.Errorf("lastGetPeersOpts.NetworkByte = %v, want %v", fake.lastGetPeersOpts.NetworkByte, p2p.NetworkByteEsmeralda)
 	}
 }

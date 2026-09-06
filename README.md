@@ -44,6 +44,10 @@ implementation is a one-function change.
 - `NETMAP_DATABASE_URL` — Postgres DSN. Defaults to `postgres://localhost:5432/netmap` if unset.
 - `NETMAP_SEED_NODES` — comma-separated list of seed node addresses for peer-graph discovery.
   Defaults to empty (no discovery until seeds are configured).
+- `NETMAP_NETWORK_BYTE` — decimal string of the raw Tari P2P wire network byte. Defaults to
+  MainNet (0) if unset/empty. Example: Esmeralda testnet = 38 (0x26 hex). This is what lets a
+  second deployed instance of this binary monitor Esmeralda testnet peers instead of Mainnet
+  peers.
 
 ## Development
 
