@@ -75,9 +75,10 @@ func main() {
 
 	c := collector.New(collector.Config{
 		SeedNodes: parseSeedNodes(os.Getenv("NETMAP_SEED_NODES")),
-		// 500ms between per-node dials within a single Discover/Poll
-		// pass, so we don't hammer many different nodes in rapid
-		// succession even though the overall pass frequency is polite.
+		// 500ms between per-node dials within a single Discover/
+		// PollConfirmed/PollUnconfirmed pass, so we don't hammer many
+		// different nodes in rapid succession even though the overall
+		// pass frequency is polite.
 		// The collector package itself defaults DialJitter to zero (no
 		// delay) so its own tests stay fast and deterministic; this
 		// production default is set here instead — see

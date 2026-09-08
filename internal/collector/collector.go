@@ -167,11 +167,11 @@ type Config struct {
 	SeedNodes []string
 
 	// DialJitter is the delay inserted before each per-node dial within a
-	// single Discover or Poll pass (only immediately before a dial that's
-	// actually about to happen — nodes skipped by a due()/dueForDiscovery
-	// cooldown check don't incur it), to avoid hammering many different
-	// nodes in rapid succession even when overall pass frequency is
-	// polite.
+	// single Discover, PollConfirmed, or PollUnconfirmed pass (only
+	// immediately before a dial that's actually about to happen — nodes
+	// skipped by a due()/dueForDiscovery cooldown check don't incur it),
+	// to avoid hammering many different nodes in rapid succession even
+	// when overall pass frequency is polite.
 	//
 	// Zero (the Go zero value, and thus the default for any Collector
 	// that doesn't set this explicitly, including every existing test in
@@ -193,28 +193,47 @@ type Collector struct {
 
 	// GRPCClient talks to Tari base nodes over go-tari-grpc-lib's gRPC
 	// BaseNode service. Optional/nilable: if nil, the gRPC probe is
-	// skipped entirely for both Discover and Poll, rather than erroring.
+	// skipped entirely for Discover, PollConfirmed, and PollUnconfirmed,
+	// rather than erroring.
 	GRPCClient NodeClient
 
 	// P2PClient talks to Tari nodes over go-tari-lib/p2p's direct
 	// comms/RPC-over-P2P transport. Optional/nilable: if nil, the P2P
-	// probe is skipped entirely for both Discover and Poll, rather than
-	// erroring. A Collector with only one of GRPCClient/P2PClient set
-	// still works correctly, just without data from the other transport.
+	// probe is skipped entirely for Discover, PollConfirmed, and
+	// PollUnconfirmed, rather than erroring. A Collector with only one
+	// of GRPCClient/P2PClient set still works correctly, just without
+	// data from the other transport.
 	P2PClient NodeClient
 
-	// TickInterval governs both how often Run checks which known nodes
-	// are due for a poll, and how often Run kicks off a fresh discovery
-	// pass. The two run on independent tickers/goroutines (see Run) but
-	// share this same cadence value for simplicity — there's no need for
-	// separate configuration since a discovery pass that's still running
-	// when its next tick fires simply doesn't overlap with itself (Run
-	// waits for the previous Discover call to return before scheduling
-	// off the next tick), and the same is true for Poll. Defaults to
-	// defaultTickInterval if unset. Kept short and independent of the
-	// (much longer) per-node poll cadence so tests don't need to wait an
-	// hour for anything.
+	// TickInterval governs how often Run checks which known confirmed
+	// nodes are due for a poll, and how often Run kicks off a fresh
+	// discovery pass. These run on independent tickers/goroutines (see
+	// Run) but share this same cadence value for simplicity — there's
+	// no need for separate configuration since a discovery pass that's
+	// still running when its next tick fires simply doesn't overlap
+	// with itself (Run waits for the previous Discover call to return
+	// before scheduling off the next tick), and the same is true for
+	// PollConfirmed. Defaults to defaultTickInterval if unset. Kept
+	// short and independent of the (much longer) per-node poll cadence
+	// so tests don't need to wait an hour for anything.
+	//
+	// The unconfirmed-node poll loop (see UnconfirmedTickInterval) is
+	// deliberately NOT governed by this field — it is fully independent
+	// so that unconfirmed-node volume/backlog can never affect the
+	// confirmed loop's cadence, and vice versa.
 	TickInterval time.Duration
+
+	// UnconfirmedTickInterval governs how often Run checks which known
+	// unconfirmed placeholder nodes (Node.PublicKey == nil) are due for
+	// a poll, mirroring TickInterval but for the separate, explicitly
+	// lower-priority unconfirmed poll loop (see runUnconfirmedPollLoop).
+	// Optional: defaults to the same effective tick as TickInterval
+	// (itself defaulting to defaultTickInterval) when left unset/<= 0,
+	// so existing callers that don't care about tuning the two loops'
+	// cadences independently see no behavior change. Set this
+	// explicitly only if the unconfirmed loop's cadence needs to differ
+	// from the confirmed loop's.
+	UnconfirmedTickInterval time.Duration
 
 	mu            sync.Mutex
 	nextPoll      map[string]time.Time // address -> next poll due time
@@ -225,8 +244,8 @@ type Collector struct {
 // P2PClient are left nil (network calls are opt-in): set Storage
 // (required) and at least one of GRPCClient/P2PClient (recommended, but
 // not required — a Collector with neither set just does nothing on
-// Discover/Poll rather than panicking) before calling Run, Discover, or
-// Poll.
+// Discover/PollConfirmed/PollUnconfirmed rather than panicking) before
+// calling Run, Discover, PollConfirmed, or PollUnconfirmed.
 func New(cfg Config) *Collector {
 	return &Collector{
 		cfg:           cfg,
@@ -235,29 +254,49 @@ func New(cfg Config) *Collector {
 	}
 }
 
-// Run starts the collector's discovery and poll loops. Discovery and
-// polling run on independent goroutines/tickers so that a slow or
-// never-ending Discover pass (a synchronous BFS over the real peer graph,
-// with real network dials — this can take minutes against the real
-// mainnet, or longer as the network grows) cannot starve Poll, which is
-// what actually produces the health-check data the rest of this tool is
-// for. Both goroutines share Storage and the NodeClients, and both
-// observe ctx cancellation independently. Run blocks until both have
+// Run starts the collector's discovery and poll loops. Discovery, the
+// confirmed-node poll loop, and the unconfirmed-node poll loop each run
+// on their own independent goroutine/ticker so that none can starve
+// another:
+//
+//   - a slow or never-ending Discover pass (a synchronous BFS over the
+//     real peer graph, with real network dials — this can take minutes
+//     against the real mainnet, or longer as the network grows) cannot
+//     starve either poll loop, which is what actually produces the
+//     health-check data the rest of this tool is for.
+//   - the unconfirmed-node poll loop (PollUnconfirmed) cannot starve the
+//     confirmed-node poll loop (PollConfirmed), even when the unconfirmed
+//     node population vastly outnumbers confirmed nodes (in production,
+//     ~243:1) — confirmed nodes must be polled reliably every tick
+//     regardless of unconfirmed-queue volume/backlog. This is the core
+//     fix this split exists for; see PollConfirmed/PollUnconfirmed's doc
+//     comments.
+//
+// All three goroutines share Storage and the NodeClients, and all
+// observe ctx cancellation independently. Run blocks until all three have
 // exited (via a sync.WaitGroup) and returns nil on clean shutdown.
 //
 // Discover() only ever touches Storage and the NodeClients — never
-// c.nextPoll — so running it concurrently with Poll() introduces no new
-// data race: c.nextPoll access is already guarded by c.mu for
-// Poll-vs-Poll safety (due/setNextPoll), and Discover never reads or
-// writes it.
+// c.nextPoll — so running it concurrently with the poll loops introduces
+// no new data race. c.nextPoll access is already guarded by c.mu, which
+// is generic over address keys and thus safe for concurrent due/
+// setNextPoll access from both poll loops simultaneously — PollConfirmed
+// and PollUnconfirmed only ever touch disjoint address keys (a node is
+// never both confirmed and unconfirmed at once), but the mutex makes this
+// safe even so.
 func (c *Collector) Run(ctx context.Context) error {
 	tick := c.TickInterval
 	if tick <= 0 {
 		tick = defaultTickInterval
 	}
 
+	unconfirmedTick := c.UnconfirmedTickInterval
+	if unconfirmedTick <= 0 {
+		unconfirmedTick = tick
+	}
+
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(3)
 
 	go func() {
 		defer wg.Done()
@@ -269,12 +308,18 @@ func (c *Collector) Run(ctx context.Context) error {
 		c.runPollLoop(ctx, tick)
 	}()
 
+	go func() {
+		defer wg.Done()
+		c.runUnconfirmedPollLoop(ctx, unconfirmedTick)
+	}()
+
 	wg.Wait()
 	return nil
 }
 
 // runDiscoverLoop runs Discover once immediately, then on every tick,
-// until ctx is cancelled. It runs entirely independently of runPollLoop.
+// until ctx is cancelled. It runs entirely independently of runPollLoop
+// and runUnconfirmedPollLoop.
 func (c *Collector) runDiscoverLoop(ctx context.Context, tick time.Duration) {
 	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
@@ -295,15 +340,17 @@ func (c *Collector) runDiscoverLoop(ctx context.Context, tick time.Duration) {
 	}
 }
 
-// runPollLoop runs Poll once immediately, then on every tick, until ctx
-// is cancelled. It runs entirely independently of runDiscoverLoop, so a
-// slow/hanging Discover pass never delays or starves polling.
+// runPollLoop runs PollConfirmed once immediately, then on every tick,
+// until ctx is cancelled. It runs entirely independently of
+// runDiscoverLoop and runUnconfirmedPollLoop, so neither a slow/hanging
+// Discover pass nor unconfirmed-node poll volume/backlog ever delays or
+// starves polling of confirmed nodes.
 func (c *Collector) runPollLoop(ctx context.Context, tick time.Duration) {
 	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
 
-	if err := c.Poll(ctx); err != nil {
-		log.Printf("collector: poll pass error: %v", err)
+	if err := c.PollConfirmed(ctx); err != nil {
+		log.Printf("collector: confirmed poll pass error: %v", err)
 	}
 
 	for {
@@ -311,8 +358,36 @@ func (c *Collector) runPollLoop(ctx context.Context, tick time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := c.Poll(ctx); err != nil {
-				log.Printf("collector: poll pass error: %v", err)
+			if err := c.PollConfirmed(ctx); err != nil {
+				log.Printf("collector: confirmed poll pass error: %v", err)
+			}
+		}
+	}
+}
+
+// runUnconfirmedPollLoop runs PollUnconfirmed once immediately, then on
+// every tick, until ctx is cancelled. It runs entirely independently of
+// runDiscoverLoop and runPollLoop, on its own ticker (see Run's
+// unconfirmedTick) — this loop is explicitly lower-priority than
+// runPollLoop: it never blocks or starves the confirmed loop in any way
+// (no shared per-tick budget, no shared blocking lock held across a
+// dial; the two loops' only shared state is c.nextPoll/c.mu, and
+// PollConfirmed/PollUnconfirmed only ever touch disjoint address keys).
+func (c *Collector) runUnconfirmedPollLoop(ctx context.Context, tick time.Duration) {
+	ticker := time.NewTicker(tick)
+	defer ticker.Stop()
+
+	if err := c.PollUnconfirmed(ctx); err != nil {
+		log.Printf("collector: unconfirmed poll pass error: %v", err)
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := c.PollUnconfirmed(ctx); err != nil {
+				log.Printf("collector: unconfirmed poll pass error: %v", err)
 			}
 		}
 	}
@@ -445,15 +520,46 @@ func discoveryCooldownKey(transportLabel, addr string) string {
 	return transportLabel + ":" + addr
 }
 
-// Poll checks all known nodes and, for those whose next-poll time is due,
-// calls PollOnce (which independently attempts GRPCClient and P2PClient,
-// whichever are non-nil).
-func (c *Collector) Poll(ctx context.Context) error {
+// PollConfirmed checks all known confirmed nodes (Node.PublicKey != nil)
+// and, for those whose next-poll time is due, calls PollOnce (which
+// independently attempts GRPCClient and P2PClient, whichever are
+// non-nil). It runs entirely independently of PollUnconfirmed — this is
+// the confirmed half of the priority split described in Run's doc
+// comment: confirmed nodes must be polled reliably every tick regardless
+// of unconfirmed-node population/backlog, since production experience
+// showed a single interleaved node list (confirmed and unconfirmed
+// nodes sharing one fixed per-tick dial budget) lets unconfirmed
+// placeholder nodes — which can outnumber confirmed nodes by orders of
+// magnitude — starve confirmed nodes of reliable polling.
+func (c *Collector) PollConfirmed(ctx context.Context) error {
+	confirmed := true
+	return c.poll(ctx, storage.NodeFilter{Confirmed: &confirmed})
+}
+
+// PollUnconfirmed checks all known unconfirmed placeholder nodes
+// (Node.PublicKey == nil) and, for those whose next-poll time is due,
+// calls PollOnce, exactly mirroring PollConfirmed but over the
+// complementary node subset. It runs entirely independently of
+// PollConfirmed — see PollConfirmed's doc comment and Run's doc comment
+// for why this split exists and why this loop is explicitly
+// lower-priority (it must never block or starve PollConfirmed).
+func (c *Collector) PollUnconfirmed(ctx context.Context) error {
+	confirmed := false
+	return c.poll(ctx, storage.NodeFilter{Confirmed: &confirmed})
+}
+
+// poll checks all nodes matching filter and, for those whose next-poll
+// time is due, calls PollOnce. Shared by PollConfirmed and
+// PollUnconfirmed — both call the same due/setNextPoll/PollOnce/jitter
+// logic, just over a filtered node set each; per-node poll-interval
+// selection (pollInterval) is completely unaffected by this split, since
+// it already branches on n.PublicKey itself.
+func (c *Collector) poll(ctx context.Context, filter storage.NodeFilter) error {
 	if c.Storage == nil {
 		return errors.New("collector: Storage is not configured")
 	}
 
-	nodes, err := c.Storage.ListNodes(ctx, storage.NodeFilter{})
+	nodes, err := c.Storage.ListNodes(ctx, filter)
 	if err != nil {
 		return fmt.Errorf("collector: list nodes: %w", err)
 	}
@@ -707,9 +813,9 @@ func (c *Collector) dueForDiscovery(key string, now time.Time) bool {
 
 // setNextDiscovery records the next discovery-walk due time for the given
 // discoveryCooldownKey, mirroring setNextPoll. It is guarded by the same
-// c.mu as nextPoll — both maps belong to the same Collector and neither
-// Discover nor Poll needs to hold the lock for long, so a second mutex
-// would add no real benefit.
+// c.mu as nextPoll — both maps belong to the same Collector and none of
+// Discover, PollConfirmed, or PollUnconfirmed need to hold the lock for
+// long, so a second mutex would add no real benefit.
 func (c *Collector) setNextDiscovery(key string, t time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
