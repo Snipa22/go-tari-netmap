@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -303,7 +304,7 @@ func TestPollRecordsHealthChecksAndRespectsCadence(t *testing.T) {
 	c.Storage = store
 	c.GRPCClient = client
 
-	if err := c.Poll(ctx); err != nil {
+	if err := c.PollUnconfirmed(ctx); err != nil {
 		t.Fatalf("poll: %v", err)
 	}
 
@@ -326,7 +327,7 @@ func TestPollRecordsHealthChecksAndRespectsCadence(t *testing.T) {
 
 	// Polling again immediately must be a no-op: the generic node's
 	// next-poll time (PollIntervalGeneric = 2h) hasn't elapsed yet.
-	if err := c.Poll(ctx); err != nil {
+	if err := c.PollUnconfirmed(ctx); err != nil {
 		t.Fatalf("second poll: %v", err)
 	}
 	history, err = store.GetNodeHistory(ctx, node.ID, 10)
@@ -361,7 +362,7 @@ func TestPollThreadsPeerIdentityUpdatedAtIntoStorage(t *testing.T) {
 	c.Storage = store
 	c.GRPCClient = client
 
-	if err := c.Poll(ctx); err != nil {
+	if err := c.PollUnconfirmed(ctx); err != nil {
 		t.Fatalf("poll: %v", err)
 	}
 
@@ -392,7 +393,7 @@ func TestPollUnreachableNodeRecordsFailure(t *testing.T) {
 	c.Storage = store
 	c.GRPCClient = client
 
-	if err := c.Poll(ctx); err != nil {
+	if err := c.PollUnconfirmed(ctx); err != nil {
 		t.Fatalf("poll: %v", err)
 	}
 
@@ -448,7 +449,7 @@ func TestPollDualProbeBothSucceed(t *testing.T) {
 	c.GRPCClient = grpcClient
 	c.P2PClient = p2pClient
 
-	if err := c.Poll(ctx); err != nil {
+	if err := c.PollUnconfirmed(ctx); err != nil {
 		t.Fatalf("poll: %v", err)
 	}
 
@@ -502,7 +503,7 @@ func TestPollDualProbeGRPCFailsP2PSucceeds(t *testing.T) {
 	c.GRPCClient = grpcClient
 	c.P2PClient = p2pClient
 
-	if err := c.Poll(ctx); err != nil {
+	if err := c.PollUnconfirmed(ctx); err != nil {
 		t.Fatalf("poll: %v", err)
 	}
 
@@ -551,7 +552,7 @@ func TestPollDualProbeP2PFailsGRPCSucceeds(t *testing.T) {
 	c.GRPCClient = grpcClient
 	c.P2PClient = p2pClient
 
-	if err := c.Poll(ctx); err != nil {
+	if err := c.PollUnconfirmed(ctx); err != nil {
 		t.Fatalf("poll: %v", err)
 	}
 
@@ -600,7 +601,7 @@ func TestPollNilP2PClientSkipsP2PProbe(t *testing.T) {
 	c.GRPCClient = grpcClient
 	// c.P2PClient intentionally left nil.
 
-	if err := c.Poll(ctx); err != nil {
+	if err := c.PollUnconfirmed(ctx); err != nil {
 		t.Fatalf("poll: %v", err)
 	}
 
@@ -1138,5 +1139,282 @@ func TestRunDoesNotStarvePollOnSlowDiscover(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not return after ctx cancellation")
+	}
+}
+
+// TestPollConfirmedOnlyTouchesConfirmedNodes verifies the core
+// confirmed/unconfirmed priority-queue split: PollConfirmed only ever
+// dials/records confirmed nodes (Node.PublicKey != nil), and
+// PollUnconfirmed only ever dials/records unconfirmed placeholder nodes
+// (Node.PublicKey == nil) -- neither function's node set ever includes
+// the other's.
+func TestPollConfirmedOnlyTouchesConfirmedNodes(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	confirmedHeight := int64(111)
+	unconfirmedHeight := int64(222)
+	client := &fakeClient{info: map[string]NodeInfo{
+		"confirmed:1":   {Reachable: true, Height: &confirmedHeight},
+		"unconfirmed:1": {Reachable: true, Height: &unconfirmedHeight},
+	}}
+
+	confirmedNode, err := store.UpsertConfirmedNode(ctx, "confirmed:1", []byte{0x01, 0x02}, storage.DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("seed confirmed node: %v", err)
+	}
+	unconfirmedNode, err := store.UpsertDiscoveredNode(ctx, "unconfirmed:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("seed unconfirmed node: %v", err)
+	}
+
+	c := New(Config{})
+	c.Storage = store
+	c.GRPCClient = client
+
+	if err := c.PollConfirmed(ctx); err != nil {
+		t.Fatalf("poll confirmed: %v", err)
+	}
+
+	confirmedHistory, err := store.GetNodeHistory(ctx, confirmedNode.ID, 10)
+	if err != nil {
+		t.Fatalf("get confirmed history: %v", err)
+	}
+	if len(confirmedHistory) != 1 {
+		t.Fatalf("len(confirmed history) after PollConfirmed = %d, want 1", len(confirmedHistory))
+	}
+
+	unconfirmedHistory, err := store.GetNodeHistory(ctx, unconfirmedNode.ID, 10)
+	if err != nil {
+		t.Fatalf("get unconfirmed history: %v", err)
+	}
+	if len(unconfirmedHistory) != 0 {
+		t.Fatalf("len(unconfirmed history) after PollConfirmed = %d, want 0 (PollConfirmed must never touch unconfirmed nodes)", len(unconfirmedHistory))
+	}
+
+	// PollUnconfirmed must now touch only the unconfirmed node, leaving
+	// the confirmed node's history exactly as PollConfirmed left it.
+	if err := c.PollUnconfirmed(ctx); err != nil {
+		t.Fatalf("poll unconfirmed: %v", err)
+	}
+
+	confirmedHistory, err = store.GetNodeHistory(ctx, confirmedNode.ID, 10)
+	if err != nil {
+		t.Fatalf("get confirmed history after PollUnconfirmed: %v", err)
+	}
+	if len(confirmedHistory) != 1 {
+		t.Fatalf("len(confirmed history) after PollUnconfirmed = %d, want still 1 (PollUnconfirmed must never touch confirmed nodes)", len(confirmedHistory))
+	}
+
+	unconfirmedHistory, err = store.GetNodeHistory(ctx, unconfirmedNode.ID, 10)
+	if err != nil {
+		t.Fatalf("get unconfirmed history after PollUnconfirmed: %v", err)
+	}
+	if len(unconfirmedHistory) != 1 {
+		t.Fatalf("len(unconfirmed history) after PollUnconfirmed = %d, want 1", len(unconfirmedHistory))
+	}
+}
+
+// slowInfoClient is a NodeClient fixture whose GetInfo blocks (until
+// either unblock is closed or ctx is cancelled) when called for
+// slowAddr specifically, while returning immediately from an in-memory
+// fixture for every other address -- used to simulate a large/slow
+// unconfirmed-node population's real network dials hanging, without
+// affecting a confirmed node's fast poll. GetPeers always returns
+// immediately with no peers, since these tests don't exercise discovery.
+// infoCalled is closed the first time GetInfo is entered for slowAddr
+// (before it blocks), and infoDone is set (atomically) after that call
+// actually returns, mirroring slowPeersFastInfoClient's synchronization
+// pattern above but for GetInfo instead of GetPeers.
+type slowInfoClient struct {
+	slowAddr string
+	unblock  chan struct{}
+
+	infoCalled     chan struct{}
+	infoCalledOnce sync.Once
+	infoDone       atomic.Bool
+
+	info map[string]NodeInfo
+}
+
+func (s *slowInfoClient) GetPeers(ctx context.Context, addr string) ([]DiscoveredPeer, error) {
+	return nil, nil
+}
+
+func (s *slowInfoClient) GetInfo(ctx context.Context, addr string) (NodeInfo, error) {
+	if addr == s.slowAddr {
+		s.infoCalledOnce.Do(func() { close(s.infoCalled) })
+		defer s.infoDone.Store(true)
+		select {
+		case <-s.unblock:
+		case <-ctx.Done():
+			return NodeInfo{}, ctx.Err()
+		}
+	}
+	info, ok := s.info[addr]
+	if !ok {
+		return NodeInfo{}, fmt.Errorf("collector_test: no fixture GetInfo response for %s", addr)
+	}
+	return info, nil
+}
+
+// TestPollConfirmedNotStarvedBySlowUnconfirmedPoll is the poll-loop
+// analogue of TestRunDoesNotStarvePollOnSlowDiscover: it proves that a
+// slow (simulating a large/backlogged) unconfirmed-node poll cannot
+// delay or starve the confirmed loop's poll attempts, since the two run
+// on fully independent tickers/goroutines (see Run). A slow-blocking
+// GetInfo is used for the unconfirmed node; the confirmed node's GetInfo
+// returns immediately from an in-memory fixture. Both loops run
+// concurrently via c.Run, and the test asserts a health check is
+// recorded for the confirmed node while the unconfirmed node's GetInfo
+// call is still (verifiably) in flight.
+func TestPollConfirmedNotStarvedBySlowUnconfirmedPoll(t *testing.T) {
+	store := newTestStore(t)
+	seedCtx := context.Background()
+
+	client := &slowInfoClient{
+		slowAddr:   "unconfirmed:1",
+		unblock:    make(chan struct{}),
+		infoCalled: make(chan struct{}),
+		info: map[string]NodeInfo{
+			"confirmed:1": {Reachable: true},
+		},
+	}
+	// Ensures the slow GetInfo call actually unblocks/returns at the end
+	// of the test, even on failure, rather than leaking a goroutine
+	// blocked forever on a channel nothing else will ever close.
+	t.Cleanup(func() { close(client.unblock) })
+
+	confirmedNode, err := store.UpsertConfirmedNode(seedCtx, "confirmed:1", []byte{0x01, 0x02}, storage.DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("seed confirmed node: %v", err)
+	}
+	if _, err := store.UpsertDiscoveredNode(seedCtx, "unconfirmed:1", storage.DiscoverySourceP2P, nil, nil); err != nil {
+		t.Fatalf("seed unconfirmed node: %v", err)
+	}
+
+	c := New(Config{})
+	c.Storage = store
+	c.GRPCClient = client
+	c.TickInterval = 20 * time.Millisecond
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- c.Run(runCtx) }()
+
+	// Wait for the unconfirmed loop's poll to actually reach (and hang
+	// in) GetInfo, so we know it's genuinely in flight for the rest of
+	// the test rather than, say, not having started yet.
+	select {
+	case <-client.infoCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("unconfirmed node's GetInfo was never called")
+	}
+
+	// The confirmed loop ticks independently of the hung unconfirmed
+	// loop; poll for a recorded health check on the confirmed node
+	// within a deadline that comfortably exceeds several TickIntervals.
+	deadline := time.Now().Add(3 * time.Second)
+	var history []storage.HealthCheck
+	for {
+		history, err = store.GetNodeHistory(seedCtx, confirmedNode.ID, 10)
+		if err != nil {
+			t.Fatalf("get history: %v", err)
+		}
+		if len(history) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no health check recorded for the confirmed node while the unconfirmed node's GetInfo was still hung -- PollConfirmed appears starved by PollUnconfirmed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// The whole point: confirm the slow GetInfo call genuinely had not
+	// returned yet when PollConfirmed's result showed up above.
+	if client.infoDone.Load() {
+		t.Fatal("unconfirmed GetInfo had already returned by the time PollConfirmed recorded a health check -- test doesn't prove independence")
+	}
+
+	if !history[0].Reachable {
+		t.Errorf("expected reachable = true")
+	}
+
+	// Cancel ctx so all loops exit -- the hung GetInfo call observes
+	// ctx.Done() and returns rather than staying hung forever -- and
+	// confirm Run actually returns promptly and without error.
+	cancel()
+
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Errorf("Run returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after ctx cancellation")
+	}
+}
+
+// TestConcurrentPollLoopsNoDataRace runs PollConfirmed and PollUnconfirmed
+// concurrently and repeatedly against the same Collector's shared
+// nextPoll/mu state and the same underlying Storage. It makes no
+// assertion beyond "no error" -- its entire purpose is to give
+// `go test -race` real concurrent access to c.nextPoll (guarded by c.mu)
+// from both poll loops at once, proving that running the confirmed and
+// unconfirmed poll loops concurrently (as Run does) introduces no data
+// race.
+func TestConcurrentPollLoopsNoDataRace(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	client := &fakeClient{info: map[string]NodeInfo{}}
+	for i := 0; i < 20; i++ {
+		addr := fmt.Sprintf("confirmed:%d", i)
+		client.info[addr] = NodeInfo{Reachable: true}
+		if _, err := store.UpsertConfirmedNode(ctx, addr, []byte{byte(i), byte(i + 1)}, storage.DiscoverySourceP2P); err != nil {
+			t.Fatalf("seed confirmed node %d: %v", i, err)
+		}
+	}
+	for i := 0; i < 20; i++ {
+		addr := fmt.Sprintf("unconfirmed:%d", i)
+		client.info[addr] = NodeInfo{Reachable: true}
+		if _, err := store.UpsertDiscoveredNode(ctx, addr, storage.DiscoverySourceP2P, nil, nil); err != nil {
+			t.Fatalf("seed unconfirmed node %d: %v", i, err)
+		}
+	}
+
+	c := New(Config{})
+	c.Storage = store
+	c.GRPCClient = client
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	errCh := make(chan error, 2)
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 10; i++ {
+			if err := c.PollConfirmed(ctx); err != nil {
+				errCh <- err
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 10; i++ {
+			if err := c.PollUnconfirmed(ctx); err != nil {
+				errCh <- err
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("concurrent poll error: %v", err)
 	}
 }

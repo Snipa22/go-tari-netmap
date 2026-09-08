@@ -246,6 +246,58 @@ func TestListNodesReachableSinceFilter(t *testing.T) {
 	}
 }
 
+// TestListNodesConfirmedFilter exercises NodeFilter.Confirmed: a true
+// value restricts results to nodes with a non-nil PublicKey (confirmed),
+// a false value restricts to nodes with a nil PublicKey (unconfirmed
+// placeholders), and a nil value (the zero-value default) applies no
+// filtering at all -- the same critical invariant already established
+// for ReachableSince above, since the collector's PollConfirmed/
+// PollUnconfirmed split (see internal/collector/collector.go) relies on
+// this filter to divide the node set without otherwise changing
+// ListNodes' behavior for any other caller that leaves it unset.
+func TestListNodesConfirmedFilter(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	confirmed, err := store.UpsertConfirmedNode(ctx, "confirmed:1", []byte{0x01, 0x02}, DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("upsert confirmed: %v", err)
+	}
+	unconfirmed, err := store.UpsertDiscoveredNode(ctx, "unconfirmed:1", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert unconfirmed: %v", err)
+	}
+
+	yes := true
+	confirmedOnly, err := store.ListNodes(ctx, NodeFilter{Confirmed: &yes})
+	if err != nil {
+		t.Fatalf("list confirmed=true: %v", err)
+	}
+	if len(confirmedOnly) != 1 || confirmedOnly[0].ID != confirmed.ID {
+		t.Fatalf("Confirmed=true filter = %+v, want just %s (%s)", confirmedOnly, confirmed.Address, confirmed.ID)
+	}
+
+	no := false
+	unconfirmedOnly, err := store.ListNodes(ctx, NodeFilter{Confirmed: &no})
+	if err != nil {
+		t.Fatalf("list confirmed=false: %v", err)
+	}
+	if len(unconfirmedOnly) != 1 || unconfirmedOnly[0].ID != unconfirmed.ID {
+		t.Fatalf("Confirmed=false filter = %+v, want just %s (%s)", unconfirmedOnly, unconfirmed.Address, unconfirmed.ID)
+	}
+
+	// Critical invariant: a zero-value filter (Confirmed left nil) must
+	// return everything, completely unaffected by the new field's mere
+	// existence.
+	all, err := store.ListNodes(ctx, NodeFilter{})
+	if err != nil {
+		t.Fatalf("list all (zero-value filter): %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("len(all) = %d, want 2 (zero-value NodeFilter{} must be unaffected by Confirmed)", len(all))
+	}
+}
+
 // TestListNodesPagination verifies that NodeFilter.Limit/Offset apply
 // real SQL-level pagination (a correct page, in the same address-sorted
 // order ListNodes always uses), and that a zero-value filter still

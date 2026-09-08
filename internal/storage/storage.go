@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -94,6 +95,10 @@ type Store interface {
 	// nodes with at least one reachable=true node_health row at or
 	// after that time (see NodeFilter's doc comment) — also strictly
 	// opt-in, a nil ReachableSince never filters anything out.
+	// filter.Confirmed, when non-nil, further restricts results to
+	// confirmed (PublicKey != nil) or unconfirmed (PublicKey == nil)
+	// nodes only (see NodeFilter's doc comment) — also strictly
+	// opt-in, a nil Confirmed never filters anything out.
 	ListNodes(ctx context.Context, filter NodeFilter) ([]Node, error)
 
 	// CountNodes returns the total number of nodes matching filter's
@@ -738,20 +743,28 @@ func (s *pgStore) ListNodeAddressesForNodes(ctx context.Context, nodeIDs []uuid.
 func (s *pgStore) ListNodes(ctx context.Context, filter NodeFilter) ([]Node, error) {
 	query := "SELECT " + nodeColumns + " FROM nodes"
 	args := []any{}
+	var clauses []string
 
 	if filter.DiscoverySource != "" {
 		args = append(args, string(filter.DiscoverySource))
-		query += fmt.Sprintf(" WHERE discovery_source = $%d", len(args))
+		clauses = append(clauses, fmt.Sprintf("discovery_source = $%d", len(args)))
 	}
 
 	if filter.ReachableSince != nil {
 		args = append(args, *filter.ReachableSince)
-		clause := fmt.Sprintf("EXISTS (SELECT 1 FROM node_health nh WHERE nh.node_id = nodes.id AND nh.reachable AND nh.ts >= $%d)", len(args))
-		if filter.DiscoverySource != "" {
-			query += " AND " + clause
+		clauses = append(clauses, fmt.Sprintf("EXISTS (SELECT 1 FROM node_health nh WHERE nh.node_id = nodes.id AND nh.reachable AND nh.ts >= $%d)", len(args)))
+	}
+
+	if filter.Confirmed != nil {
+		if *filter.Confirmed {
+			clauses = append(clauses, "public_key IS NOT NULL")
 		} else {
-			query += " WHERE " + clause
+			clauses = append(clauses, "public_key IS NULL")
 		}
+	}
+
+	if len(clauses) > 0 {
+		query += " WHERE " + strings.Join(clauses, " AND ")
 	}
 
 	query += " ORDER BY address"

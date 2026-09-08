@@ -101,6 +101,21 @@ type NodeFilter struct {
 	// storage.NodeFilter{}) rely on seeing every node, unconditionally,
 	// forever.
 	ReachableSince *time.Time
+
+	// Confirmed, if non-nil, restricts results by whether a node has
+	// been directly, successfully probed and thus has a known
+	// PublicKey: true means public_key IS NOT NULL (confirmed nodes
+	// only), false means public_key IS NULL (unconfirmed placeholder
+	// nodes only). A nil Confirmed (the zero value) means "no
+	// filtering", following the same nil-pointer / "unset means no
+	// filtering" convention as ReachableSince above — a zero-value
+	// NodeFilter{} must remain completely unaffected by this field's
+	// mere existence. This backs the collector's split confirmed/
+	// unconfirmed poll queues (see collector.PollConfirmed/
+	// PollUnconfirmed): confirmed nodes must be pollable independently
+	// of however many unconfirmed placeholder nodes exist, and vice
+	// versa.
+	Confirmed *bool
 }
 
 // TopologyFilter filters/caps the result of ListTopology. A zero-value
