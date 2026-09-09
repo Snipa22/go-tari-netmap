@@ -631,6 +631,64 @@ func TestPollIntervalUsesPoolOwnedCadence(t *testing.T) {
 	}
 }
 
+// TestPollIntervalUsesPoolOwnedCadenceForOwnerTag covers the real-world
+// production case that motivated isPoolOwned's owner-tag signal: a
+// confirmed node approved via the submission-review flow (see
+// internal/api/api.go's approve-submission handler) only ever gets
+// tags["owner"] set — tags["pool_owned"] is never written by that path.
+// Production has 24 confirmed nodes with tags = {"owner": "Jagtech"} and
+// zero nodes anywhere with pool_owned: true, so before this fix every one
+// of those nodes was incorrectly falling through to PollIntervalGeneric's
+// 2-hour cadence instead of the intended 5-minute PollIntervalPoolOwned.
+func TestPollIntervalUsesPoolOwnedCadenceForOwnerTag(t *testing.T) {
+	ctx := context.Background()
+	ownerTagged := storage.Node{PublicKey: []byte{0x05, 0x06}, Tags: map[string]any{"owner": "Jagtech"}}
+
+	c := New(Config{})
+	if got := c.pollInterval(ctx, ownerTagged); got != PollIntervalPoolOwned {
+		t.Errorf("pollInterval(owner-tagged, no pool_owned key) = %v, want %v", got, PollIntervalPoolOwned)
+	}
+}
+
+// TestPollIntervalIgnoresEmptyOwnerTag covers the negative case: an empty
+// string owner tag must not count as "someone registered/claimed this
+// IP", so it must not trigger fast cadence.
+func TestPollIntervalIgnoresEmptyOwnerTag(t *testing.T) {
+	ctx := context.Background()
+	emptyOwner := storage.Node{PublicKey: []byte{0x07, 0x08}, Tags: map[string]any{"owner": ""}}
+
+	c := New(Config{})
+	if got := c.pollInterval(ctx, emptyOwner); got != PollIntervalGeneric {
+		t.Errorf("pollInterval(empty owner tag) = %v, want %v", got, PollIntervalGeneric)
+	}
+}
+
+// TestDiscoveryIntervalUsesPoolOwnedCadence covers discoveryInterval's use
+// of the same isPoolOwned helper as pollInterval, for both existing
+// signals: the explicit pool_owned bool and the real-world owner-tag
+// path. See TestPollIntervalUsesPoolOwnedCadenceForOwnerTag for the
+// production evidence behind the owner-tag case.
+func TestDiscoveryIntervalUsesPoolOwnedCadence(t *testing.T) {
+	poolOwned := storage.Node{PublicKey: []byte{0x01, 0x02}, Tags: map[string]any{"pool_owned": true}}
+	ownerTagged := storage.Node{PublicKey: []byte{0x05, 0x06}, Tags: map[string]any{"owner": "Jagtech"}}
+	emptyOwner := storage.Node{PublicKey: []byte{0x07, 0x08}, Tags: map[string]any{"owner": ""}}
+	regular := storage.Node{PublicKey: []byte{0x03, 0x04}, Tags: map[string]any{}}
+
+	c := New(Config{})
+	if got := c.discoveryInterval(poolOwned); got != DiscoveryIntervalPoolOwned {
+		t.Errorf("discoveryInterval(pool-owned) = %v, want %v", got, DiscoveryIntervalPoolOwned)
+	}
+	if got := c.discoveryInterval(ownerTagged); got != DiscoveryIntervalPoolOwned {
+		t.Errorf("discoveryInterval(owner-tagged, no pool_owned key) = %v, want %v", got, DiscoveryIntervalPoolOwned)
+	}
+	if got := c.discoveryInterval(emptyOwner); got != DiscoveryIntervalGeneric {
+		t.Errorf("discoveryInterval(empty owner tag) = %v, want %v", got, DiscoveryIntervalGeneric)
+	}
+	if got := c.discoveryInterval(regular); got != DiscoveryIntervalGeneric {
+		t.Errorf("discoveryInterval(regular) = %v, want %v", got, DiscoveryIntervalGeneric)
+	}
+}
+
 // TestPollIntervalUsesUnconfirmedCadenceForPlaceholderNodes covers
 // scenario (d): an unconfirmed placeholder node with zero history is not
 // (and cannot be) likely-dead — collectorLikelyDead needs 3+ history

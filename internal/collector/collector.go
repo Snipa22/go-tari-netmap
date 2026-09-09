@@ -772,14 +772,38 @@ func (c *Collector) dialJitter() time.Duration {
 	return c.cfg.DialJitter
 }
 
-// isPoolOwned reports whether n's tags mark it as pool-owned.
+// isPoolOwned reports whether n should get the fast pool-owned poll/
+// discovery cadence. This is true when EITHER of two independent signals
+// is present:
+//
+//   - n.Tags["pool_owned"] == true — an explicit boolean flag some other
+//     code path may still set directly.
+//   - n.Tags["owner"] is a non-empty string — the real-world tagging path
+//     that actually fires today: when an admin approves a submitted node
+//     with an OwnerTag (see internal/api/api.go's submission-approval
+//     handler), only tags["owner"] is written, never tags["pool_owned"].
+//     Per Alex: the mere presence of a non-empty owner tag (i.e. someone
+//     registered/claimed this IP) is itself the fast-poll signal, not a
+//     separate boolean that path never set. Confirmed live: production
+//     has 24 confirmed nodes with tags = {"owner": "Jagtech"} and zero
+//     nodes anywhere with pool_owned: true set, meaning every one of
+//     those owner-tagged nodes was incorrectly falling through to
+//     PollIntervalGeneric's 2-hour cadence before this fix.
+//
+// An empty-string owner tag does NOT count as "someone registered/
+// claimed this IP" and so does not trigger fast cadence.
 func isPoolOwned(n storage.Node) bool {
-	v, ok := n.Tags["pool_owned"]
-	if !ok {
-		return false
+	if v, ok := n.Tags["pool_owned"]; ok {
+		if b, ok := v.(bool); ok && b {
+			return true
+		}
 	}
-	b, ok := v.(bool)
-	return ok && b
+	if v, ok := n.Tags["owner"]; ok {
+		if s, ok := v.(string); ok && s != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Collector) due(addr string, now time.Time) bool {
