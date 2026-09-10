@@ -136,12 +136,13 @@ const defaultNeverContactedTickInterval = 1 * time.Minute
 // (see grpc_client.go/p2p_client.go, currently 180s), and with tens of
 // thousands of tracked nodes, fully sequential dialing cannot remotely
 // keep up with the poll cadences above — see this repo's
-// collector-concurrency-brief for the full rationale. 100 was chosen as
-// an explicit, deliberate step up from strictly-sequential (1) per
-// Alex's request to "walk the network more aggressively", while still
-// bounding total in-flight dials to a fixed, known worst case rather
-// than firing off one goroutine per due node unbounded.
-const maxPollWorkers = 100
+// collector-concurrency-brief for the full rationale. Originally raised
+// to 100 as a deliberate step up from strictly-sequential (1) per
+// Alex's request to "walk the network more aggressively"; raised again
+// to 250 per updated guidance from Alex, for the same reason — still a
+// fixed, bounded worst case (never one goroutine per due node,
+// unbounded), just a bigger deliberate number.
+const maxPollWorkers = 250
 
 // NodeInfo is the subset of a Tari base node's health/sync-status info
 // needed to record a health check.
@@ -738,7 +739,7 @@ func (c *Collector) PollNeverContacted(ctx context.Context) error {
 // setNextPoll), and each node's next-poll time is still set exactly
 // once per pass with no race, regardless of maxPollWorkers. Only the
 // actual network dial (PollOnce, the expensive/slow part) runs
-// concurrently, bounded to at most maxPollWorkers (100) simultaneous
+// concurrently, bounded to at most maxPollWorkers (250) simultaneous
 // in-flight calls via an errgroup.Group with SetLimit — see this
 // repo's collector-concurrency-brief for why strictly-sequential
 // dialing could not keep up with tens of thousands of tracked nodes.
