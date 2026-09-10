@@ -6,7 +6,7 @@ toolchain go1.24.13
 
 require (
 	github.com/Snipa22/go-tari-grpc-lib/v3 v3.2.0
-	github.com/Snipa22/go-tari-lib v1.3.0
+	github.com/Snipa22/go-tari-lib v1.3.1-0.20260910182122-36f40b9e6631
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.6.0
 	golang.org/x/sync v0.18.0
