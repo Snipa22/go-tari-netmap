@@ -29,6 +29,52 @@ func TestParseSeedNodes(t *testing.T) {
 	}
 }
 
+// TestParseSocksProxyAddrs verifies parseSocksProxyAddrs' plural-preferred/singular-fallback
+// precedence (see its doc comment and NETMAP_SOCKS_PROXY_ADDRS/NETMAP_SOCKS_PROXY_ADDR's
+// construction site in main.go).
+func TestParseSocksProxyAddrs(t *testing.T) {
+	cases := []struct {
+		name        string
+		pluralRaw   string
+		singularRaw string
+		want        []string
+	}{
+		{name: "both empty/unset", pluralRaw: "", singularRaw: "", want: nil},
+		{
+			name:        "singular only (testnet's existing zero-config-change deployment)",
+			pluralRaw:   "",
+			singularRaw: "127.0.0.1:9050",
+			want:        []string{"127.0.0.1:9050"},
+		},
+		{
+			name:        "plural only",
+			pluralRaw:   "127.0.0.1:9100,127.0.0.1:9101,127.0.0.1:9102",
+			singularRaw: "",
+			want:        []string{"127.0.0.1:9100", "127.0.0.1:9101", "127.0.0.1:9102"},
+		},
+		{
+			name:        "plural takes precedence when both are set",
+			pluralRaw:   "127.0.0.1:9100,127.0.0.1:9101",
+			singularRaw: "127.0.0.1:9050",
+			want:        []string{"127.0.0.1:9100", "127.0.0.1:9101"},
+		},
+		{
+			name:        "plural with whitespace and empty entries",
+			pluralRaw:   " 127.0.0.1:9100 , , 127.0.0.1:9101 ",
+			singularRaw: "",
+			want:        []string{"127.0.0.1:9100", "127.0.0.1:9101"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseSocksProxyAddrs(tc.pluralRaw, tc.singularRaw)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("parseSocksProxyAddrs(%q, %q) = %v, want %v", tc.pluralRaw, tc.singularRaw, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestParseOwnedGRPCAddresses verifies parseOwnedGRPCAddresses' comma-separated
 // "p2pAddress=grpcAddress" parsing, mirroring TestParseSeedNodes' style.
 func TestParseOwnedGRPCAddresses(t *testing.T) {

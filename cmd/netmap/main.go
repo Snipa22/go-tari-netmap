@@ -102,12 +102,29 @@ func main() {
 	// direct comms/RPC-over-P2P transport, independent of gRPC — see
 	// p2pNodeClient's doc comment in internal/collector/p2p_client.go.
 	//
-	// NETMAP_SOCKS_PROXY_ADDR is the "host:port" address of a Tor SOCKS5
-	// proxy (e.g. a local Tor daemon's SocksPort, typically
-	// 127.0.0.1:9050), used to reach `.onion` Tari peers over this
-	// transport. Empty/unset (the default) disables it, matching the
+	// NETMAP_SOCKS_PROXY_ADDRS (plural) is a comma-separated list of Tor SOCKS5 proxy
+	// "host:port" addresses (e.g. N independent local Tor daemon instances' SocksPorts,
+	// typically 127.0.0.1:9100..127.0.0.1:9123 for N=24 in the real mainnet deploy -- this
+	// binary does NOT assume any particular count, it just splits on comma, trims, and
+	// drops empties, exactly like parseSeedNodes), used to reach `.onion` Tari peers over
+	// this transport. Each dial's proxy is chosen deterministically per-address (see
+	// collector.P2PShardIndex), letting collector.go's poll() bound P2P dial concurrency
+	// PER REAL TOR INSTANCE instead of across all of them combined -- see
+	// collector.maxP2PWorkersPerShard's doc comment for why: a single Tor instance
+	// saturates catastrophically at high concurrent hidden-service circuit-build counts.
+	//
+	// NETMAP_SOCKS_PROXY_ADDR (singular, legacy) is kept working as a fallback for the
+	// existing testnet deployment (netmap-testnet.service), which is explicitly OUT OF
+	// SCOPE for sharding and must keep using its single existing Tor instance/env var
+	// unchanged: if NETMAP_SOCKS_PROXY_ADDRS is unset/empty, this falls back to reading
+	// NETMAP_SOCKS_PROXY_ADDR as a single-element list, preserving exact pre-existing
+	// testnet behavior with zero config changes required on that host. Precedence is
+	// plural-preferred, singular-fallback -- if BOTH happen to be set, plural wins and
+	// singular is ignored entirely.
+	//
+	// Empty/unset (both variables): disables SOCKS entirely (dial directly), matching the
 	// pre-existing zero-config behavior.
-	socksProxyAddr := os.Getenv("NETMAP_SOCKS_PROXY_ADDR")
+	socksProxyAddrs := parseSocksProxyAddrs(os.Getenv("NETMAP_SOCKS_PROXY_ADDRS"), os.Getenv("NETMAP_SOCKS_PROXY_ADDR"))
 
 	// NETMAP_NETWORK_BYTE is a decimal string representation of the raw
 	// Tari P2P wire network byte (e.g. "0" for MainNet, "38" for
@@ -123,7 +140,7 @@ func main() {
 		}
 		networkByte = byte(n)
 	}
-	p2pClient := collector.NewP2PClientWithOptions(socksProxyAddr, networkByte)
+	p2pClient := collector.NewP2PClientWithShardedProxies(socksProxyAddrs, networkByte)
 
 	c := collector.New(collector.Config{
 		SeedNodes: parseSeedNodes(os.Getenv("NETMAP_SEED_NODES")),
@@ -280,4 +297,22 @@ func parseOwnedGRPCAddresses(raw string) map[string]string {
 		out[p2pAddr] = grpcAddr
 	}
 	return out
+}
+
+// parseSocksProxyAddrs implements NETMAP_SOCKS_PROXY_ADDRS' plural-preferred/
+// NETMAP_SOCKS_PROXY_ADDR-singular-fallback precedence described at this file's socksProxyAddrs
+// construction site: if pluralRaw is non-empty, it is parsed exactly like parseSeedNodes
+// (comma-separated, trimmed, empties dropped) and singularRaw is ignored entirely -- even if
+// singularRaw also happens to be set. Otherwise, if singularRaw is non-empty, it is returned as
+// a single-element slice, preserving the existing testnet deployment's exact zero-config
+// (aside from that one variable) behavior with NO changes required on that host. If both are
+// empty/unset, returns nil (no SOCKS proxy at all, dial directly).
+func parseSocksProxyAddrs(pluralRaw, singularRaw string) []string {
+	if pluralRaw != "" {
+		return parseSeedNodes(pluralRaw)
+	}
+	if singularRaw != "" {
+		return []string{singularRaw}
+	}
+	return nil
 }
