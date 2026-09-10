@@ -763,6 +763,15 @@ func (s *pgStore) ListNodes(ctx context.Context, filter NodeFilter) ([]Node, err
 		}
 	}
 
+	if filter.HasHealthChecks != nil {
+		exists := "EXISTS (SELECT 1 FROM node_health nh WHERE nh.node_id = nodes.id)"
+		if *filter.HasHealthChecks {
+			clauses = append(clauses, exists)
+		} else {
+			clauses = append(clauses, "NOT "+exists)
+		}
+	}
+
 	if len(clauses) > 0 {
 		query += " WHERE " + strings.Join(clauses, " AND ")
 	}

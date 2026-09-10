@@ -298,6 +298,59 @@ func TestListNodesConfirmedFilter(t *testing.T) {
 	}
 }
 
+// TestListNodesHasHealthChecksFilter exercises NodeFilter.HasHealthChecks:
+// a true value restricts results to nodes with at least one node_health
+// row, a false value restricts to nodes with zero node_health rows, and a
+// nil value (the zero-value default) applies no filtering at all --
+// backing the collector's never-contacted poll queue (see
+// internal/collector/collector.go's PollNeverContacted).
+func TestListNodesHasHealthChecksFilter(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	contacted, err := store.UpsertDiscoveredNode(ctx, "contacted:1", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert contacted: %v", err)
+	}
+	if err := store.RecordHealthCheck(ctx, HealthCheckInput{NodeID: contacted.ID, Reachable: false, ProbeSource: ProbeSourceGRPC}); err != nil {
+		t.Fatalf("record health check: %v", err)
+	}
+
+	neverContacted, err := store.UpsertDiscoveredNode(ctx, "never-contacted:1", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert never-contacted: %v", err)
+	}
+
+	yes := true
+	hasChecks, err := store.ListNodes(ctx, NodeFilter{HasHealthChecks: &yes})
+	if err != nil {
+		t.Fatalf("list HasHealthChecks=true: %v", err)
+	}
+	if len(hasChecks) != 1 || hasChecks[0].ID != contacted.ID {
+		t.Fatalf("HasHealthChecks=true filter = %+v, want just %s (%s)", hasChecks, contacted.Address, contacted.ID)
+	}
+
+	no := false
+	noChecks, err := store.ListNodes(ctx, NodeFilter{HasHealthChecks: &no})
+	if err != nil {
+		t.Fatalf("list HasHealthChecks=false: %v", err)
+	}
+	if len(noChecks) != 1 || noChecks[0].ID != neverContacted.ID {
+		t.Fatalf("HasHealthChecks=false filter = %+v, want just %s (%s)", noChecks, neverContacted.Address, neverContacted.ID)
+	}
+
+	// Critical invariant: a zero-value filter (HasHealthChecks left
+	// nil) must return everything, completely unaffected by the new
+	// field's mere existence.
+	all, err := store.ListNodes(ctx, NodeFilter{})
+	if err != nil {
+		t.Fatalf("list all (zero-value filter): %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("len(all) = %d, want 2 (zero-value NodeFilter{} must be unaffected by HasHealthChecks)", len(all))
+	}
+}
+
 // TestListNodesPagination verifies that NodeFilter.Limit/Offset apply
 // real SQL-level pagination (a correct page, in the same address-sorted
 // order ListNodes always uses), and that a zero-value filter still
