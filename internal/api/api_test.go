@@ -2588,6 +2588,7 @@ type statsResponseForTest struct {
 	RegistryDiscovered int `json:"registry_discovered"`
 	BothDiscovered     int `json:"both_discovered"`
 	OnionCapable       int `json:"onion_capable"`
+	ClearnetCapable    int `json:"clearnet_capable"`
 	ClearnetOnly       int `json:"clearnet_only"`
 
 	NetworkHeight          *int64 `json:"network_height"`
@@ -2620,11 +2621,14 @@ func TestStatsEndpointEmpty(t *testing.T) {
 
 // TestStatsEndpoint asserts GET /v1/stats' counts match a hand-built node
 // population spanning every discovery source (p2p/registry/both),
-// confirmed vs unconfirmed, and onion vs clearnet-only capability, plus
-// that network_height/network_height_node_count reflect the mode of the
-// latest-per-node heights recorded (see TestNetworkHeight in
-// internal/storage for the mode-computation semantics being surfaced
-// here).
+// confirmed vs unconfirmed, and onion/clearnet/dual-stack capability
+// (including the subtle case: a node with BOTH an onion and a clearnet
+// address counts in both OnionCapable and ClearnetCapable, but NOT in
+// ClearnetOnly, since ClearnetOnly is mutually-exclusive-with-onion by
+// definition), plus that network_height/network_height_node_count
+// reflect the mode of the latest-per-node heights recorded (see
+// TestNetworkHeight in internal/storage for the mode-computation
+// semantics being surfaced here).
 func TestStatsEndpoint(t *testing.T) {
 	srv, store := newTestServer(t, nil)
 	ctx := context.Background()
@@ -2658,6 +2662,31 @@ func TestStatsEndpoint(t *testing.T) {
 		t.Fatalf("bothNode.DiscoverySource = %q, want %q", bothNode.DiscoverySource, storage.DiscoverySourceBoth)
 	}
 
+	// dualStackConfirmed: registry_submitted, confirmed, clearnet
+	// address at creation plus a second, onion address added directly
+	// (storage.Store has no multi-address upsert API — same
+	// direct-to-db pattern TestTopPeeredNodesOnionClearnetCounts uses).
+	// This is the subtle case this test exists to cover: it must count
+	// in BOTH OnionCapable and ClearnetCapable, but NOT in ClearnetOnly.
+	const dualStackClearnetAddr = "203.0.113.30:18142"
+	const dualStackOnionAddr = "stats2234567abcdefghijklmnopqrstu.onion:18142"
+	dualStackPubkey := []byte("stats-test-registry-pubkey-dual-stack")
+	dualStackNode, err := store.UpsertConfirmedNode(ctx, dualStackClearnetAddr, dualStackPubkey, storage.DiscoverySourceRegistry)
+	if err != nil {
+		t.Fatalf("upsert dual-stack confirmed: %v", err)
+	}
+	pool, err := pgxpool.New(ctx, testDSN())
+	if err != nil {
+		t.Fatalf("connect to test db: %v", err)
+	}
+	defer pool.Close()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO node_addresses (node_id, address, first_seen, last_seen)
+		VALUES ($1, $2, now(), now())
+	`, dualStackNode.ID, dualStackOnionAddr); err != nil {
+		t.Fatalf("insert dual-stack node's onion address: %v", err)
+	}
+
 	// Record health checks with heights so NetworkHeight has a mode to
 	// report: p2pUnconfirmed and bothNode both latest at 500, so 500 is
 	// the mode across the 2 nodes with recorded heights.
@@ -2685,13 +2714,14 @@ func TestStatsEndpoint(t *testing.T) {
 	}
 
 	want := statsResponseForTest{
-		TotalNodes:         3,
-		ConfirmedNodes:     1,
+		TotalNodes:         4,
+		ConfirmedNodes:     2,
 		UnconfirmedNodes:   2,
 		P2PDiscovered:      1,
-		RegistryDiscovered: 1,
+		RegistryDiscovered: 2,
 		BothDiscovered:     1,
-		OnionCapable:       1,
+		OnionCapable:       2,
+		ClearnetCapable:    3,
 		ClearnetOnly:       2,
 
 		NetworkHeightNodeCount: 2,
@@ -2703,6 +2733,7 @@ func TestStatsEndpoint(t *testing.T) {
 		got.RegistryDiscovered != want.RegistryDiscovered ||
 		got.BothDiscovered != want.BothDiscovered ||
 		got.OnionCapable != want.OnionCapable ||
+		got.ClearnetCapable != want.ClearnetCapable ||
 		got.ClearnetOnly != want.ClearnetOnly ||
 		got.NetworkHeightNodeCount != want.NetworkHeightNodeCount {
 		t.Errorf("got %+v, want %+v", got, want)

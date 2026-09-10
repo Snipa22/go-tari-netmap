@@ -1502,6 +1502,9 @@ func TestFullNetworkSummaryCounts(t *testing.T) {
 	if !strings.Contains(body, `<div class="card-label">Onion-capable</div>`) {
 		t.Errorf("GET /network body missing the Onion-capable summary card")
 	}
+	if !strings.Contains(body, `<div class="card-label">Clearnet-capable</div>`) {
+		t.Errorf("GET /network body missing the Clearnet-capable summary card")
+	}
 	if !strings.Contains(body, `<div class="card-label">Clearnet-only</div>`) {
 		t.Errorf("GET /network body missing the Clearnet-only summary card")
 	}

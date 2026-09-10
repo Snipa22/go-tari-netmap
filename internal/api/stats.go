@@ -20,10 +20,11 @@ type NodeCounts struct {
 	Registry int
 	Both     int
 
-	Confirmed    int
-	Unconfirmed  int
-	OnionCapable int
-	ClearnetOnly int
+	Confirmed       int
+	Unconfirmed     int
+	OnionCapable    int
+	ClearnetCapable int
+	ClearnetOnly    int
 }
 
 // ComputeNodeCounts computes NodeCounts from an already-fetched slice of
@@ -36,10 +37,10 @@ type NodeCounts struct {
 // twice; handleStats below, which has no other use for that data, fetches
 // it itself just for this call.
 //
-// Confirmed/OnionCapable/ClearnetOnly are derived via ScrubNode — the
-// same single source of truth the rest of this package's privacy
-// contract runs through — rather than reimplementing that classification
-// here.
+// Confirmed/OnionCapable/ClearnetCapable/ClearnetOnly are derived via
+// ScrubNode — the same single source of truth the rest of this
+// package's privacy contract runs through — rather than reimplementing
+// that classification here.
 func ComputeNodeCounts(nodes []storage.Node, addrsByNode map[uuid.UUID][]storage.NodeAddress) NodeCounts {
 	var counts NodeCounts
 
@@ -62,6 +63,9 @@ func ComputeNodeCounts(nodes []storage.Node, addrsByNode map[uuid.UUID][]storage
 		}
 		if pn.HasOnion {
 			counts.OnionCapable++
+		}
+		if pn.HasIPv4 || pn.HasIPv6 {
+			counts.ClearnetCapable++
 		}
 		if (pn.HasIPv4 || pn.HasIPv6) && !pn.HasOnion {
 			counts.ClearnetOnly++
@@ -107,6 +111,7 @@ type statsResponse struct {
 	RegistryDiscovered int `json:"registry_discovered"`
 	BothDiscovered     int `json:"both_discovered"`
 	OnionCapable       int `json:"onion_capable"`
+	ClearnetCapable    int `json:"clearnet_capable"`
 	ClearnetOnly       int `json:"clearnet_only"`
 
 	NetworkHeight          *int64 `json:"network_height"`
@@ -142,6 +147,7 @@ func handleStats(store storage.Store) http.HandlerFunc {
 			RegistryDiscovered: counts.Registry,
 			BothDiscovered:     counts.Both,
 			OnionCapable:       counts.OnionCapable,
+			ClearnetCapable:    counts.ClearnetCapable,
 			ClearnetOnly:       counts.ClearnetOnly,
 
 			NetworkHeight:          height,

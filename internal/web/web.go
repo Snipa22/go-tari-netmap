@@ -101,10 +101,11 @@ type dashboardCounts struct {
 	Registry int
 	Both     int
 
-	Confirmed    int
-	Unconfirmed  int
-	OnionCapable int
-	ClearnetOnly int
+	Confirmed       int
+	Unconfirmed     int
+	OnionCapable    int
+	ClearnetCapable int
+	ClearnetOnly    int
 }
 
 // dashboardNodeRow is one row of a node table (the dashboard's or
@@ -390,10 +391,10 @@ func computeLikelyDead(history []storage.HealthCheck) bool {
 
 // buildNodeTableData fetches the whole-population dashboardCounts
 // (Total/P2P/Registry/Both/Confirmed/Unconfirmed/OnionCapable/
-// ClearnetOnly — always unfiltered, regardless of reachableSince) plus a
-// paginated page of dashboardNodeRow for a node table. reachableSince
-// nil means no filter (the full node population, for /network);
-// non-nil applies that cutoff (the main dashboard's
+// ClearnetCapable/ClearnetOnly — always unfiltered, regardless of
+// reachableSince) plus a paginated page of dashboardNodeRow for a node
+// table. reachableSince nil means no filter (the full node population,
+// for /network); non-nil applies that cutoff (the main dashboard's
 // dashboardReachableWindow liveness view). page/limit/offset drive the
 // SQL-level LIMIT/OFFSET of the paginated page; historyLimit controls
 // how many HealthCheck rows are fetched per row (see
@@ -442,10 +443,11 @@ func buildNodeTableData(ctx context.Context, store storage.Store, reachableSince
 		Registry: nc.Registry,
 		Both:     nc.Both,
 
-		Confirmed:    nc.Confirmed,
-		Unconfirmed:  nc.Unconfirmed,
-		OnionCapable: nc.OnionCapable,
-		ClearnetOnly: nc.ClearnetOnly,
+		Confirmed:       nc.Confirmed,
+		Unconfirmed:     nc.Unconfirmed,
+		OnionCapable:    nc.OnionCapable,
+		ClearnetCapable: nc.ClearnetCapable,
+		ClearnetOnly:    nc.ClearnetOnly,
 	}
 
 	// Paginated: the actual SQL-level LIMIT/OFFSET query backing the
