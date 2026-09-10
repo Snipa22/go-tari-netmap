@@ -2367,6 +2367,8 @@ func TestNonAdminAPIRoutesRemainUnauthenticated(t *testing.T) {
 	assertStatus("GET /topology", http.StatusOK, resp, err)
 	resp, err = http.Get(srv.URL + "/topology/top-peered")
 	assertStatus("GET /topology/top-peered", http.StatusOK, resp, err)
+	resp, err = http.Get(srv.URL + "/stats")
+	assertStatus("GET /stats", http.StatusOK, resp, err)
 
 	// POST /nodes: public node registration, exercised as a full
 	// request with a real body (same shape as TestCreateNodeValid).
@@ -2572,5 +2574,140 @@ func TestConfigPeerSeedsEndpointGenericHeaderWithoutNetwork(t *testing.T) {
 	text := string(body)
 	if !strings.Contains(text, "[p2p.seeds]\n") {
 		t.Errorf("body missing generic header:\n%s", text)
+	}
+}
+
+// statsResponseForTest mirrors internal/api's unexported statsResponse
+// JSON shape, so this external (api_test) test package can decode GET
+// /stats responses without needing that type exported.
+type statsResponseForTest struct {
+	TotalNodes         int `json:"total_nodes"`
+	ConfirmedNodes     int `json:"confirmed_nodes"`
+	UnconfirmedNodes   int `json:"unconfirmed_nodes"`
+	P2PDiscovered      int `json:"p2p_discovered"`
+	RegistryDiscovered int `json:"registry_discovered"`
+	BothDiscovered     int `json:"both_discovered"`
+	OnionCapable       int `json:"onion_capable"`
+	ClearnetOnly       int `json:"clearnet_only"`
+
+	NetworkHeight          *int64 `json:"network_height"`
+	NetworkHeightNodeCount int    `json:"network_height_node_count"`
+}
+
+// TestStatsEndpointEmpty asserts GET /stats returns all-zero counts and a
+// nil network_height against an empty database, matching
+// storage.Store.NetworkHeight's own (nil, 0, nil) "no data yet" return.
+func TestStatsEndpointEmpty(t *testing.T) {
+	srv, _ := newTestServer(t, nil)
+
+	resp, err := http.Get(srv.URL + "/stats")
+	if err != nil {
+		t.Fatalf("GET /stats: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	var got statsResponseForTest
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got != (statsResponseForTest{}) {
+		t.Errorf("got %+v, want all-zero/nil", got)
+	}
+}
+
+// TestStatsEndpoint asserts GET /stats' counts match a hand-built node
+// population spanning every discovery source (p2p/registry/both),
+// confirmed vs unconfirmed, and onion vs clearnet-only capability, plus
+// that network_height/network_height_node_count reflect the mode of the
+// latest-per-node heights recorded (see TestNetworkHeight in
+// internal/storage for the mode-computation semantics being surfaced
+// here).
+func TestStatsEndpoint(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
+
+	// p2pUnconfirmed: p2p_discovered, unconfirmed (no confirmed
+	// pubkey), clearnet-only address.
+	p2pUnconfirmed, err := store.UpsertDiscoveredNode(ctx, "203.0.113.10:18142", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert p2p unconfirmed: %v", err)
+	}
+
+	// registryConfirmedOnion: registry_submitted, confirmed, onion-only
+	// address.
+	registryPubkey := []byte("stats-test-registry-pubkey-onion")
+	if _, err := store.UpsertConfirmedNode(ctx, "abcdefghijklmnopqrstuvwxyz234567.onion:18142", registryPubkey, storage.DiscoverySourceRegistry); err != nil {
+		t.Fatalf("upsert registry confirmed onion: %v", err)
+	}
+
+	// bothUnconfirmedClearnet: discovered via BOTH p2p and registry
+	// (same address submitted/observed via each path), unconfirmed,
+	// clearnet-only address.
+	const bothAddr = "203.0.113.20:18142"
+	if _, err := store.UpsertDiscoveredNode(ctx, bothAddr, storage.DiscoverySourceP2P, nil, nil); err != nil {
+		t.Fatalf("upsert both (p2p leg): %v", err)
+	}
+	bothNode, err := store.UpsertDiscoveredNode(ctx, bothAddr, storage.DiscoverySourceRegistry, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert both (registry leg): %v", err)
+	}
+	if bothNode.DiscoverySource != storage.DiscoverySourceBoth {
+		t.Fatalf("bothNode.DiscoverySource = %q, want %q", bothNode.DiscoverySource, storage.DiscoverySourceBoth)
+	}
+
+	// Record health checks with heights so NetworkHeight has a mode to
+	// report: p2pUnconfirmed and bothNode both latest at 500, so 500 is
+	// the mode across the 2 nodes with recorded heights.
+	h500 := int64(500)
+	if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{NodeID: p2pUnconfirmed.ID, Reachable: true, ProbeSource: storage.ProbeSourceGRPC, Height: &h500}); err != nil {
+		t.Fatalf("record health p2pUnconfirmed: %v", err)
+	}
+	if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{NodeID: bothNode.ID, Reachable: true, ProbeSource: storage.ProbeSourceGRPC, Height: &h500}); err != nil {
+		t.Fatalf("record health bothNode: %v", err)
+	}
+
+	resp, err := http.Get(srv.URL + "/stats")
+	if err != nil {
+		t.Fatalf("GET /stats: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, http.StatusOK, body)
+	}
+
+	var got statsResponseForTest
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	want := statsResponseForTest{
+		TotalNodes:         3,
+		ConfirmedNodes:     1,
+		UnconfirmedNodes:   2,
+		P2PDiscovered:      1,
+		RegistryDiscovered: 1,
+		BothDiscovered:     1,
+		OnionCapable:       1,
+		ClearnetOnly:       2,
+
+		NetworkHeightNodeCount: 2,
+	}
+	if got.TotalNodes != want.TotalNodes ||
+		got.ConfirmedNodes != want.ConfirmedNodes ||
+		got.UnconfirmedNodes != want.UnconfirmedNodes ||
+		got.P2PDiscovered != want.P2PDiscovered ||
+		got.RegistryDiscovered != want.RegistryDiscovered ||
+		got.BothDiscovered != want.BothDiscovered ||
+		got.OnionCapable != want.OnionCapable ||
+		got.ClearnetOnly != want.ClearnetOnly ||
+		got.NetworkHeightNodeCount != want.NetworkHeightNodeCount {
+		t.Errorf("got %+v, want %+v", got, want)
+	}
+	if got.NetworkHeight == nil || *got.NetworkHeight != h500 {
+		t.Errorf("NetworkHeight = %v, want pointer to %d", got.NetworkHeight, h500)
 	}
 }
