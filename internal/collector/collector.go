@@ -158,10 +158,10 @@ const DiscoveryPassDeadline = 4 * time.Minute
 
 // ownedDiscoveryWorkers bounds the number of concurrent in-flight
 // GetPeers calls within a single DiscoverOwned pass, mirroring
-// maxPollWorkers' errgroup.SetLimit pattern in poll() but sized very
+// maxGRPCPollWorkers' errgroup.SetLimit pattern in poll() but sized very
 // differently: there are only ever a handful of owned/seed nodes in
 // production (unlike the tens of thousands of generic nodes
-// maxPollWorkers is sized for), so serializing them behind each other's
+// maxGRPCPollWorkers is sized for), so serializing them behind each other's
 // dial timeouts (up to dialTimeout, 180s, each — see
 // grpc_client.go/p2p_client.go) is exactly the kind of avoidable
 // head-of-line delay DiscoverOwned exists to eliminate. 16 is a
@@ -172,19 +172,66 @@ const DiscoveryPassDeadline = 4 * time.Minute
 // the common case.
 const ownedDiscoveryWorkers = 16
 
-// maxPollWorkers bounds the number of concurrent in-flight PollOnce calls
-// within a single poll() pass (shared by PollConfirmed, PollUnconfirmed,
-// and PollNeverContacted). Each PollOnce dial can take up to dialTimeout
-// (see grpc_client.go/p2p_client.go, currently 180s), and with tens of
-// thousands of tracked nodes, fully sequential dialing cannot remotely
-// keep up with the poll cadences above — see this repo's
-// collector-concurrency-brief for the full rationale. Originally raised
-// to 100 as a deliberate step up from strictly-sequential (1) per
-// Alex's request to "walk the network more aggressively"; raised again
-// to 250 per updated guidance from Alex, for the same reason — still a
-// fixed, bounded worst case (never one goroutine per due node,
-// unbounded), just a bigger deliberate number.
-const maxPollWorkers = 250
+// maxGRPCPollWorkers bounds the number of concurrent in-flight gRPC PollOnce dials within a
+// single poll() pass (shared by PollConfirmed, PollUnconfirmed, and PollNeverContacted). Each
+// gRPC dial can take up to dialTimeout (see grpc_client.go, currently 180s), and with tens of
+// thousands of tracked nodes, fully sequential dialing cannot remotely keep up with the poll
+// cadences above — see this repo's collector-concurrency-brief for the full rationale.
+// Originally raised to 100 as a deliberate step up from strictly-sequential (1) per Alex's
+// request to "walk the network more aggressively"; raised again to 250 per updated guidance
+// from Alex, for the same reason — still a fixed, bounded worst case (never one goroutine per
+// due node, unbounded), just a bigger deliberate number.
+//
+// Named maxGRPCPollWorkers (previously maxPollWorkers, before the P2P dial got its own,
+// separate, much smaller concurrency bound -- see maxP2PWorkersPerShard) because a single local
+// Tor SocksPort instance saturates catastrophically anywhere near this many concurrent hidden-
+// service circuit builds, even though 250 is completely fine for gRPC dials -- gRPC and P2P/
+// onion dials are no longer dispatched through one shared errgroup, see poll()'s doc comment.
+const maxGRPCPollWorkers = 250
+
+// maxP2PWorkersPerShard bounds the number of concurrent in-flight P2P/onion PollOnce dials
+// against a SINGLE Tor SOCKS-proxy shard (see P2PShardIndex/p2pNodeClient.ShardCount) within a
+// single poll() pass. This is deliberately far lower than maxGRPCPollWorkers: a single local Tor
+// SocksPort instance saturates catastrophically anywhere near 250 concurrent hidden-service
+// circuit builds (confirmed live: journalctl showed "No more HSDir available to query", circuit
+// resets, ~2.4% P2P probe success rate at that concurrency against one Tor instance) even though
+// 250 is completely fine for gRPC dials. 20 is a deliberate, much-lower per-shard default; total
+// P2P concurrency across ALL shards combined is maxP2PWorkersPerShard * shardCount, which
+// sharding P2P dials across N independent Tor instances (see p2p_client.go's
+// NewP2PClientWithShardedProxies) is what makes a large total P2P concurrency viable at all
+// without any single Tor instance ever seeing more than this many concurrent circuit builds.
+//
+// This constant does NOT need to be env-configurable, unlike the shard COUNT and shard SOCKS
+// addresses (see cmd/netmap/main.go's NETMAP_SOCKS_PROXY_ADDRS) -- it is an internal safety
+// valve protecting a single Tor instance from being overwhelmed, not a topology fact about how
+// many Tor instances are deployed, so there is no operational reason to tune it per-deployment.
+const maxP2PWorkersPerShard = 20
+
+// Sharded is implemented by NodeClient implementations that shard their dials across multiple
+// independent backing resources (see p2pNodeClient's ShardCount/socksProxyAddrs field for the
+// P2P/Tor-SOCKS-proxy case). poll()'s P2P dispatch (see its doc comment) type-asserts
+// c.P2PClient against this interface so it can bound P2P concurrency PER SHARD using the exact
+// same shard assignment the client itself uses to pick its SOCKS proxy for a given address (see
+// P2PShardIndex) — these two MUST agree, or the whole point (bounding concurrency per real Tor
+// instance) breaks.
+type Sharded interface {
+	ShardCount() int
+}
+
+// p2pShardCount returns client's shard count via the Sharded interface, or 1 if client is nil
+// or doesn't implement Sharded (e.g. a plain unsharded NewP2PClient()/NewP2PClientWithOptions()
+// result, or a test fake NodeClient that doesn't implement Sharded at all) — 1 shard means
+// poll()'s per-shard P2P dispatch degenerates to a single maxP2PWorkersPerShard-bounded worker
+// pool, exactly as if sharding didn't exist.
+func p2pShardCount(client NodeClient) int {
+	if client == nil {
+		return 1
+	}
+	if s, ok := client.(Sharded); ok {
+		return max(1, s.ShardCount())
+	}
+	return 1
+}
 
 // NodeInfo is the subset of a Tari base node's health/sync-status info
 // needed to record a health check.
@@ -887,7 +934,7 @@ func (c *Collector) DiscoverOwned(ctx context.Context) error {
 // discoverOwnedWith fans out walkNodePeers calls, bounded to at most
 // ownedDiscoveryWorkers concurrent in-flight GetPeers calls via an
 // errgroup.Group with SetLimit — mirroring poll()'s existing
-// maxPollWorkers pattern exactly, just with a much smaller pool sized
+// maxGRPCPollWorkers pattern exactly, just with a much smaller pool sized
 // for a much smaller (owned/seed-only) node set. Every worker always
 // returns nil (errors are logged inline by walkNodePeers itself,
 // exactly as discoverWith does), so g.Wait()'s return value can never
@@ -1064,32 +1111,69 @@ func (c *Collector) QueueSizes(ctx context.Context) (confirmed, unconfirmed, nev
 }
 
 // poll checks all nodes matching filter and, for those whose next-poll
-// time is due, calls PollOnce. Shared by PollConfirmed, PollUnconfirmed,
-// and PollNeverContacted — all three call the same due/setNextPoll/
-// PollOnce/jitter logic, just over a filtered node set each; per-node
-// poll-interval selection (pollInterval) is completely unaffected by
-// this split, since it already branches on n.PublicKey (and, for the
-// never-contacted case, on empty history) itself.
+// time is due, dials each configured transport for that node. Shared by
+// PollConfirmed, PollUnconfirmed, and PollNeverContacted — all three
+// call the same due/setNextPoll/dispatch/jitter logic, just over a
+// filtered node set each; per-node poll-interval selection
+// (pollInterval) is completely unaffected by this split, since it
+// already branches on n.PublicKey (and, for the never-contacted case,
+// on empty history) itself.
 //
 // The due()/setNextPoll() bookkeeping for every node runs sequentially,
 // single-threaded, in this same top-level loop, BEFORE any concurrent
 // dialing is dispatched below — so it needs no additional
 // synchronization beyond c.mu's existing per-key locking (see due/
 // setNextPoll), and each node's next-poll time is still set exactly
-// once per pass with no race, regardless of maxPollWorkers. Only the
-// actual network dial (PollOnce, the expensive/slow part) runs
-// concurrently, bounded to at most maxPollWorkers (250) simultaneous
-// in-flight calls via an errgroup.Group with SetLimit — see this
-// repo's collector-concurrency-brief for why strictly-sequential
-// dialing could not keep up with tens of thousands of tracked nodes.
+// once per pass with no race, regardless of how the actual dials are
+// dispatched.
+//
+// Unlike before, the gRPC dial and the P2P dial for a given due node are
+// NOT dispatched through one shared errgroup/PollOnce call — they run
+// through TWO INDEPENDENT concurrency-bounded dispatchers:
+//
+//   - gRPC dials all share one errgroup.Group bounded to
+//     maxGRPCPollWorkers (250) simultaneous in-flight calls, exactly as
+//     the combined pool was bounded before this split.
+//   - P2P/onion dials are spread across shardCount independent
+//     errgroup.Groups (one per Tor-SOCKS-proxy shard — see
+//     P2PShardIndex/Sharded/p2pShardCount), each bounded to
+//     maxP2PWorkersPerShard (20) simultaneous in-flight calls. A given
+//     node's P2P dial is routed to shardGroups[P2PShardIndex(n.Address,
+//     shardCount)] — the EXACT same shard assignment c.P2PClient itself
+//     uses internally to pick its SOCKS proxy for that address (see
+//     p2pNodeClient.proxyForAddr) — so no more than
+//     maxP2PWorkersPerShard P2P dials are ever in flight against the
+//     SAME real Tor instance at once, regardless of how many total
+//     nodes are due across all shards combined; total P2P concurrency
+//     across all shards combined is maxP2PWorkersPerShard * shardCount.
+//
+// This split exists because a single local Tor SocksPort instance
+// saturates catastrophically anywhere near maxGRPCPollWorkers (250)
+// concurrent hidden-service circuit builds, even though that concurrency
+// is completely fine for gRPC dials — see maxP2PWorkersPerShard's doc
+// comment for the confirmed-live failure mode this fixes.
+//
+// Each transport's health check is still recorded independently exactly
+// as before this split — see pollTransportOnce, shared by this dispatch
+// and by PollOnce — only the CONCURRENCY DISPATCH changes here, not the
+// per-node/per-transport recording semantics. PollOnce itself (the
+// exported function used by API poll-now/submission-approval call
+// sites) keeps its existing synchronous "call gRPC then P2P for one
+// node" contract completely unchanged — this restructure is specifically
+// about this BULK scheduled poll() loop's fan-out, not PollOnce's public
+// contract.
+//
 // dialJitter is applied per-worker, immediately before that worker's
-// own dial, rather than once for the whole batch — a single
-// batch-wide sleep would serialize away the entire concurrency benefit
-// of the worker pool. PollOnce errors are logged, never returned/
-// aborted — one node's dial failing must never affect any other node's
-// dial in the same pass. g.Wait()'s return value is intentionally
-// discarded: every worker func always returns nil (errors are logged
-// inline instead), so it can never itself report an error.
+// own dial, rather than once for the whole batch — a single batch-wide
+// sleep would serialize away the entire concurrency benefit of the
+// worker pools; since gRPC and P2P now dispatch independently, a given
+// node's two transport dials (if both configured) each get their own
+// independent jitter delay rather than sharing one. Every dial error is
+// logged, never returned/aborted — one node's dial failing must never
+// affect any other node's dial in the same pass. Every g.Wait() return
+// value is intentionally discarded: every worker func always returns
+// nil (errors are logged inline instead), so none can ever itself
+// report an error.
 func (c *Collector) poll(ctx context.Context, filter storage.NodeFilter) error {
 	if c.Storage == nil {
 		return errors.New("collector: Storage is not configured")
@@ -1101,8 +1185,17 @@ func (c *Collector) poll(ctx context.Context, filter storage.NodeFilter) error {
 	}
 
 	now := time.Now()
-	var g errgroup.Group
-	g.SetLimit(maxPollWorkers)
+
+	var grpcGroup errgroup.Group
+	grpcGroup.SetLimit(maxGRPCPollWorkers)
+
+	shardCount := p2pShardCount(c.P2PClient)
+	shardGroups := make([]*errgroup.Group, shardCount)
+	for i := range shardGroups {
+		g := &errgroup.Group{}
+		g.SetLimit(maxP2PWorkersPerShard)
+		shardGroups[i] = g
+	}
 
 	for _, n := range nodes {
 		if !c.due(n.Address, now) {
@@ -1111,17 +1204,35 @@ func (c *Collector) poll(ctx context.Context, filter storage.NodeFilter) error {
 		c.setNextPoll(n.Address, now.Add(c.pollInterval(ctx, n)))
 
 		n := n
-		g.Go(func() error {
-			if jitter := c.dialJitter(); jitter > 0 {
-				time.Sleep(jitter)
-			}
-			if err := PollOnce(ctx, c.GRPCClient, c.P2PClient, c.Storage, n, c.OnPollResult); err != nil {
-				log.Printf("collector: poll %s: %v", n.Address, err)
-			}
-			return nil
-		})
+		if c.GRPCClient != nil {
+			grpcGroup.Go(func() error {
+				if jitter := c.dialJitter(); jitter > 0 {
+					time.Sleep(jitter)
+				}
+				if err := pollTransportOnce(ctx, c.GRPCClient, c.Storage, n, storage.ProbeSourceGRPC, c.OnPollResult); err != nil {
+					log.Printf("collector: poll %s (grpc): %v", n.Address, err)
+				}
+				return nil
+			})
+		}
+		if c.P2PClient != nil {
+			shardGroup := shardGroups[P2PShardIndex(n.Address, shardCount)]
+			shardGroup.Go(func() error {
+				if jitter := c.dialJitter(); jitter > 0 {
+					time.Sleep(jitter)
+				}
+				if err := pollTransportOnce(ctx, c.P2PClient, c.Storage, n, storage.ProbeSourceP2P, c.OnPollResult); err != nil {
+					log.Printf("collector: poll %s (p2p): %v", n.Address, err)
+				}
+				return nil
+			})
+		}
 	}
-	_ = g.Wait()
+
+	_ = grpcGroup.Wait()
+	for _, g := range shardGroups {
+		_ = g.Wait()
+	}
 	return nil
 }
 

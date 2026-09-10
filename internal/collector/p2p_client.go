@@ -3,6 +3,7 @@ package collector
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"time"
 
@@ -10,6 +11,25 @@ import (
 	pb "github.com/Snipa22/go-tari-lib/p2p/proto"
 	rpcpkg "github.com/Snipa22/go-tari-lib/p2p/rpc"
 )
+
+// P2PShardIndex returns which shard (in [0, shardCount)) addr routes to, via a stable FNV-1a
+// hash of addr — deterministic across calls/processes/restarts (unlike Go's native map
+// iteration order or a pointer-identity hash), so a given address always lands on the same
+// shard. shardCount <= 0 is treated as 1 (no sharding, everything routes to shard 0).
+//
+// This is exported so it's independently unit-testable and so collector.go's poll() P2P
+// concurrency dispatch (see Sharded/p2pShardCount) can use the EXACT same shard assignment
+// p2pNodeClient itself uses to pick its SOCKS proxy for a given address (see
+// p2pNodeClient.proxyForAddr) — these two must agree, or the whole point of bounding
+// concurrency PER real Tor instance breaks.
+func P2PShardIndex(addr string, shardCount int) int {
+	if shardCount <= 0 {
+		return 0
+	}
+	h := fnv.New32a()
+	h.Write([]byte(addr))
+	return int(h.Sum32() % uint32(shardCount))
+}
 
 // p2pDialTimeout bounds how long p2pNodeClient waits for a single probe
 // (handshake + identity exchange + the actual RPC call) to complete before

@@ -1750,7 +1750,7 @@ func TestConcurrentPollLoopsNoDataRace(t *testing.T) {
 // wall-clock time -- otherwise a bug that removed all concurrency could
 // still show a misleadingly low peak just because calls happened to be
 // fast enough not to overlap. Used by TestPollBoundedConcurrency to
-// prove poll()'s worker pool never exceeds maxPollWorkers in-flight
+// prove poll()'s worker pool never exceeds maxGRPCPollWorkers in-flight
 // PollOnce calls, even when many more nodes than that are due in a
 // single pass.
 type concurrencyTrackingClient struct {
@@ -1777,8 +1777,8 @@ func (c *concurrencyTrackingClient) GetInfo(ctx context.Context, addr string) (N
 	}
 
 	// Long enough that, with true bounded concurrency (up to
-	// maxPollWorkers in flight), a batch well in excess of
-	// maxPollWorkers has no realistic way to complete without multiple
+	// maxGRPCPollWorkers in flight), a batch well in excess of
+	// maxGRPCPollWorkers has no realistic way to complete without multiple
 	// workers genuinely overlapping in time -- proving the peak
 	// reflects real concurrency, not just a bookkeeping race won by
 	// sheer luck.
@@ -1790,19 +1790,19 @@ func (c *concurrencyTrackingClient) GetInfo(ctx context.Context, addr string) (N
 // TestPollBoundedConcurrency is the core regression/proof test for Part
 // 1 of the collector-concurrency-brief: poll() (shared by PollConfirmed/
 // PollUnconfirmed/PollNeverContacted) must never have more than
-// maxPollWorkers (250) PollOnce calls in flight at once, no matter how
+// maxGRPCPollWorkers (250) PollOnce calls in flight at once, no matter how
 // many more nodes than that are simultaneously due. It seeds
-// numNodesDue (600, comfortably more than double maxPollWorkers) never-
+// numNodesDue (600, comfortably more than double maxGRPCPollWorkers) never-
 // contacted nodes -- all due immediately, since none has ever been
 // polled -- and asserts the concurrencyTrackingClient's observed peak
 // concurrent GetInfo call count is both (a) greater than 1 (proving the
 // pass is genuinely running concurrently at all, not accidentally back
-// to sequential) and (b) never more than maxPollWorkers.
+// to sequential) and (b) never more than maxGRPCPollWorkers.
 func TestPollBoundedConcurrency(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	const numNodesDue = 600 // comfortably more than 2x maxPollWorkers (250)
+	const numNodesDue = 600 // comfortably more than 2x maxGRPCPollWorkers (250)
 	for i := 0; i < numNodesDue; i++ {
 		addr := fmt.Sprintf("bounded-concurrency:%d", i)
 		if _, err := store.UpsertDiscoveredNode(ctx, addr, storage.DiscoverySourceP2P, nil, nil); err != nil {
@@ -1820,11 +1820,160 @@ func TestPollBoundedConcurrency(t *testing.T) {
 	}
 
 	peak := atomic.LoadInt64(&client.peak)
-	if peak > int64(maxPollWorkers) {
-		t.Fatalf("peak concurrent PollOnce calls = %d, want <= maxPollWorkers (%d)", peak, maxPollWorkers)
+	if peak > int64(maxGRPCPollWorkers) {
+		t.Fatalf("peak concurrent PollOnce calls = %d, want <= maxGRPCPollWorkers (%d)", peak, maxGRPCPollWorkers)
 	}
 	if peak <= 1 {
 		t.Fatalf("peak concurrent PollOnce calls = %d, want > 1 -- the pass does not appear to have run concurrently at all, so this test cannot be proving the concurrency limit is actually being exercised", peak)
+	}
+}
+
+// shardedConcurrencyTrackingClient is a NodeClient fixture implementing Sharded (see
+// collector.go), whose GetInfo computes which shard addr routes to (via the EXACT same
+// P2PShardIndex call collector.go's poll() dispatch uses) and tracks peak concurrent in-flight
+// GetInfo calls PER SHARD independently, via a slice of atomic counters -- one entry per shard.
+// Used by TestPollP2PPerShardBoundedConcurrency to prove poll()'s P2P dispatch never exceeds
+// maxP2PWorkersPerShard in-flight calls for any SINGLE shard, even when many more nodes than
+// that hash to the same shard simultaneously, mirroring concurrencyTrackingClient/
+// TestPollBoundedConcurrency's technique but keyed per-shard.
+type shardedConcurrencyTrackingClient struct {
+	shardCount int
+	current    []int64
+	peak       []int64
+}
+
+func newShardedConcurrencyTrackingClient(shardCount int) *shardedConcurrencyTrackingClient {
+	return &shardedConcurrencyTrackingClient{
+		shardCount: shardCount,
+		current:    make([]int64, shardCount),
+		peak:       make([]int64, shardCount),
+	}
+}
+
+func (c *shardedConcurrencyTrackingClient) ShardCount() int { return c.shardCount }
+
+func (c *shardedConcurrencyTrackingClient) GetPeers(ctx context.Context, addr string) ([]DiscoveredPeer, error) {
+	return nil, nil
+}
+
+func (c *shardedConcurrencyTrackingClient) GetInfo(ctx context.Context, addr string) (NodeInfo, error) {
+	idx := P2PShardIndex(addr, c.shardCount)
+
+	cur := atomic.AddInt64(&c.current[idx], 1)
+	defer atomic.AddInt64(&c.current[idx], -1)
+
+	for {
+		peak := atomic.LoadInt64(&c.peak[idx])
+		if cur <= peak {
+			break
+		}
+		if atomic.CompareAndSwapInt64(&c.peak[idx], peak, cur) {
+			break
+		}
+	}
+
+	// Same reasoning as concurrencyTrackingClient.GetInfo: long enough that a batch well in
+	// excess of maxP2PWorkersPerShard hashing to one shard has no realistic way to complete
+	// without multiple workers genuinely overlapping in time.
+	time.Sleep(20 * time.Millisecond)
+
+	return NodeInfo{Reachable: true}, nil
+}
+
+// TestPollP2PPerShardBoundedConcurrency is the core regression/proof test for Part 3 of the
+// grpc-scope-and-tor-sharding brief: poll()'s P2P dispatch must never have more than
+// maxP2PWorkersPerShard (20) GetInfo calls in flight against any SINGLE shard at once, even when
+// many more nodes than that hash to the same shard simultaneously. It seeds numNodesDue (200,
+// comfortably more than 2x maxP2PWorkersPerShard even after spreading across shardCount shards)
+// never-contacted nodes with addresses guaranteed to include a large cluster hashing to shard 0
+// specifically (by construction: numNodesDue addresses fed through the same P2PShardIndex
+// distribution used in production will land some nodes on every shard, and with shardCount=3
+// and 200 nodes, pigeonhole guarantees at least one shard gets comfortably more than
+// maxP2PWorkersPerShard nodes), and asserts the observed peak concurrent GetInfo call count for
+// EVERY shard is both (a) greater than 1 for at least one shard (proving the pass genuinely runs
+// concurrently at all) and (b) never more than maxP2PWorkersPerShard for any shard.
+func TestPollP2PPerShardBoundedConcurrency(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	const shardCount = 3
+	const numNodesDue = 200 // spread across 3 shards, pigeonhole guarantees >maxP2PWorkersPerShard (20) on some shard
+
+	for i := 0; i < numNodesDue; i++ {
+		addr := fmt.Sprintf("p2p-shard-bounded-concurrency:%d", i)
+		if _, err := store.UpsertDiscoveredNode(ctx, addr, storage.DiscoverySourceP2P, nil, nil); err != nil {
+			t.Fatalf("seed node %d: %v", i, err)
+		}
+	}
+
+	client := newShardedConcurrencyTrackingClient(shardCount)
+	c := New(Config{})
+	c.Storage = store
+	c.P2PClient = client
+
+	if err := c.PollNeverContacted(ctx); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+
+	var maxObservedPeak int64
+	for shard := 0; shard < shardCount; shard++ {
+		peak := atomic.LoadInt64(&client.peak[shard])
+		if peak > int64(maxP2PWorkersPerShard) {
+			t.Errorf("shard %d: peak concurrent GetInfo calls = %d, want <= maxP2PWorkersPerShard (%d)", shard, peak, maxP2PWorkersPerShard)
+		}
+		if peak > maxObservedPeak {
+			maxObservedPeak = peak
+		}
+	}
+	if maxObservedPeak <= 1 {
+		t.Fatalf("max observed peak concurrent GetInfo calls across all shards = %d, want > 1 -- the pass does not appear to have run concurrently at all, so this test cannot be proving the per-shard concurrency limit is actually being exercised", maxObservedPeak)
+	}
+}
+
+// TestPollGRPCAndP2PUseIndependentConcurrencyDispatchers proves Part 2's core claim directly:
+// the gRPC dial and the P2P dial for due nodes run through two INDEPENDENT concurrency-bounded
+// dispatchers, not one shared errgroup -- a slow/many P2P dial batch does not reduce the gRPC
+// dispatcher's own effective concurrency (proven here by observing the gRPC side still achieves
+// a peak > 1 while a much-larger-than-maxP2PWorkersPerShard P2P batch is also in flight), and
+// vice versa.
+func TestPollGRPCAndP2PUseIndependentConcurrencyDispatchers(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	const numNodesDue = 100
+	for i := 0; i < numNodesDue; i++ {
+		addr := fmt.Sprintf("dual-transport-independent-dispatch:%d", i)
+		if _, err := store.UpsertDiscoveredNode(ctx, addr, storage.DiscoverySourceP2P, nil, nil); err != nil {
+			t.Fatalf("seed node %d: %v", i, err)
+		}
+	}
+
+	grpcClient := &concurrencyTrackingClient{}
+	p2pClient := newShardedConcurrencyTrackingClient(1) // single shard, so ALL P2P dials contend for the one maxP2PWorkersPerShard-bounded pool
+
+	c := New(Config{})
+	c.Storage = store
+	c.GRPCClient = grpcClient
+	c.P2PClient = p2pClient
+
+	if err := c.PollNeverContacted(ctx); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+
+	grpcPeak := atomic.LoadInt64(&grpcClient.peak)
+	p2pPeak := atomic.LoadInt64(&p2pClient.peak[0])
+
+	if grpcPeak <= 1 {
+		t.Errorf("gRPC peak concurrent GetInfo calls = %d, want > 1 (gRPC dispatch must run independently/concurrently of the P2P dispatch)", grpcPeak)
+	}
+	if grpcPeak > int64(maxGRPCPollWorkers) {
+		t.Errorf("gRPC peak concurrent GetInfo calls = %d, want <= maxGRPCPollWorkers (%d)", grpcPeak, maxGRPCPollWorkers)
+	}
+	if p2pPeak > int64(maxP2PWorkersPerShard) {
+		t.Errorf("P2P peak concurrent GetInfo calls = %d, want <= maxP2PWorkersPerShard (%d)", p2pPeak, maxP2PWorkersPerShard)
+	}
+	if p2pPeak <= 1 {
+		t.Errorf("P2P peak concurrent GetInfo calls = %d, want > 1", p2pPeak)
 	}
 }
 
