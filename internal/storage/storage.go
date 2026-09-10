@@ -98,7 +98,10 @@ type Store interface {
 	// filter.Confirmed, when non-nil, further restricts results to
 	// confirmed (PublicKey != nil) or unconfirmed (PublicKey == nil)
 	// nodes only (see NodeFilter's doc comment) — also strictly
-	// opt-in, a nil Confirmed never filters anything out.
+	// opt-in, a nil Confirmed never filters anything out. filter.Owned,
+	// when non-nil, further restricts results by the pool-owned tag
+	// predicate (see NodeFilter.Owned's doc comment) — also strictly
+	// opt-in, a nil Owned never filters anything out.
 	ListNodes(ctx context.Context, filter NodeFilter) ([]Node, error)
 
 	// CountNodes returns the total number of nodes matching filter's
@@ -769,6 +772,42 @@ func (s *pgStore) ListNodes(ctx context.Context, filter NodeFilter) ([]Node, err
 			clauses = append(clauses, exists)
 		} else {
 			clauses = append(clauses, "NOT "+exists)
+		}
+	}
+
+	if filter.Owned != nil {
+		// Mirrors collector.isPoolOwned's exact predicate (see
+		// NodeFilter.Owned's doc comment): tags @> '{"pool_owned":
+		// true}' only matches a genuine JSON boolean true (not the
+		// string "true", not false) — jsonb containment compares by
+		// value AND type, same as isPoolOwned's `v.(bool)` type
+		// assertion in Go. The owner half additionally checks
+		// jsonb_typeof(...) = 'string' before comparing != '' so a
+		// non-string owner value (e.g. a stray number) isn't
+		// miscounted as owned via ->>'s implicit text cast, again
+		// matching isPoolOwned's `v.(string)` type assertion exactly.
+		// The whole OR is wrapped in COALESCE(..., false): a node
+		// with no "owner" key at all makes jsonb_typeof(tags->'owner')
+		// SQL NULL, and `false OR NULL` is NULL (not false) under
+		// three-valued logic — without the COALESCE, ListNodes would
+		// fail to scan that NULL into filter.Owned's bool column
+		// (or, for Owned: false, would wrongly exclude every node
+		// with no owner key under `NOT NULL` also being NULL) instead
+		// of correctly resolving to "not owned".
+		//
+		// Expressed as a full SQL/JSONB clause (rather than the
+		// "fetch Confirmed: true, then filter in-memory with
+		// isPoolOwned" alternative floated in this repo's
+		// discovery-starvation brief) since it's a direct, minimal
+		// mirror of the existing Confirmed/HasHealthChecks clauses
+		// above and keeps ListNodes as the single source of truth for
+		// every NodeFilter field, rather than splitting "owned" logic
+		// between a SQL confirmed-filter and a Go-side helper.
+		ownedPredicate := `COALESCE(tags @> '{"pool_owned": true}'::jsonb OR (jsonb_typeof(tags->'owner') = 'string' AND tags->>'owner' <> ''), false)`
+		if *filter.Owned {
+			clauses = append(clauses, ownedPredicate)
+		} else {
+			clauses = append(clauses, "NOT "+ownedPredicate)
 		}
 	}
 
