@@ -116,6 +116,28 @@ type NodeFilter struct {
 	// of however many unconfirmed placeholder nodes exist, and vice
 	// versa.
 	Confirmed *bool
+
+	// HasHealthChecks, if non-nil, restricts results by whether a node
+	// has at least one node_health row ever recorded for it: true means
+	// "at least one health check exists", false means "zero health
+	// checks exist" (i.e. never once probed, successfully or not — see
+	// pollOnceWithSource in internal/collector/collector.go, which
+	// records a health-check row on every PollOnce attempt regardless
+	// of outcome, so "zero rows" really does mean "never attempted",
+	// not just "never succeeded"). A nil HasHealthChecks (the zero
+	// value) means "no filtering", following the same convention as
+	// Confirmed/ReachableSince above — a zero-value NodeFilter{} must
+	// remain completely unaffected by this field's mere existence. This
+	// backs the collector's three-way confirmed/unconfirmed/
+	// never-contacted poll-queue split (see collector.PollNeverContacted
+	// and PollUnconfirmed's tightened filter): a never-contacted node is
+	// Confirmed: false AND HasHealthChecks: false, while a "regular"
+	// unconfirmed node (one with failed-probe history but no confirmed
+	// pubkey yet) is Confirmed: false AND HasHealthChecks: true — the
+	// two are mutually exclusive and exhaustive over the unconfirmed
+	// population, so no node is ever double-polled or skipped by both
+	// loops.
+	HasHealthChecks *bool
 }
 
 // TopologyFilter filters/caps the result of ListTopology. A zero-value
