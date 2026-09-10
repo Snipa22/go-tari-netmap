@@ -192,6 +192,18 @@ func (c *grpcNodeClient) GetPeers(ctx context.Context, addr string) ([]Discovere
 	return peers, nil
 }
 
+// ParsePeerAddress is the exported form of parsePeerAddress, for callers
+// outside this package that need to decode a raw Tari peer address into
+// a "host:port" string (e.g. cmd/netmap-p2p-responder decoding a
+// p2p.PeerInfo's self-claimed Addresses, the same raw-multiaddr-bytes
+// shape this function already handles for gRPC/P2P GetPeers claims — see
+// parsePeerAddress's doc comment for the exact encodings handled). This
+// exists so that decoding logic is written and tested exactly once
+// rather than reinvented per caller.
+func ParsePeerAddress(raw []byte) (string, bool) {
+	return parsePeerAddress(raw)
+}
+
 // parsePeerAddress attempts to extract a "host:port" string from a Tari
 // peer Address's raw bytes.
 //
