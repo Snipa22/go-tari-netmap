@@ -11,7 +11,7 @@ import (
 
 // NodeCounts is the whole-population node count summary shared by the
 // HTML dashboard (internal/web's dashboardCounts, built from this) and
-// the JSON GET /stats endpoint (handleStats below). It mirrors exactly
+// the JSON GET /v1/stats endpoint (handleStats below). It mirrors exactly
 // what buildNodeTableData (internal/web/web.go) used to compute inline
 // before this was factored out — same fields, same semantics.
 type NodeCounts struct {
@@ -93,7 +93,7 @@ func fetchNodeCounts(ctx context.Context, store storage.Store) (NodeCounts, erro
 	return ComputeNodeCounts(nodes, addrsByNode), nil
 }
 
-// statsResponse is the GET /stats response body: the same whole-
+// statsResponse is the GET /v1/stats response body: the same whole-
 // population node counts shown on the HTML dashboard (see NodeCounts),
 // plus the network-height context also shown there. NetworkHeight is
 // nullable (*int64), matching storage.Store.NetworkHeight's own return —
@@ -113,7 +113,7 @@ type statsResponse struct {
 	NetworkHeightNodeCount int    `json:"network_height_node_count"`
 }
 
-// handleStats serves GET /stats: a simple, read-only JSON snapshot of the
+// handleStats serves GET /v1/stats: a simple, read-only JSON snapshot of the
 // whole node population's counts (same numbers as the HTML dashboard's
 // summary cards, see internal/web's dashboardCounts) plus NetworkHeight
 // context, for callers that want the dashboard's headline numbers without

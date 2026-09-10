@@ -2367,8 +2367,8 @@ func TestNonAdminAPIRoutesRemainUnauthenticated(t *testing.T) {
 	assertStatus("GET /topology", http.StatusOK, resp, err)
 	resp, err = http.Get(srv.URL + "/topology/top-peered")
 	assertStatus("GET /topology/top-peered", http.StatusOK, resp, err)
-	resp, err = http.Get(srv.URL + "/stats")
-	assertStatus("GET /stats", http.StatusOK, resp, err)
+	resp, err = http.Get(srv.URL + "/v1/stats")
+	assertStatus("GET /v1/stats", http.StatusOK, resp, err)
 
 	// POST /nodes: public node registration, exercised as a full
 	// request with a real body (same shape as TestCreateNodeValid).
@@ -2579,7 +2579,7 @@ func TestConfigPeerSeedsEndpointGenericHeaderWithoutNetwork(t *testing.T) {
 
 // statsResponseForTest mirrors internal/api's unexported statsResponse
 // JSON shape, so this external (api_test) test package can decode GET
-// /stats responses without needing that type exported.
+// /v1/stats responses without needing that type exported.
 type statsResponseForTest struct {
 	TotalNodes         int `json:"total_nodes"`
 	ConfirmedNodes     int `json:"confirmed_nodes"`
@@ -2594,15 +2594,15 @@ type statsResponseForTest struct {
 	NetworkHeightNodeCount int    `json:"network_height_node_count"`
 }
 
-// TestStatsEndpointEmpty asserts GET /stats returns all-zero counts and a
+// TestStatsEndpointEmpty asserts GET /v1/stats returns all-zero counts and a
 // nil network_height against an empty database, matching
 // storage.Store.NetworkHeight's own (nil, 0, nil) "no data yet" return.
 func TestStatsEndpointEmpty(t *testing.T) {
 	srv, _ := newTestServer(t, nil)
 
-	resp, err := http.Get(srv.URL + "/stats")
+	resp, err := http.Get(srv.URL + "/v1/stats")
 	if err != nil {
-		t.Fatalf("GET /stats: %v", err)
+		t.Fatalf("GET /v1/stats: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -2618,7 +2618,7 @@ func TestStatsEndpointEmpty(t *testing.T) {
 	}
 }
 
-// TestStatsEndpoint asserts GET /stats' counts match a hand-built node
+// TestStatsEndpoint asserts GET /v1/stats' counts match a hand-built node
 // population spanning every discovery source (p2p/registry/both),
 // confirmed vs unconfirmed, and onion vs clearnet-only capability, plus
 // that network_height/network_height_node_count reflect the mode of the
@@ -2669,9 +2669,9 @@ func TestStatsEndpoint(t *testing.T) {
 		t.Fatalf("record health bothNode: %v", err)
 	}
 
-	resp, err := http.Get(srv.URL + "/stats")
+	resp, err := http.Get(srv.URL + "/v1/stats")
 	if err != nil {
-		t.Fatalf("GET /stats: %v", err)
+		t.Fatalf("GET /v1/stats: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {

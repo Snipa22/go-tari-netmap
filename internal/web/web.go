@@ -431,7 +431,7 @@ func buildNodeTableData(ctx context.Context, store storage.Store, reachableSince
 		return counts, nil, pagination, err
 	}
 
-	// Shared with the JSON GET /api/stats endpoint (internal/api's
+	// Shared with the JSON GET /api/v1/stats endpoint (internal/api's
 	// ComputeNodeCounts) rather than reimplementing this
 	// counts-by-discovery-source/confirmation/capability loop here —
 	// see its doc comment.
