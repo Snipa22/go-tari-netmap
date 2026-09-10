@@ -78,7 +78,25 @@ func main() {
 	// Real go-tari-grpc-lib-backed client: talks to Tari base nodes over
 	// gRPC. Dials fresh per-call (see grpcNodeClient's doc comment in
 	// internal/collector/grpc_client.go for why that's fine here).
-	grpcClient := collector.NewGRPCClient()
+	//
+	// NETMAP_OWNED_GRPC_ADDRESSES scopes gRPC probing to an explicit allowlist of
+	// "P2P address -> real gRPC address" pairs for nodes we own -- comma-separated
+	// "p2pAddress=grpcAddress" entries, e.g.
+	// "23.226.69.178:18189=23.226.69.178:18102,10.0.0.5:18189=10.0.0.5:18102". This exists
+	// because a peer's real gRPC listen port is NEVER discoverable via Tari P2P peer
+	// discovery, for ANY peer, arbitrary or our own -- tari_protos/network.proto's
+	// Peer/Address messages and go-tari-lib's p2p.PeerInfo both carry no gRPC-port field
+	// anywhere, only the P2P/comms wire address. See docs/grpc-port-scope.md for the full
+	// finding and rationale. The only way this collector can ever know a node's real gRPC
+	// address is out-of-band, operator-supplied config -- i.e. gRPC probing is only
+	// meaningful for our own explicitly-configured/owned nodes, never for addresses
+	// learned by walking the peer graph. Empty/unset (the default) disables this scoping
+	// entirely: grpcClient dials whatever addr it's given, as-is, matching the
+	// pre-existing (buggy, for non-owned nodes) zero-config behavior -- see
+	// collector.NewGRPCClientWithAddressMap's doc comment for the nil-vs-populated-map
+	// distinction.
+	ownedGRPCAddresses := parseOwnedGRPCAddresses(os.Getenv("NETMAP_OWNED_GRPC_ADDRESSES"))
+	grpcClient := collector.NewGRPCClientWithAddressMap(ownedGRPCAddresses)
 
 	// Real go-tari-lib/p2p-backed client: talks to Tari nodes over the
 	// direct comms/RPC-over-P2P transport, independent of gRPC — see
@@ -229,4 +247,37 @@ func parseSeedNodes(raw string) []string {
 		}
 	}
 	return seeds
+}
+
+// parseOwnedGRPCAddresses parses NETMAP_OWNED_GRPC_ADDRESSES's raw value: a comma-separated
+// list of "p2pAddress=grpcAddress" pairs (see grpcClient's construction above for the exact
+// shape/example and the "why" -- gRPC ports are never P2P-discoverable, see
+// docs/grpc-port-scope.md), mirroring parseSeedNodes' style -- trim whitespace, skip empty
+// entries. An empty/unset raw value returns a nil map, which is the deliberate "feature not
+// configured at all" sentinel collector.NewGRPCClientWithAddressMap distinguishes from a
+// populated-but-missing-entry map -- see that constructor's doc comment. Each entry is split on
+// the FIRST "=" via strings.Cut, since neither a P2P nor a gRPC "host:port" address can itself
+// contain "="; a malformed entry (no "=", or an empty p2pAddress/grpcAddress after trimming) is
+// logged and skipped rather than failing the whole binary at startup -- a typo in one pair
+// should not take down gRPC probing for every other correctly-configured owned node.
+func parseOwnedGRPCAddresses(raw string) map[string]string {
+	if raw == "" {
+		return nil
+	}
+	out := make(map[string]string)
+	for _, pair := range strings.Split(raw, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		p2pAddr, grpcAddr, ok := strings.Cut(pair, "=")
+		p2pAddr = strings.TrimSpace(p2pAddr)
+		grpcAddr = strings.TrimSpace(grpcAddr)
+		if !ok || p2pAddr == "" || grpcAddr == "" {
+			log.Printf("netmap: skipping malformed NETMAP_OWNED_GRPC_ADDRESSES entry %q (want \"p2pAddress=grpcAddress\")", pair)
+			continue
+		}
+		out[p2pAddr] = grpcAddr
+	}
+	return out
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base32"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -16,6 +17,22 @@ import (
 
 	"github.com/Snipa22/go-tari-grpc-lib/v3/tari_generated"
 )
+
+// ErrGRPCAddressUnknown is returned by grpcNodeClient's methods (via
+// dialNode) when the client was constructed with a non-nil address map
+// (see NewGRPCClientWithAddressMap) and the addr passed in has no entry
+// in that map -- i.e. this is a P2P/discovered address we have no known
+// real gRPC "host:port" for, per this repo's docs/grpc-port-scope.md
+// finding that a peer's gRPC listen port is never P2P-discoverable. In
+// that case dialNode does not attempt to dial the P2P address at all
+// (which would just fail anyway, see docs/grpc-port-scope.md) -- it
+// returns this sentinel immediately, wrapped so callers can
+// errors.Is(err, ErrGRPCAddressUnknown). Collector.pollOnceWithSource
+// specifically checks for this via errors.Is to skip recording a
+// health-check row (and the OnPollResult observer call) entirely for
+// this case, rather than recording/counting it as a genuine probe
+// failure -- see pollOnceWithSource's doc comment.
+var ErrGRPCAddressUnknown = errors.New("collector: no known gRPC address for this P2P address (gRPC probing is scoped to owned nodes with a configured gRPC address -- see NETMAP_OWNED_GRPC_ADDRESSES and docs/grpc-port-scope.md)")
 
 // dialTimeout bounds how long grpcNodeClient waits to establish a
 // connection (and, transitively, to complete each RPC via the per-call
@@ -60,25 +77,83 @@ type grpcNodeClient struct {
 	// default insecure-transport option. Tests use this to inject
 	// grpc.WithContextDialer pointing at a bufconn listener.
 	dialOpts []grpc.DialOption
+
+	// addressMap, if non-nil, maps a P2P/discovered "host:port" address
+	// (the addr every NodeClient method is given) to the real gRPC
+	// "host:port" address to actually dial for it -- see
+	// NewGRPCClientWithAddressMap's doc comment for why this exists at
+	// all (docs/grpc-port-scope.md: a peer's gRPC port is never
+	// P2P-discoverable, so gRPC probing must be scoped to an explicit,
+	// operator-supplied allowlist of owned addresses).
+	//
+	// The nil vs empty-non-nil distinction matters and is deliberate:
+	// nil (the zero value, and what NewGRPCClient()/
+	// NewGRPCClientWithAddressMap(nil) both produce) means this feature
+	// is not configured at all -- dialNode preserves the EXACT
+	// pre-existing behavior of dialing addr as-is, unconditionally. A
+	// non-nil map (even an empty one, map[string]string{}) means the
+	// feature IS configured/active -- any addr with no entry in it is
+	// refused via ErrGRPCAddressUnknown rather than dialed, since an
+	// active map with no entry for addr means "we know this address
+	// exists but do not have a real gRPC address for it", which is a
+	// meaningfully different, common case (every non-owned node) from
+	// "this feature isn't in use at all".
+	addressMap map[string]string
 }
 
 // NewGRPCClient returns a NodeClient backed by real go-tari-grpc-lib/v3
 // gRPC calls against Tari base nodes. It takes no required args: each
-// method dials the addr passed to it, per-call.
+// method dials the addr passed to it, per-call. Equivalent to
+// NewGRPCClientWithAddressMap(nil) -- see that constructor's doc comment
+// for why a nil address map means "dial addr as-is, unconditionally"
+// (the gRPC-port-scoping feature is opt-in).
 func NewGRPCClient() NodeClient {
-	return &grpcNodeClient{dial: grpc.NewClient}
+	return NewGRPCClientWithAddressMap(nil)
 }
 
-// dialNode dials addr and returns a ready-to-use BaseNodeClient plus the
-// underlying *grpc.ClientConn for the caller to Close via defer.
+// NewGRPCClientWithAddressMap returns a NodeClient identical to
+// NewGRPCClient's, except each method's dial target is resolved through
+// addrMap first -- see grpcNodeClient.addressMap's doc comment for the
+// full nil-vs-empty-map semantics, and ErrGRPCAddressUnknown's doc
+// comment / docs/grpc-port-scope.md for why this exists: a peer's gRPC
+// listen port is never discoverable via Tari P2P peer discovery, so
+// gRPC probing is only ever meaningful against an explicit,
+// operator-supplied allowlist of "P2P address -> real gRPC address"
+// pairs for nodes we own (see cmd/netmap/main.go's
+// NETMAP_OWNED_GRPC_ADDRESSES wiring). Passing addrMap == nil here is
+// exactly equivalent to NewGRPCClient() -- both preserve the
+// pre-existing dial-addr-as-is behavior unconditionally, for any
+// existing test/caller that doesn't care about this feature.
+func NewGRPCClientWithAddressMap(addrMap map[string]string) NodeClient {
+	return &grpcNodeClient{dial: grpc.NewClient, addressMap: addrMap}
+}
+
+// dialNode resolves addr to its real dial target (see
+// grpcNodeClient.addressMap's doc comment), dials it, and returns a
+// ready-to-use BaseNodeClient plus the underlying *grpc.ClientConn for
+// the caller to Close via defer.
 func (c *grpcNodeClient) dialNode(addr string) (tari_generated.BaseNodeClient, *grpc.ClientConn, error) {
+	target := addr
+	if c.addressMap != nil {
+		grpcAddr, ok := c.addressMap[addr]
+		if !ok {
+			// Do NOT attempt to dial the P2P address at all in this
+			// case -- see ErrGRPCAddressUnknown's doc comment: it
+			// would just fail anyway (there is no real gRPC listener
+			// on the P2P port), and dialing it anyway is exactly the
+			// bug this feature exists to fix.
+			return nil, nil, fmt.Errorf("dial %s: %w", addr, ErrGRPCAddressUnknown)
+		}
+		target = grpcAddr
+	}
+
 	opts := append([]grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}, c.dialOpts...)
 	// Tari base-node gRPC is plaintext (insecure) by default; there is no
 	// TLS story here to plug in short of a much larger change to how
 	// nodes are configured/discovered, which is out of scope.
-	conn, err := c.dial(addr, opts...)
+	conn, err := c.dial(target, opts...)
 	if err != nil {
-		return nil, nil, fmt.Errorf("dial %s: %w", addr, err)
+		return nil, nil, fmt.Errorf("dial %s: %w", target, err)
 	}
 	return tari_generated.NewBaseNodeClient(conn), conn, nil
 }

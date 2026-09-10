@@ -430,6 +430,107 @@ func historyByProbeSource(history []storage.HealthCheck) map[storage.ProbeSource
 	return out
 }
 
+// grpcAddressUnknownClient is a NodeClient fixture whose GetInfo always fails with an error
+// wrapping ErrGRPCAddressUnknown, mimicking grpcNodeClient's real behavior when scoped via an
+// address map with no entry for the dialed addr (see grpc_client.go's dialNode). Used to prove
+// that pollOnceWithSource/PollOnce/poll() all skip recording a health-check row entirely for
+// this specific error, rather than recording a Reachable: false row.
+type grpcAddressUnknownClient struct {
+	getInfoCalls int
+}
+
+func (c *grpcAddressUnknownClient) GetPeers(ctx context.Context, addr string) ([]DiscoveredPeer, error) {
+	return nil, nil
+}
+
+func (c *grpcAddressUnknownClient) GetInfo(ctx context.Context, addr string) (NodeInfo, error) {
+	c.getInfoCalls++
+	return NodeInfo{}, fmt.Errorf("dial %s: %w", addr, ErrGRPCAddressUnknown)
+}
+
+// TestPollOnceSkipsHealthCheckOnGRPCAddressUnknown verifies that PollOnce (and, transitively,
+// pollOnceWithSource) does not call store.RecordHealthCheck at all when the GRPC client returns
+// ErrGRPCAddressUnknown -- a skip is a distinct signal from "we tried and failed" (see
+// pollOnceWithSource's doc comment and docs/grpc-port-scope.md), so no row (Reachable: true or
+// false) should ever be recorded for this case.
+func TestPollOnceSkipsHealthCheckOnGRPCAddressUnknown(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	node, err := store.UpsertDiscoveredNode(ctx, "unscoped-discovered-peer:18189", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	client := &grpcAddressUnknownClient{}
+
+	var observedCalls int
+	observe := func(probeSource storage.ProbeSource, success bool) {
+		observedCalls++
+	}
+
+	if err := PollOnce(ctx, client, nil, store, node, observe); err != nil {
+		t.Fatalf("PollOnce: unexpected error: %v", err)
+	}
+	if client.getInfoCalls != 1 {
+		t.Fatalf("client.getInfoCalls = %d, want 1", client.getInfoCalls)
+	}
+
+	history, err := store.GetNodeHistory(ctx, node.ID, 10)
+	if err != nil {
+		t.Fatalf("get history: %v", err)
+	}
+	if len(history) != 0 {
+		t.Fatalf("len(history) = %d, want 0 -- no health-check row should be recorded on ErrGRPCAddressUnknown, got %+v", len(history), history)
+	}
+	if observedCalls != 0 {
+		t.Fatalf("observedCalls = %d, want 0 -- OnPollResult must not be invoked either on a skip (see pollTransportOnce's doc comment for why: it would reintroduce the exact poll_result_total metric noise this feature exists to eliminate)", observedCalls)
+	}
+}
+
+// TestPollSkipsHealthCheckOnGRPCAddressUnknown mirrors
+// TestPollOnceSkipsHealthCheckOnGRPCAddressUnknown but through the full scheduled poll() path
+// (via PollNeverContacted), proving the skip behavior holds for the bulk collector loop too, not
+// just the exported PollOnce entrypoint.
+func TestPollSkipsHealthCheckOnGRPCAddressUnknown(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	node, err := store.UpsertDiscoveredNode(ctx, "unscoped-discovered-peer:18189", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	client := &grpcAddressUnknownClient{}
+
+	var observedCalls int64
+	c := New(Config{})
+	c.Storage = store
+	c.GRPCClient = client
+	c.OnPollResult = func(probeSource storage.ProbeSource, success bool) {
+		atomic.AddInt64(&observedCalls, 1)
+	}
+
+	if err := c.PollNeverContacted(ctx); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+
+	if client.getInfoCalls != 1 {
+		t.Fatalf("client.getInfoCalls = %d, want 1", client.getInfoCalls)
+	}
+
+	history, err := store.GetNodeHistory(ctx, node.ID, 10)
+	if err != nil {
+		t.Fatalf("get history: %v", err)
+	}
+	if len(history) != 0 {
+		t.Fatalf("len(history) = %d, want 0 -- no health-check row should be recorded on ErrGRPCAddressUnknown, got %+v", len(history), history)
+	}
+	if atomic.LoadInt64(&observedCalls) != 0 {
+		t.Fatalf("observedCalls = %d, want 0", observedCalls)
+	}
+}
+
 // TestPollDualProbeBothSucceed verifies that when both GRPCClient and
 // P2PClient are configured and both successfully report info for a node,
 // Poll (via PollOnce) records two independent rows, one per probe_source.

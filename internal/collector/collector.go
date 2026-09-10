@@ -1164,25 +1164,41 @@ func PollOnce(ctx context.Context, grpcClient, p2pClient NodeClient, store stora
 	var errs []error
 
 	if grpcClient != nil {
-		success, err := pollOnceWithSource(ctx, grpcClient, store, node, storage.ProbeSourceGRPC)
-		if observe != nil {
-			observe(storage.ProbeSourceGRPC, success)
-		}
-		if err != nil {
+		if err := pollTransportOnce(ctx, grpcClient, store, node, storage.ProbeSourceGRPC, observe); err != nil {
 			errs = append(errs, fmt.Errorf("grpc probe %s: %w", node.Address, err))
 		}
 	}
 	if p2pClient != nil {
-		success, err := pollOnceWithSource(ctx, p2pClient, store, node, storage.ProbeSourceP2P)
-		if observe != nil {
-			observe(storage.ProbeSourceP2P, success)
-		}
-		if err != nil {
+		if err := pollTransportOnce(ctx, p2pClient, store, node, storage.ProbeSourceP2P, observe); err != nil {
 			errs = append(errs, fmt.Errorf("p2p probe %s: %w", node.Address, err))
 		}
 	}
 
 	return errors.Join(errs...)
+}
+
+// pollTransportOnce performs a single health check of node via client, tagged with probeSource,
+// and invokes observe (if non-nil) with the resulting success value — unless the probe is
+// SKIPPED (see pollOnceWithSource's skip return value / ErrGRPCAddressUnknown's doc comment),
+// in which case observe is deliberately NOT called either, so a skip never shows up in
+// OnPollResult-derived metrics (e.g. netmap_<network>_collector_poll_result_total{probe_source=
+// "grpc"}) as either a success or a failure — see Part 1 of docs/grpc-port-scope.md for why that
+// noise was itself the reason the underlying gRPC-port bug went undetected for so long.
+//
+// This is shared by PollOnce (which calls it once per configured transport, synchronously,
+// preserving PollOnce's existing "grpc then p2p, for one node" public contract unchanged) and
+// Collector.poll()'s two independent GRPC/P2P concurrency dispatchers (see poll's doc comment) —
+// factoring this out gives both callers byte-for-byte identical per-transport recording/
+// observing semantics, with only the surrounding concurrency/dispatch differing between them.
+func pollTransportOnce(ctx context.Context, client NodeClient, store storage.Store, node storage.Node, probeSource storage.ProbeSource, observe PollResultFunc) error {
+	success, skip, err := pollOnceWithSource(ctx, client, store, node, probeSource)
+	if skip {
+		return nil
+	}
+	if observe != nil {
+		observe(probeSource, success)
+	}
+	return err
 }
 
 // pollOnceWithSource performs a single health check of node via client and
@@ -1192,6 +1208,15 @@ func PollOnce(ctx context.Context, grpcClient, p2pClient NodeClient, store stora
 // history reflects the failed check rather than silently having no data
 // point; the GetInfo error itself is not returned in that case, only any
 // error from the RecordHealthCheck call.
+//
+// EXCEPT: if client.GetInfo's error wraps ErrGRPCAddressUnknown (grpcNodeClient's sentinel for
+// "this addr has no configured real gRPC address" — see its doc comment and
+// docs/grpc-port-scope.md), this is not a genuine probe attempt against a real address at all —
+// it's what happens for every non-owned node whenever gRPC probing is scoped via
+// NewGRPCClientWithAddressMap. In that case the skip return value is true, no
+// RecordHealthCheck call is made, and (success, err) are (false, nil) — callers (see
+// pollTransportOnce) must check skip FIRST and, if true, treat this as "no attempt was made"
+// rather than inspecting success/err at all.
 //
 // If GetInfo succeeds and yields a confirmed PublicKey, this is a real,
 // direct probe of node.Address — exactly the case UpsertConfirmedNode
@@ -1204,17 +1229,20 @@ func PollOnce(ctx context.Context, grpcClient, p2pClient NodeClient, store stora
 // If info.PublicKey is nil/empty (GetInfo succeeded but didn't yield a
 // pubkey), the health check falls back to node.ID as before.
 //
-// The returned bool is whether client.GetInfo itself succeeded (the probe transport got a
-// response at all) — this is PollOnce's PollResultFunc "success" signal, deliberately distinct
+// The returned success bool is whether client.GetInfo itself succeeded (the probe transport got
+// a response at all) — this is PollOnce's PollResultFunc "success" signal, deliberately distinct
 // from any subsequent RecordHealthCheck/UpsertConfirmedNode storage error (returned separately,
-// as error) and from info.Reachable (which, per both grpc_client.go's and p2p_client.go's own
+// as err) and from info.Reachable (which, per both grpc_client.go's and p2p_client.go's own
 // GetInfo implementations, is always true whenever GetInfo itself returns a nil error — there
 // is no real-world case where GetInfo succeeds with Reachable: false today, but this return
 // value tracks the GetInfo err itself rather than assuming that equivalence holds forever).
-func pollOnceWithSource(ctx context.Context, client NodeClient, store storage.Store, node storage.Node, probeSource storage.ProbeSource) (bool, error) {
+func pollOnceWithSource(ctx context.Context, client NodeClient, store storage.Store, node storage.Node, probeSource storage.ProbeSource) (success bool, skip bool, err error) {
 	info, err := client.GetInfo(ctx, node.Address)
 	if err != nil {
-		return false, store.RecordHealthCheck(ctx, storage.HealthCheckInput{
+		if errors.Is(err, ErrGRPCAddressUnknown) {
+			return false, true, nil
+		}
+		return false, false, store.RecordHealthCheck(ctx, storage.HealthCheckInput{
 			NodeID:      node.ID,
 			Reachable:   false,
 			ProbeSource: probeSource,
@@ -1231,7 +1259,7 @@ func pollOnceWithSource(ctx context.Context, client NodeClient, store storage.St
 		}
 	}
 
-	return true, store.RecordHealthCheck(ctx, storage.HealthCheckInput{
+	return true, false, store.RecordHealthCheck(ctx, storage.HealthCheckInput{
 		NodeID:                nodeID,
 		Reachable:             info.Reachable,
 		ProbeSource:           probeSource,
