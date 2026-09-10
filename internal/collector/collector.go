@@ -17,6 +17,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/Snipa22/go-tari-netmap/internal/storage"
 )
 
@@ -52,6 +54,32 @@ const PollIntervalUnconfirmed = 15 * time.Minute
 // node is still polled, just less often, so it will eventually be
 // rediscovered as reachable.
 const PollIntervalLikelyDead = 24 * time.Hour
+
+// PollIntervalNeverContacted is the poll cadence pollInterval falls back
+// to for an unconfirmed placeholder node that is past all three of the
+// NewNodeCheckpoint1/2/3 escalating checkpoints (age >= NewNodeCheckpoint3)
+// yet STILL has zero recorded health checks at all — i.e. it has never
+// once been through PollOnce, successfully or not (see
+// pollOnceWithSource's doc comment: even a failed probe records a row,
+// so zero rows really does mean zero attempts). This only happens when
+// poll backlog/volume, not node age, is the reason it hasn't been probed
+// yet — exactly the scenario the never-contacted poll queue exists to
+// fix (see PollNeverContacted's doc comment and
+// Collector.NeverContactedTickInterval).
+//
+// This is set equal to PollIntervalUnconfirmed/NewNodeCheckpoint1 (15min)
+// for now — the two constants are intentionally kept separate rather
+// than reusing PollIntervalUnconfirmed directly, since what actually
+// delivers the "walk the network more aggressively" improvement for
+// never-contacted nodes is PollNeverContacted running on its own
+// short, independent tick (NeverContactedTickInterval) so a large
+// unconfirmed backlog can never delay a never-contacted node's first
+// probe attempt — not a shorter per-node cadence once it IS being
+// checked. Keeping this as its own named constant leaves room to tune
+// it independently later (e.g. if a genuinely different value turns out
+// to matter) without touching the unrelated PollIntervalUnconfirmed
+// steady-state cadence.
+const PollIntervalNeverContacted = NewNodeCheckpoint1
 
 // NewNodeCheckpoint1, NewNodeCheckpoint2, and NewNodeCheckpoint3 are
 // AGE-SINCE-storage.Node.FirstSeen thresholds (NOT fixed retry counts, and
@@ -90,6 +118,30 @@ const DiscoveryIntervalPoolOwned = 30 * time.Minute
 // PollIntervalGeneric/PollIntervalPoolOwned, which govern per-node poll
 // cadence — this just controls the granularity of that check.
 const defaultTickInterval = 5 * time.Minute
+
+// defaultNeverContactedTickInterval is how often Run checks which
+// never-contacted nodes (see PollNeverContacted) are due for their very
+// first probe attempt, when Collector.NeverContactedTickInterval is
+// unset. It defaults to a shorter cadence than defaultTickInterval (and
+// is deliberately NOT derived from it, unlike UnconfirmedTickInterval's
+// default) since this queue is explicitly the highest-priority/
+// fastest-cadence of the three poll loops — see PollNeverContacted's doc
+// comment — and must not inherit whatever (possibly much longer) tick
+// the confirmed loop happens to be configured with.
+const defaultNeverContactedTickInterval = 1 * time.Minute
+
+// maxPollWorkers bounds the number of concurrent in-flight PollOnce calls
+// within a single poll() pass (shared by PollConfirmed, PollUnconfirmed,
+// and PollNeverContacted). Each PollOnce dial can take up to dialTimeout
+// (see grpc_client.go/p2p_client.go, currently 180s), and with tens of
+// thousands of tracked nodes, fully sequential dialing cannot remotely
+// keep up with the poll cadences above — see this repo's
+// collector-concurrency-brief for the full rationale. 100 was chosen as
+// an explicit, deliberate step up from strictly-sequential (1) per
+// Alex's request to "walk the network more aggressively", while still
+// bounding total in-flight dials to a fixed, known worst case rather
+// than firing off one goroutine per due node unbounded.
+const maxPollWorkers = 100
 
 // NodeInfo is the subset of a Tari base node's health/sync-status info
 // needed to record a health check.
@@ -235,6 +287,23 @@ type Collector struct {
 	// from the confirmed loop's.
 	UnconfirmedTickInterval time.Duration
 
+	// NeverContactedTickInterval governs how often Run checks which
+	// never-contacted nodes (Node.PublicKey == nil AND zero recorded
+	// health checks ever — see PollNeverContacted) are due for their
+	// very first probe attempt, mirroring TickInterval/
+	// UnconfirmedTickInterval but for the third, explicitly
+	// highest-priority poll loop (see runNeverContactedPollLoop).
+	// Optional: unlike UnconfirmedTickInterval, this does NOT default
+	// to TickInterval's (possibly long) effective value when left
+	// unset/<= 0 — it defaults to the shorter
+	// defaultNeverContactedTickInterval instead, since a
+	// never-contacted node getting its first probe attempt as soon as
+	// possible after discovery is the explicit "walk the network more
+	// aggressively" goal this queue exists for (see PollNeverContacted's
+	// doc comment) — it must not be tied to however long the confirmed
+	// loop's cadence happens to be configured.
+	NeverContactedTickInterval time.Duration
+
 	mu            sync.Mutex
 	nextPoll      map[string]time.Time // address -> next poll due time
 	nextDiscovery map[string]time.Time // discoveryCooldownKey(transport, address) -> next discovery-walk due time
@@ -271,19 +340,28 @@ func New(cfg Config) *Collector {
 //     regardless of unconfirmed-queue volume/backlog. This is the core
 //     fix this split exists for; see PollConfirmed/PollUnconfirmed's doc
 //     comments.
+//   - the never-contacted poll loop (PollNeverContacted) cannot be
+//     starved by, or starve, either of the other two — it runs on its
+//     own goroutine/ticker just like the other two, so a never-contacted
+//     node gets its first probe attempt on its own fast, independent
+//     cadence (see NeverContactedTickInterval) regardless of how large
+//     the confirmed or unconfirmed backlogs are. See PollNeverContacted's
+//     doc comment for why this queue exists as a THIRD, distinct
+//     category rather than folding into PollUnconfirmed.
 //
-// All three goroutines share Storage and the NodeClients, and all
-// observe ctx cancellation independently. Run blocks until all three have
+// All four goroutines share Storage and the NodeClients, and all
+// observe ctx cancellation independently. Run blocks until all four have
 // exited (via a sync.WaitGroup) and returns nil on clean shutdown.
 //
 // Discover() only ever touches Storage and the NodeClients — never
 // c.nextPoll — so running it concurrently with the poll loops introduces
 // no new data race. c.nextPoll access is already guarded by c.mu, which
 // is generic over address keys and thus safe for concurrent due/
-// setNextPoll access from both poll loops simultaneously — PollConfirmed
-// and PollUnconfirmed only ever touch disjoint address keys (a node is
-// never both confirmed and unconfirmed at once), but the mutex makes this
-// safe even so.
+// setNextPoll access from all three poll loops simultaneously —
+// PollConfirmed, PollUnconfirmed, and PollNeverContacted only ever touch
+// disjoint address keys (a node belongs to exactly one of the three
+// categories at any given time — see PollNeverContacted's doc comment),
+// but the mutex makes this safe even so.
 func (c *Collector) Run(ctx context.Context) error {
 	tick := c.TickInterval
 	if tick <= 0 {
@@ -295,8 +373,13 @@ func (c *Collector) Run(ctx context.Context) error {
 		unconfirmedTick = tick
 	}
 
+	neverContactedTick := c.NeverContactedTickInterval
+	if neverContactedTick <= 0 {
+		neverContactedTick = defaultNeverContactedTickInterval
+	}
+
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(4)
 
 	go func() {
 		defer wg.Done()
@@ -311,6 +394,11 @@ func (c *Collector) Run(ctx context.Context) error {
 	go func() {
 		defer wg.Done()
 		c.runUnconfirmedPollLoop(ctx, unconfirmedTick)
+	}()
+
+	go func() {
+		defer wg.Done()
+		c.runNeverContactedPollLoop(ctx, neverContactedTick)
 	}()
 
 	wg.Wait()
@@ -388,6 +476,39 @@ func (c *Collector) runUnconfirmedPollLoop(ctx context.Context, tick time.Durati
 		case <-ticker.C:
 			if err := c.PollUnconfirmed(ctx); err != nil {
 				log.Printf("collector: unconfirmed poll pass error: %v", err)
+			}
+		}
+	}
+}
+
+// runNeverContactedPollLoop runs PollNeverContacted once immediately,
+// then on every tick, until ctx is cancelled. It runs entirely
+// independently of runDiscoverLoop, runPollLoop, and
+// runUnconfirmedPollLoop, on its own ticker (see Run's
+// neverContactedTick) — this loop is explicitly the HIGHEST-priority of
+// the three poll loops (see PollNeverContacted's doc comment): it must
+// never be blocked or starved by either of the other two, and its own
+// (typically much smaller) never-contacted node population must never
+// be crowded out by however large the confirmed or unconfirmed backlogs
+// are. The three loops' only shared state is c.nextPoll/c.mu, and
+// PollConfirmed/PollUnconfirmed/PollNeverContacted only ever touch
+// disjoint address keys (a node belongs to exactly one of the three
+// categories at any given time).
+func (c *Collector) runNeverContactedPollLoop(ctx context.Context, tick time.Duration) {
+	ticker := time.NewTicker(tick)
+	defer ticker.Stop()
+
+	if err := c.PollNeverContacted(ctx); err != nil {
+		log.Printf("collector: never-contacted poll pass error: %v", err)
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := c.PollNeverContacted(ctx); err != nil {
+				log.Printf("collector: never-contacted poll pass error: %v", err)
 			}
 		}
 	}
@@ -537,23 +658,98 @@ func (c *Collector) PollConfirmed(ctx context.Context) error {
 }
 
 // PollUnconfirmed checks all known unconfirmed placeholder nodes
-// (Node.PublicKey == nil) and, for those whose next-poll time is due,
-// calls PollOnce, exactly mirroring PollConfirmed but over the
-// complementary node subset. It runs entirely independently of
-// PollConfirmed — see PollConfirmed's doc comment and Run's doc comment
-// for why this split exists and why this loop is explicitly
-// lower-priority (it must never block or starve PollConfirmed).
+// (Node.PublicKey == nil) that have AT LEAST ONE recorded health check
+// (i.e. have been probed before, successfully or not) and, for those
+// whose next-poll time is due, calls PollOnce, exactly mirroring
+// PollConfirmed but over the complementary node subset. It runs
+// entirely independently of PollConfirmed — see PollConfirmed's doc
+// comment and Run's doc comment for why this split exists and why this
+// loop is explicitly lower-priority (it must never block or starve
+// PollConfirmed).
+//
+// The HasHealthChecks: true half of this filter is deliberate and
+// distinct from a plain Confirmed: false filter: a node that has NEVER
+// had a single health check recorded belongs to PollNeverContacted
+// instead (see its doc comment) — without this tightening, such a node
+// would be polled by BOTH this loop and PollNeverContacted
+// simultaneously, defeating the whole point of prioritizing
+// never-contacted nodes ahead of the (typically much larger)
+// with-history unconfirmed backlog. See
+// TestPollNeverContactedOnlyTouchesNeverContactedNodes and
+// TestListNodesHasHealthChecksFilter (internal/storage) for the tests
+// proving these two filters are a true partition of the unconfirmed
+// population — no double-poll, no gap.
 func (c *Collector) PollUnconfirmed(ctx context.Context) error {
 	confirmed := false
-	return c.poll(ctx, storage.NodeFilter{Confirmed: &confirmed})
+	hasHistory := true
+	return c.poll(ctx, storage.NodeFilter{Confirmed: &confirmed, HasHealthChecks: &hasHistory})
+}
+
+// PollNeverContacted checks all known nodes that have NEVER had a single
+// health check recorded (zero node_health rows ever — see
+// storage.NodeFilter.HasHealthChecks's doc comment for why "zero rows"
+// really does mean "never attempted", not just "never succeeded") and,
+// for those whose next-poll time is due, calls PollOnce, mirroring
+// PollConfirmed/PollUnconfirmed but over this third, disjoint node
+// subset.
+//
+// This is deliberately NOT the same thing as "unconfirmed" (see this
+// repo's collector-concurrency-brief): an unconfirmed node can have
+// failed-probe history already (the existing PollIntervalLikelyDead
+// backoff path handles that, via PollUnconfirmed) — this queue is
+// specifically for nodes that have never been dialed at all, typically
+// because they were only just discovered and the confirmed/unconfirmed
+// poll backlog hasn't reached them yet.
+//
+// This is the HIGHEST-priority of the three poll loops (see Run's doc
+// comment and Collector.NeverContactedTickInterval's shorter default
+// tick): a brand-new, zero-history node getting its very first probe
+// attempt as soon as possible after discovery is what actually grows
+// the confirmed population, per Alex's explicit "walk the network more
+// aggressively" request. It runs entirely independently of both
+// PollConfirmed and PollUnconfirmed — a large backlog in either of the
+// other two must never delay a never-contacted node's first probe.
+//
+// A node moves OFF this queue and onto PollUnconfirmed (or, if the
+// first probe happens to succeed and yield a pubkey, straight to
+// PollConfirmed) the instant its first health-check row is written —
+// this is a pure query-time distinction (see
+// storage.NodeFilter.HasHealthChecks), not a separate stored flag/state
+// machine that needs its own bookkeeping, exactly mirroring how the
+// confirmed/unconfirmed split itself works.
+func (c *Collector) PollNeverContacted(ctx context.Context) error {
+	confirmed := false
+	hasHistory := false
+	return c.poll(ctx, storage.NodeFilter{Confirmed: &confirmed, HasHealthChecks: &hasHistory})
 }
 
 // poll checks all nodes matching filter and, for those whose next-poll
-// time is due, calls PollOnce. Shared by PollConfirmed and
-// PollUnconfirmed — both call the same due/setNextPoll/PollOnce/jitter
-// logic, just over a filtered node set each; per-node poll-interval
-// selection (pollInterval) is completely unaffected by this split, since
-// it already branches on n.PublicKey itself.
+// time is due, calls PollOnce. Shared by PollConfirmed, PollUnconfirmed,
+// and PollNeverContacted — all three call the same due/setNextPoll/
+// PollOnce/jitter logic, just over a filtered node set each; per-node
+// poll-interval selection (pollInterval) is completely unaffected by
+// this split, since it already branches on n.PublicKey (and, for the
+// never-contacted case, on empty history) itself.
+//
+// The due()/setNextPoll() bookkeeping for every node runs sequentially,
+// single-threaded, in this same top-level loop, BEFORE any concurrent
+// dialing is dispatched below — so it needs no additional
+// synchronization beyond c.mu's existing per-key locking (see due/
+// setNextPoll), and each node's next-poll time is still set exactly
+// once per pass with no race, regardless of maxPollWorkers. Only the
+// actual network dial (PollOnce, the expensive/slow part) runs
+// concurrently, bounded to at most maxPollWorkers (100) simultaneous
+// in-flight calls via an errgroup.Group with SetLimit — see this
+// repo's collector-concurrency-brief for why strictly-sequential
+// dialing could not keep up with tens of thousands of tracked nodes.
+// dialJitter is applied per-worker, immediately before that worker's
+// own dial, rather than once for the whole batch — a single
+// batch-wide sleep would serialize away the entire concurrency benefit
+// of the worker pool. PollOnce errors are logged, never returned/
+// aborted — one node's dial failing must never affect any other node's
+// dial in the same pass. g.Wait()'s return value is intentionally
+// discarded: every worker func always returns nil (errors are logged
+// inline instead), so it can never itself report an error.
 func (c *Collector) poll(ctx context.Context, filter storage.NodeFilter) error {
 	if c.Storage == nil {
 		return errors.New("collector: Storage is not configured")
@@ -565,18 +761,27 @@ func (c *Collector) poll(ctx context.Context, filter storage.NodeFilter) error {
 	}
 
 	now := time.Now()
+	var g errgroup.Group
+	g.SetLimit(maxPollWorkers)
+
 	for _, n := range nodes {
 		if !c.due(n.Address, now) {
 			continue
 		}
 		c.setNextPoll(n.Address, now.Add(c.pollInterval(ctx, n)))
-		if jitter := c.dialJitter(); jitter > 0 {
-			time.Sleep(jitter)
-		}
-		if err := PollOnce(ctx, c.GRPCClient, c.P2PClient, c.Storage, n); err != nil {
-			log.Printf("collector: poll %s: %v", n.Address, err)
-		}
+
+		n := n
+		g.Go(func() error {
+			if jitter := c.dialJitter(); jitter > 0 {
+				time.Sleep(jitter)
+			}
+			if err := PollOnce(ctx, c.GRPCClient, c.P2PClient, c.Storage, n); err != nil {
+				log.Printf("collector: poll %s: %v", n.Address, err)
+			}
+			return nil
+		})
 	}
+	_ = g.Wait()
 	return nil
 }
 
@@ -713,9 +918,14 @@ func collectorLikelyDead(history []storage.HealthCheck) bool {
 // collectorLikelyDead exactly as before: 3+ consecutive failed probes
 // with zero successes backs it off to PollIntervalLikelyDead instead of
 // the normal PollIntervalUnconfirmed cadence (see PollIntervalLikelyDead's
-// doc comment for the rationale). On a GetNodeHistory error, this falls
-// back to PollIntervalUnconfirmed (fail safe: a transient DB error must
-// not over-penalize a node's poll cadence) and logs the error.
+// doc comment for the rationale). A node with ZERO history at all (never
+// once probed — see PollIntervalNeverContacted's doc comment) gets
+// PollIntervalNeverContacted instead — collectorLikelyDead can't
+// meaningfully apply to it (it needs 3+ entries), and this is exactly the
+// never-contacted case PollNeverContacted's own faster tick cadence
+// exists to get ahead of. On a GetNodeHistory error, this falls back to
+// PollIntervalUnconfirmed (fail safe: a transient DB error must not
+// over-penalize a node's poll cadence) and logs the error.
 //
 // Confirmed nodes (n.PublicKey != nil) are completely unaffected by any of
 // the above: neither the checkpoint schedule nor GetNodeHistory/
@@ -740,6 +950,18 @@ func (c *Collector) pollInterval(ctx context.Context, n storage.Node) time.Durat
 		if err != nil {
 			log.Printf("collector: get node history for %s: %v", n.Address, err)
 			return PollIntervalUnconfirmed
+		}
+		if len(history) == 0 {
+			// Past all three checkpoints (age-based) but still zero
+			// health-check rows at all: this is the never-contacted
+			// case (see PollIntervalNeverContacted's doc comment) --
+			// poll backlog, not node age, is why it hasn't been probed
+			// yet. collectorLikelyDead needs 3+ history entries to
+			// conclude anything, so it's not even reachable here; skip
+			// straight to the dedicated constant instead of falling
+			// through to the (numerically identical, for now)
+			// PollIntervalUnconfirmed default below.
+			return PollIntervalNeverContacted
 		}
 		if collectorLikelyDead(history) {
 			return PollIntervalLikelyDead

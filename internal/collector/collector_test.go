@@ -304,7 +304,10 @@ func TestPollRecordsHealthChecksAndRespectsCadence(t *testing.T) {
 	c.Storage = store
 	c.GRPCClient = client
 
-	if err := c.PollUnconfirmed(ctx); err != nil {
+	// node:1 has zero recorded health checks at this point, so its
+	// very first poll comes from PollNeverContacted, not PollUnconfirmed
+	// (see PollNeverContacted's doc comment).
+	if err := c.PollNeverContacted(ctx); err != nil {
 		t.Fatalf("poll: %v", err)
 	}
 
@@ -325,8 +328,11 @@ func TestPollRecordsHealthChecksAndRespectsCadence(t *testing.T) {
 		t.Errorf("probe_source = %q, want %q", history[0].ProbeSource, storage.ProbeSourceGRPC)
 	}
 
-	// Polling again immediately must be a no-op: the generic node's
-	// next-poll time (PollIntervalGeneric = 2h) hasn't elapsed yet.
+	// Polling again immediately must be a no-op: node:1 now has one
+	// recorded health check, so it has graduated onto PollUnconfirmed's
+	// side of the split -- but its next-poll time (set by the
+	// escalating new-node checkpoint schedule off the call above)
+	// hasn't elapsed yet, so due() correctly skips it.
 	if err := c.PollUnconfirmed(ctx); err != nil {
 		t.Fatalf("second poll: %v", err)
 	}
@@ -362,7 +368,7 @@ func TestPollThreadsPeerIdentityUpdatedAtIntoStorage(t *testing.T) {
 	c.Storage = store
 	c.GRPCClient = client
 
-	if err := c.PollUnconfirmed(ctx); err != nil {
+	if err := c.PollNeverContacted(ctx); err != nil {
 		t.Fatalf("poll: %v", err)
 	}
 
@@ -393,7 +399,7 @@ func TestPollUnreachableNodeRecordsFailure(t *testing.T) {
 	c.Storage = store
 	c.GRPCClient = client
 
-	if err := c.PollUnconfirmed(ctx); err != nil {
+	if err := c.PollNeverContacted(ctx); err != nil {
 		t.Fatalf("poll: %v", err)
 	}
 
@@ -449,7 +455,7 @@ func TestPollDualProbeBothSucceed(t *testing.T) {
 	c.GRPCClient = grpcClient
 	c.P2PClient = p2pClient
 
-	if err := c.PollUnconfirmed(ctx); err != nil {
+	if err := c.PollNeverContacted(ctx); err != nil {
 		t.Fatalf("poll: %v", err)
 	}
 
@@ -503,7 +509,7 @@ func TestPollDualProbeGRPCFailsP2PSucceeds(t *testing.T) {
 	c.GRPCClient = grpcClient
 	c.P2PClient = p2pClient
 
-	if err := c.PollUnconfirmed(ctx); err != nil {
+	if err := c.PollNeverContacted(ctx); err != nil {
 		t.Fatalf("poll: %v", err)
 	}
 
@@ -552,7 +558,7 @@ func TestPollDualProbeP2PFailsGRPCSucceeds(t *testing.T) {
 	c.GRPCClient = grpcClient
 	c.P2PClient = p2pClient
 
-	if err := c.PollUnconfirmed(ctx); err != nil {
+	if err := c.PollNeverContacted(ctx); err != nil {
 		t.Fatalf("poll: %v", err)
 	}
 
@@ -601,7 +607,7 @@ func TestPollNilP2PClientSkipsP2PProbe(t *testing.T) {
 	c.GRPCClient = grpcClient
 	// c.P2PClient intentionally left nil.
 
-	if err := c.PollUnconfirmed(ctx); err != nil {
+	if err := c.PollNeverContacted(ctx); err != nil {
 		t.Fatalf("poll: %v", err)
 	}
 
@@ -1206,6 +1212,12 @@ func TestRunDoesNotStarvePollOnSlowDiscover(t *testing.T) {
 // PollUnconfirmed only ever dials/records unconfirmed placeholder nodes
 // (Node.PublicKey == nil) -- neither function's node set ever includes
 // the other's.
+//
+// unconfirmedNode is seeded with one pre-existing (failed) health check
+// so it qualifies for PollUnconfirmed's HasHealthChecks: true half of
+// its filter (see PollUnconfirmed's doc comment) -- a zero-history
+// unconfirmed node belongs to PollNeverContacted instead, covered
+// separately by TestPollNeverContactedOnlyTouchesNeverContactedNodes.
 func TestPollConfirmedOnlyTouchesConfirmedNodes(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -1225,6 +1237,7 @@ func TestPollConfirmedOnlyTouchesConfirmedNodes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed unconfirmed node: %v", err)
 	}
+	recordHistory(t, ctx, store, unconfirmedNode.ID, false)
 
 	c := New(Config{})
 	c.Storage = store
@@ -1246,8 +1259,8 @@ func TestPollConfirmedOnlyTouchesConfirmedNodes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get unconfirmed history: %v", err)
 	}
-	if len(unconfirmedHistory) != 0 {
-		t.Fatalf("len(unconfirmed history) after PollConfirmed = %d, want 0 (PollConfirmed must never touch unconfirmed nodes)", len(unconfirmedHistory))
+	if len(unconfirmedHistory) != 1 {
+		t.Fatalf("len(unconfirmed history) after PollConfirmed = %d, want still 1 (PollConfirmed must never touch unconfirmed nodes)", len(unconfirmedHistory))
 	}
 
 	// PollUnconfirmed must now touch only the unconfirmed node, leaving
@@ -1268,8 +1281,121 @@ func TestPollConfirmedOnlyTouchesConfirmedNodes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get unconfirmed history after PollUnconfirmed: %v", err)
 	}
-	if len(unconfirmedHistory) != 1 {
-		t.Fatalf("len(unconfirmed history) after PollUnconfirmed = %d, want 1", len(unconfirmedHistory))
+	if len(unconfirmedHistory) != 2 {
+		t.Fatalf("len(unconfirmed history) after PollUnconfirmed = %d, want 2 (1 pre-seeded + 1 new)", len(unconfirmedHistory))
+	}
+}
+
+// TestPollNeverContactedOnlyTouchesNeverContactedNodes verifies the
+// three-way confirmed/unconfirmed-with-history/never-contacted
+// poll-queue split (see PollNeverContacted's doc comment): PollNeverContacted
+// only ever dials/records nodes with ZERO recorded health checks at all,
+// and (immediately after, on the same shared Collector -- exactly as
+// Run's independent tickers would in production) PollUnconfirmed does
+// not re-poll the node PollNeverContacted just gave its first probe to,
+// because that node's due() cooldown (set from its escalating checkpoint
+// pollInterval) hasn't elapsed yet -- proving the "no double-poll"
+// requirement holds via the combination of the tightened query filters
+// AND the shared due()/nextPoll cooldown, exactly as it does in
+// production where all three loops share one Collector.
+func TestPollNeverContactedOnlyTouchesNeverContactedNodes(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	client := &fakeClient{info: map[string]NodeInfo{
+		"never-contacted:1":   {Reachable: true},
+		"with-history:1":      {Reachable: true},
+		"confirmed-no-poll:1": {Reachable: true},
+	}}
+
+	// Confirmed via UpsertConfirmedNode directly (bypassing PollOnce, as
+	// every other test in this file does to seed a confirmed node) --
+	// this deliberately leaves it with ZERO node_health rows, so it
+	// exercises the Confirmed: false half of PollNeverContacted's
+	// filter specifically: without that clause, a confirmed node with
+	// no history (a real if unusual state -- e.g. right after a
+	// pubkey-only migration/import) would incorrectly be swept up by
+	// PollNeverContacted too.
+	confirmedNode, err := store.UpsertConfirmedNode(ctx, "confirmed-no-poll:1", []byte{0x01, 0x02}, storage.DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("seed confirmed node: %v", err)
+	}
+
+	withHistoryNode, err := store.UpsertDiscoveredNode(ctx, "with-history:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("seed with-history node: %v", err)
+	}
+	recordHistory(t, ctx, store, withHistoryNode.ID, false)
+
+	neverContactedNode, err := store.UpsertDiscoveredNode(ctx, "never-contacted:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("seed never-contacted node: %v", err)
+	}
+
+	c := New(Config{})
+	c.Storage = store
+	c.GRPCClient = client
+
+	if err := c.PollNeverContacted(ctx); err != nil {
+		t.Fatalf("poll never-contacted: %v", err)
+	}
+
+	neverContactedHistory, err := store.GetNodeHistory(ctx, neverContactedNode.ID, 10)
+	if err != nil {
+		t.Fatalf("get never-contacted history: %v", err)
+	}
+	if len(neverContactedHistory) != 1 {
+		t.Fatalf("len(never-contacted history) after PollNeverContacted = %d, want 1", len(neverContactedHistory))
+	}
+
+	withHistoryHistory, err := store.GetNodeHistory(ctx, withHistoryNode.ID, 10)
+	if err != nil {
+		t.Fatalf("get with-history history: %v", err)
+	}
+	if len(withHistoryHistory) != 1 {
+		t.Fatalf("len(with-history history) after PollNeverContacted = %d, want still 1 (PollNeverContacted must never touch nodes that already have history)", len(withHistoryHistory))
+	}
+
+	confirmedHistory, err := store.GetNodeHistory(ctx, confirmedNode.ID, 10)
+	if err != nil {
+		t.Fatalf("get confirmed history: %v", err)
+	}
+	if len(confirmedHistory) != 0 {
+		t.Fatalf("len(confirmed history) after PollNeverContacted = %d, want still 0 (PollNeverContacted must never touch confirmed nodes, even ones with zero history)", len(confirmedHistory))
+	}
+
+	// PollUnconfirmed must now touch only withHistoryNode: it was
+	// already eligible before this call, while neverContactedNode --
+	// though it now technically also has >= 1 history row after the
+	// call above -- is still cooling down under the pollInterval
+	// due()/nextPoll entry PollNeverContacted just set for it, so it is
+	// correctly NOT re-polled here.
+	if err := c.PollUnconfirmed(ctx); err != nil {
+		t.Fatalf("poll unconfirmed: %v", err)
+	}
+
+	withHistoryHistory, err = store.GetNodeHistory(ctx, withHistoryNode.ID, 10)
+	if err != nil {
+		t.Fatalf("get with-history history after PollUnconfirmed: %v", err)
+	}
+	if len(withHistoryHistory) != 2 {
+		t.Fatalf("len(with-history history) after PollUnconfirmed = %d, want 2 (1 pre-seeded + 1 new)", len(withHistoryHistory))
+	}
+
+	neverContactedHistory, err = store.GetNodeHistory(ctx, neverContactedNode.ID, 10)
+	if err != nil {
+		t.Fatalf("get never-contacted history after PollUnconfirmed: %v", err)
+	}
+	if len(neverContactedHistory) != 1 {
+		t.Fatalf("len(never-contacted history) after PollUnconfirmed = %d, want still 1 (not double-polled)", len(neverContactedHistory))
+	}
+
+	confirmedHistory, err = store.GetNodeHistory(ctx, confirmedNode.ID, 10)
+	if err != nil {
+		t.Fatalf("get confirmed history after PollUnconfirmed: %v", err)
+	}
+	if len(confirmedHistory) != 0 {
+		t.Fatalf("len(confirmed history) after PollUnconfirmed = %d, want still 0", len(confirmedHistory))
 	}
 }
 
@@ -1347,9 +1473,18 @@ func TestPollConfirmedNotStarvedBySlowUnconfirmedPoll(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed confirmed node: %v", err)
 	}
-	if _, err := store.UpsertDiscoveredNode(seedCtx, "unconfirmed:1", storage.DiscoverySourceP2P, nil, nil); err != nil {
+	unconfirmedNode, err := store.UpsertDiscoveredNode(seedCtx, "unconfirmed:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
 		t.Fatalf("seed unconfirmed node: %v", err)
 	}
+	// Pre-seed one health check so this node is picked up by
+	// PollUnconfirmed specifically (HasHealthChecks: true) rather than
+	// PollNeverContacted (HasHealthChecks: false) -- this test's whole
+	// point is proving PollConfirmed's independence from a slow
+	// PollUnconfirmed pass specifically; TestPollNeverContactedNotStarvedBySlowUnconfirmedPoll
+	// and TestRunDoesNotStarvePollOnSlowDiscover cover the other two
+	// loops' independence.
+	recordHistory(t, seedCtx, store, unconfirmedNode.ID, false)
 
 	c := New(Config{})
 	c.Storage = store
@@ -1415,14 +1550,15 @@ func TestPollConfirmedNotStarvedBySlowUnconfirmedPoll(t *testing.T) {
 	}
 }
 
-// TestConcurrentPollLoopsNoDataRace runs PollConfirmed and PollUnconfirmed
-// concurrently and repeatedly against the same Collector's shared
-// nextPoll/mu state and the same underlying Storage. It makes no
-// assertion beyond "no error" -- its entire purpose is to give
-// `go test -race` real concurrent access to c.nextPoll (guarded by c.mu)
-// from both poll loops at once, proving that running the confirmed and
-// unconfirmed poll loops concurrently (as Run does) introduces no data
-// race.
+// TestConcurrentPollLoopsNoDataRace runs PollConfirmed, PollUnconfirmed,
+// and PollNeverContacted concurrently and repeatedly against the same
+// Collector's shared nextPoll/mu state and the same underlying Storage.
+// It makes no assertion beyond "no error" -- its entire purpose is to
+// give `go test -race` real concurrent access to c.nextPoll (guarded by
+// c.mu) from all three poll loops at once, proving that running them
+// concurrently (as Run does) introduces no data race -- including the
+// worker-pool concurrency WITHIN each individual poll() call (see
+// TestPollBoundedConcurrency for that dimension in isolation).
 func TestConcurrentPollLoopsNoDataRace(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -1438,8 +1574,21 @@ func TestConcurrentPollLoopsNoDataRace(t *testing.T) {
 	for i := 0; i < 20; i++ {
 		addr := fmt.Sprintf("unconfirmed:%d", i)
 		client.info[addr] = NodeInfo{Reachable: true}
-		if _, err := store.UpsertDiscoveredNode(ctx, addr, storage.DiscoverySourceP2P, nil, nil); err != nil {
+		n, err := store.UpsertDiscoveredNode(ctx, addr, storage.DiscoverySourceP2P, nil, nil)
+		if err != nil {
 			t.Fatalf("seed unconfirmed node %d: %v", i, err)
+		}
+		// Pre-seed one health check so this node qualifies for
+		// PollUnconfirmed's HasHealthChecks: true filter (see its doc
+		// comment) -- a zero-history node belongs to
+		// PollNeverContacted instead, exercised separately below.
+		recordHistory(t, ctx, store, n.ID, true)
+	}
+	for i := 0; i < 20; i++ {
+		addr := fmt.Sprintf("never-contacted:%d", i)
+		client.info[addr] = NodeInfo{Reachable: true}
+		if _, err := store.UpsertDiscoveredNode(ctx, addr, storage.DiscoverySourceP2P, nil, nil); err != nil {
+			t.Fatalf("seed never-contacted node %d: %v", i, err)
 		}
 	}
 
@@ -1448,8 +1597,8 @@ func TestConcurrentPollLoopsNoDataRace(t *testing.T) {
 	c.GRPCClient = client
 
 	var wg sync.WaitGroup
-	wg.Add(2)
-	errCh := make(chan error, 2)
+	wg.Add(3)
+	errCh := make(chan error, 3)
 
 	go func() {
 		defer wg.Done()
@@ -1469,10 +1618,210 @@ func TestConcurrentPollLoopsNoDataRace(t *testing.T) {
 			}
 		}
 	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 10; i++ {
+			if err := c.PollNeverContacted(ctx); err != nil {
+				errCh <- err
+				return
+			}
+		}
+	}()
 
 	wg.Wait()
 	close(errCh)
 	for err := range errCh {
 		t.Fatalf("concurrent poll error: %v", err)
+	}
+}
+
+// concurrencyTrackingClient is a NodeClient fixture whose GetInfo tracks
+// the number of concurrently in-flight calls via atomic counters,
+// recording the highest ("peak") value ever observed, and sleeps
+// briefly on every call so that concurrent callers genuinely overlap in
+// wall-clock time -- otherwise a bug that removed all concurrency could
+// still show a misleadingly low peak just because calls happened to be
+// fast enough not to overlap. Used by TestPollBoundedConcurrency to
+// prove poll()'s worker pool never exceeds maxPollWorkers in-flight
+// PollOnce calls, even when many more nodes than that are due in a
+// single pass.
+type concurrencyTrackingClient struct {
+	current int64
+	peak    int64
+}
+
+func (c *concurrencyTrackingClient) GetPeers(ctx context.Context, addr string) ([]DiscoveredPeer, error) {
+	return nil, nil
+}
+
+func (c *concurrencyTrackingClient) GetInfo(ctx context.Context, addr string) (NodeInfo, error) {
+	cur := atomic.AddInt64(&c.current, 1)
+	defer atomic.AddInt64(&c.current, -1)
+
+	for {
+		peak := atomic.LoadInt64(&c.peak)
+		if cur <= peak {
+			break
+		}
+		if atomic.CompareAndSwapInt64(&c.peak, peak, cur) {
+			break
+		}
+	}
+
+	// Long enough that, with true bounded concurrency (up to
+	// maxPollWorkers in flight), a batch well in excess of
+	// maxPollWorkers has no realistic way to complete without multiple
+	// workers genuinely overlapping in time -- proving the peak
+	// reflects real concurrency, not just a bookkeeping race won by
+	// sheer luck.
+	time.Sleep(20 * time.Millisecond)
+
+	return NodeInfo{Reachable: true}, nil
+}
+
+// TestPollBoundedConcurrency is the core regression/proof test for Part
+// 1 of the collector-concurrency-brief: poll() (shared by PollConfirmed/
+// PollUnconfirmed/PollNeverContacted) must never have more than
+// maxPollWorkers (100) PollOnce calls in flight at once, no matter how
+// many more nodes than that are simultaneously due. It seeds
+// numNodesDue (250, more than double maxPollWorkers) never-contacted
+// nodes -- all due immediately, since none has ever been polled -- and
+// asserts the concurrencyTrackingClient's observed peak concurrent
+// GetInfo call count is both (a) greater than 1 (proving the pass is
+// genuinely running concurrently at all, not accidentally back to
+// sequential) and (b) never more than maxPollWorkers.
+func TestPollBoundedConcurrency(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	const numNodesDue = 250 // comfortably more than 2x maxPollWorkers (100)
+	for i := 0; i < numNodesDue; i++ {
+		addr := fmt.Sprintf("bounded-concurrency:%d", i)
+		if _, err := store.UpsertDiscoveredNode(ctx, addr, storage.DiscoverySourceP2P, nil, nil); err != nil {
+			t.Fatalf("seed node %d: %v", i, err)
+		}
+	}
+
+	client := &concurrencyTrackingClient{}
+	c := New(Config{})
+	c.Storage = store
+	c.GRPCClient = client
+
+	if err := c.PollNeverContacted(ctx); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+
+	peak := atomic.LoadInt64(&client.peak)
+	if peak > int64(maxPollWorkers) {
+		t.Fatalf("peak concurrent PollOnce calls = %d, want <= maxPollWorkers (%d)", peak, maxPollWorkers)
+	}
+	if peak <= 1 {
+		t.Fatalf("peak concurrent PollOnce calls = %d, want > 1 -- the pass does not appear to have run concurrently at all, so this test cannot be proving the concurrency limit is actually being exercised", peak)
+	}
+}
+
+// TestPollNeverContactedNotStarvedBySlowUnconfirmedPoll mirrors
+// TestPollConfirmedNotStarvedBySlowUnconfirmedPoll and
+// TestRunDoesNotStarvePollOnSlowDiscover, but for the third loop: it
+// proves that a slow (simulating a large/backlogged)
+// unconfirmed-with-history poll cannot delay or starve the
+// never-contacted loop's poll attempts, since PollNeverContacted runs
+// on its own fully independent ticker/goroutine (see Run and
+// runNeverContactedPollLoop's doc comments) -- exactly the "highest
+// priority, walk the network more aggressively" property
+// PollNeverContacted exists to guarantee.
+func TestPollNeverContactedNotStarvedBySlowUnconfirmedPoll(t *testing.T) {
+	store := newTestStore(t)
+	seedCtx := context.Background()
+
+	client := &slowInfoClient{
+		slowAddr:   "unconfirmed-with-history:1",
+		unblock:    make(chan struct{}),
+		infoCalled: make(chan struct{}),
+		info: map[string]NodeInfo{
+			"never-contacted:1": {Reachable: true},
+		},
+	}
+	// Ensures the slow GetInfo call actually unblocks/returns at the
+	// end of the test, even on failure, rather than leaking a goroutine
+	// blocked forever on a channel nothing else will ever close.
+	t.Cleanup(func() { close(client.unblock) })
+
+	withHistoryNode, err := store.UpsertDiscoveredNode(seedCtx, "unconfirmed-with-history:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("seed with-history node: %v", err)
+	}
+	recordHistory(t, seedCtx, store, withHistoryNode.ID, false)
+
+	neverContactedNode, err := store.UpsertDiscoveredNode(seedCtx, "never-contacted:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("seed never-contacted node: %v", err)
+	}
+
+	c := New(Config{})
+	c.Storage = store
+	c.GRPCClient = client
+	c.TickInterval = 20 * time.Millisecond
+	c.UnconfirmedTickInterval = 20 * time.Millisecond
+	c.NeverContactedTickInterval = 20 * time.Millisecond
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- c.Run(runCtx) }()
+
+	// Wait for the unconfirmed loop's poll to actually reach (and hang
+	// in) GetInfo for the with-history node, so we know it's genuinely
+	// in flight for the rest of the test rather than, say, not having
+	// started yet.
+	select {
+	case <-client.infoCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("with-history node's GetInfo was never called")
+	}
+
+	// The never-contacted loop ticks independently of the hung
+	// unconfirmed loop; poll for a recorded health check on the
+	// never-contacted node within a deadline that comfortably exceeds
+	// several TickIntervals.
+	deadline := time.Now().Add(3 * time.Second)
+	var history []storage.HealthCheck
+	for {
+		history, err = store.GetNodeHistory(seedCtx, neverContactedNode.ID, 10)
+		if err != nil {
+			t.Fatalf("get history: %v", err)
+		}
+		if len(history) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no health check recorded for the never-contacted node while the with-history node's GetInfo was still hung -- PollNeverContacted appears starved by PollUnconfirmed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// The whole point: confirm the slow GetInfo call genuinely had not
+	// returned yet when PollNeverContacted's result showed up above.
+	if client.infoDone.Load() {
+		t.Fatal("with-history node's GetInfo had already returned by the time PollNeverContacted recorded a health check -- test doesn't prove independence")
+	}
+
+	if !history[0].Reachable {
+		t.Errorf("expected reachable = true")
+	}
+
+	// Cancel ctx so all loops exit -- the hung GetInfo call observes
+	// ctx.Done() and returns rather than staying hung forever -- and
+	// confirm Run actually returns promptly and without error.
+	cancel()
+
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Errorf("Run returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after ctx cancellation")
 	}
 }
