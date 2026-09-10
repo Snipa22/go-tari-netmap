@@ -348,7 +348,11 @@ func TestP2PClientPassesThroughSocksProxyAddr(t *testing.T) {
 		chainMetadata: &p2p.ChainMetadataInfo{},
 		identity:      &p2p.PeerInfo{},
 	}
-	client := &p2pNodeClient{probes: fake, socksProxyAddr: proxyAddr}
+	client, ok := NewP2PClientWithSocksProxy(proxyAddr).(*p2pNodeClient)
+	if !ok {
+		t.Fatalf("NewP2PClientWithSocksProxy(...) = %T, want *p2pNodeClient", NewP2PClientWithSocksProxy(proxyAddr))
+	}
+	client.probes = fake
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

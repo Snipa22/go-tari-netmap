@@ -78,18 +78,53 @@ func main() {
 	// Real go-tari-grpc-lib-backed client: talks to Tari base nodes over
 	// gRPC. Dials fresh per-call (see grpcNodeClient's doc comment in
 	// internal/collector/grpc_client.go for why that's fine here).
-	grpcClient := collector.NewGRPCClient()
+	//
+	// NETMAP_OWNED_GRPC_ADDRESSES scopes gRPC probing to an explicit allowlist of
+	// "P2P address -> real gRPC address" pairs for nodes we own -- comma-separated
+	// "p2pAddress=grpcAddress" entries, e.g.
+	// "23.226.69.178:18189=23.226.69.178:18102,10.0.0.5:18189=10.0.0.5:18102". This exists
+	// because a peer's real gRPC listen port is NEVER discoverable via Tari P2P peer
+	// discovery, for ANY peer, arbitrary or our own -- tari_protos/network.proto's
+	// Peer/Address messages and go-tari-lib's p2p.PeerInfo both carry no gRPC-port field
+	// anywhere, only the P2P/comms wire address. See docs/grpc-port-scope.md for the full
+	// finding and rationale. The only way this collector can ever know a node's real gRPC
+	// address is out-of-band, operator-supplied config -- i.e. gRPC probing is only
+	// meaningful for our own explicitly-configured/owned nodes, never for addresses
+	// learned by walking the peer graph. Empty/unset (the default) disables this scoping
+	// entirely: grpcClient dials whatever addr it's given, as-is, matching the
+	// pre-existing (buggy, for non-owned nodes) zero-config behavior -- see
+	// collector.NewGRPCClientWithAddressMap's doc comment for the nil-vs-populated-map
+	// distinction.
+	ownedGRPCAddresses := parseOwnedGRPCAddresses(os.Getenv("NETMAP_OWNED_GRPC_ADDRESSES"))
+	grpcClient := collector.NewGRPCClientWithAddressMap(ownedGRPCAddresses)
 
 	// Real go-tari-lib/p2p-backed client: talks to Tari nodes over the
 	// direct comms/RPC-over-P2P transport, independent of gRPC — see
 	// p2pNodeClient's doc comment in internal/collector/p2p_client.go.
 	//
-	// NETMAP_SOCKS_PROXY_ADDR is the "host:port" address of a Tor SOCKS5
-	// proxy (e.g. a local Tor daemon's SocksPort, typically
-	// 127.0.0.1:9050), used to reach `.onion` Tari peers over this
-	// transport. Empty/unset (the default) disables it, matching the
+	// NETMAP_SOCKS_PROXY_ADDRS (plural) is a comma-separated list of Tor SOCKS5 proxy
+	// "host:port" addresses (e.g. N independent local Tor daemon instances' SocksPorts,
+	// typically 127.0.0.1:9100..127.0.0.1:9123 for N=24 in the real mainnet deploy -- this
+	// binary does NOT assume any particular count, it just splits on comma, trims, and
+	// drops empties, exactly like parseSeedNodes), used to reach `.onion` Tari peers over
+	// this transport. Each dial's proxy is chosen deterministically per-address (see
+	// collector.P2PShardIndex), letting collector.go's poll() bound P2P dial concurrency
+	// PER REAL TOR INSTANCE instead of across all of them combined -- see
+	// collector.maxP2PWorkersPerShard's doc comment for why: a single Tor instance
+	// saturates catastrophically at high concurrent hidden-service circuit-build counts.
+	//
+	// NETMAP_SOCKS_PROXY_ADDR (singular, legacy) is kept working as a fallback for the
+	// existing testnet deployment (netmap-testnet.service), which is explicitly OUT OF
+	// SCOPE for sharding and must keep using its single existing Tor instance/env var
+	// unchanged: if NETMAP_SOCKS_PROXY_ADDRS is unset/empty, this falls back to reading
+	// NETMAP_SOCKS_PROXY_ADDR as a single-element list, preserving exact pre-existing
+	// testnet behavior with zero config changes required on that host. Precedence is
+	// plural-preferred, singular-fallback -- if BOTH happen to be set, plural wins and
+	// singular is ignored entirely.
+	//
+	// Empty/unset (both variables): disables SOCKS entirely (dial directly), matching the
 	// pre-existing zero-config behavior.
-	socksProxyAddr := os.Getenv("NETMAP_SOCKS_PROXY_ADDR")
+	socksProxyAddrs := parseSocksProxyAddrs(os.Getenv("NETMAP_SOCKS_PROXY_ADDRS"), os.Getenv("NETMAP_SOCKS_PROXY_ADDR"))
 
 	// NETMAP_NETWORK_BYTE is a decimal string representation of the raw
 	// Tari P2P wire network byte (e.g. "0" for MainNet, "38" for
@@ -105,7 +140,7 @@ func main() {
 		}
 		networkByte = byte(n)
 	}
-	p2pClient := collector.NewP2PClientWithOptions(socksProxyAddr, networkByte)
+	p2pClient := collector.NewP2PClientWithShardedProxies(socksProxyAddrs, networkByte)
 
 	c := collector.New(collector.Config{
 		SeedNodes: parseSeedNodes(os.Getenv("NETMAP_SEED_NODES")),
@@ -229,4 +264,55 @@ func parseSeedNodes(raw string) []string {
 		}
 	}
 	return seeds
+}
+
+// parseOwnedGRPCAddresses parses NETMAP_OWNED_GRPC_ADDRESSES's raw value: a comma-separated
+// list of "p2pAddress=grpcAddress" pairs (see grpcClient's construction above for the exact
+// shape/example and the "why" -- gRPC ports are never P2P-discoverable, see
+// docs/grpc-port-scope.md), mirroring parseSeedNodes' style -- trim whitespace, skip empty
+// entries. An empty/unset raw value returns a nil map, which is the deliberate "feature not
+// configured at all" sentinel collector.NewGRPCClientWithAddressMap distinguishes from a
+// populated-but-missing-entry map -- see that constructor's doc comment. Each entry is split on
+// the FIRST "=" via strings.Cut, since neither a P2P nor a gRPC "host:port" address can itself
+// contain "="; a malformed entry (no "=", or an empty p2pAddress/grpcAddress after trimming) is
+// logged and skipped rather than failing the whole binary at startup -- a typo in one pair
+// should not take down gRPC probing for every other correctly-configured owned node.
+func parseOwnedGRPCAddresses(raw string) map[string]string {
+	if raw == "" {
+		return nil
+	}
+	out := make(map[string]string)
+	for _, pair := range strings.Split(raw, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		p2pAddr, grpcAddr, ok := strings.Cut(pair, "=")
+		p2pAddr = strings.TrimSpace(p2pAddr)
+		grpcAddr = strings.TrimSpace(grpcAddr)
+		if !ok || p2pAddr == "" || grpcAddr == "" {
+			log.Printf("netmap: skipping malformed NETMAP_OWNED_GRPC_ADDRESSES entry %q (want \"p2pAddress=grpcAddress\")", pair)
+			continue
+		}
+		out[p2pAddr] = grpcAddr
+	}
+	return out
+}
+
+// parseSocksProxyAddrs implements NETMAP_SOCKS_PROXY_ADDRS' plural-preferred/
+// NETMAP_SOCKS_PROXY_ADDR-singular-fallback precedence described at this file's socksProxyAddrs
+// construction site: if pluralRaw is non-empty, it is parsed exactly like parseSeedNodes
+// (comma-separated, trimmed, empties dropped) and singularRaw is ignored entirely -- even if
+// singularRaw also happens to be set. Otherwise, if singularRaw is non-empty, it is returned as
+// a single-element slice, preserving the existing testnet deployment's exact zero-config
+// (aside from that one variable) behavior with NO changes required on that host. If both are
+// empty/unset, returns nil (no SOCKS proxy at all, dial directly).
+func parseSocksProxyAddrs(pluralRaw, singularRaw string) []string {
+	if pluralRaw != "" {
+		return parseSeedNodes(pluralRaw)
+	}
+	if singularRaw != "" {
+		return []string{singularRaw}
+	}
+	return nil
 }

@@ -3,6 +3,7 @@ package collector
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"time"
 
@@ -10,6 +11,25 @@ import (
 	pb "github.com/Snipa22/go-tari-lib/p2p/proto"
 	rpcpkg "github.com/Snipa22/go-tari-lib/p2p/rpc"
 )
+
+// P2PShardIndex returns which shard (in [0, shardCount)) addr routes to, via a stable FNV-1a
+// hash of addr — deterministic across calls/processes/restarts (unlike Go's native map
+// iteration order or a pointer-identity hash), so a given address always lands on the same
+// shard. shardCount <= 0 is treated as 1 (no sharding, everything routes to shard 0).
+//
+// This is exported so it's independently unit-testable and so collector.go's poll() P2P
+// concurrency dispatch (see Sharded/p2pShardCount) can use the EXACT same shard assignment
+// p2pNodeClient itself uses to pick its SOCKS proxy for a given address (see
+// p2pNodeClient.proxyForAddr) — these two must agree, or the whole point of bounding
+// concurrency PER real Tor instance breaks.
+func P2PShardIndex(addr string, shardCount int) int {
+	if shardCount <= 0 {
+		return 0
+	}
+	h := fnv.New32a()
+	h.Write([]byte(addr))
+	return int(h.Sum32() % uint32(shardCount))
+}
 
 // p2pDialTimeout bounds how long p2pNodeClient waits for a single probe
 // (handshake + identity exchange + the actual RPC call) to complete before
@@ -71,15 +91,27 @@ type p2pNodeClient struct {
 	// mapping logic without any real P2P network calls.
 	probes p2pProbeFuncs
 
-	// socksProxyAddr, if non-empty, is the "host:port" address of a
-	// SOCKS5 proxy (e.g. a local Tor daemon's SocksPort) passed through
-	// to probeChainMetadata/probeGetPeers/probeIdentity via
-	// p2p.ProbeOptions, letting this client reach `.onion` Tari peers.
-	// The zero value (empty string) preserves the exact pre-existing
-	// zero-config behavior — see NewP2PClient/NewP2PClientWithSocksProxy.
-	// probeIdentity is given this same treatment as
-	// probeChainMetadata/probeGetPeers, for the same reason (reaching
-	// onion peers) — see GetInfo's doc comment.
+	// socksProxyAddrs holds the "host:port" address(es) of one or more SOCKS5 proxies (e.g.
+	// local Tor daemon SocksPort instances) passed through to
+	// probeChainMetadata/probeGetPeers/probeIdentity via p2p.ProbeOptions, letting this client
+	// reach `.onion` Tari peers. This is the field actually consulted by proxyForAddr for every
+	// real dial — see NewP2PClientWithShardedProxies' doc comment.
+	//
+	// A nil/empty slice (the zero value) means no SOCKS proxy at all (dial directly) —
+	// proxyForAddr returns "" in that case, preserving the exact pre-existing zero-config
+	// behavior. A single-element slice behaves exactly like the pre-sharding single
+	// socksProxyAddr field always did: every address routes to that one proxy. More than one
+	// element shards each dial's proxy selection across all of them via P2PShardIndex, keyed on
+	// the addr being dialed — see proxyForAddr/ShardCount.
+	socksProxyAddrs []string
+
+	// socksProxyAddr mirrors socksProxyAddrs[0] (or "" if socksProxyAddrs is empty). It is kept
+	// purely for backward compatibility with existing test assertions/call sites that read this
+	// exact field name/semantics for the single/zero-proxy case (see NewP2PClient/
+	// NewP2PClientWithSocksProxy/NewP2PClientWithOptions, all of which still populate it) — it
+	// plays NO role in dial-target resolution; proxyForAddr/GetInfo/GetPeers only ever consult
+	// socksProxyAddrs (plural). Do not read this field for anything other than the single/
+	// zero-proxy case; with 2+ proxies configured it is simply the first one, not "the" proxy.
 	socksProxyAddr string
 
 	// networkByte is passed through to probeChainMetadata/probeGetPeers/
@@ -122,8 +154,61 @@ func NewP2PClientWithSocksProxy(proxyAddr string) NodeClient {
 // p2p.NetworkByteMainNet, p2p.NetworkByteEsmeralda, etc. — the named
 // constants live in go-tari-lib's p2p package). socksProxyAddr behaves
 // exactly as in NewP2PClientWithSocksProxy (pass "" to dial directly).
+//
+// This is a thin wrapper around NewP2PClientWithShardedProxies with a
+// 0- or 1-element proxy slice — see that constructor's doc comment.
 func NewP2PClientWithOptions(socksProxyAddr string, networkByte byte) NodeClient {
-	return &p2pNodeClient{probes: realP2PProbeFuncs{}, socksProxyAddr: socksProxyAddr, networkByte: networkByte}
+	var addrs []string
+	if socksProxyAddr != "" {
+		addrs = []string{socksProxyAddr}
+	}
+	return NewP2PClientWithShardedProxies(addrs, networkByte)
+}
+
+// NewP2PClientWithShardedProxies returns a NodeClient identical to NewP2PClientWithOptions',
+// except it accepts MULTIPLE SOCKS5 proxy addresses (e.g. N independent local Tor daemon
+// instances' SocksPorts) rather than just one. Every GetInfo/GetPeers dial resolves which of
+// socksProxyAddrs to actually use for its target addr via P2PShardIndex(addr,
+// len(socksProxyAddrs)) — see proxyForAddr — so a given address always routes to the same one
+// of the N proxies, deterministically, letting a caller (see collector.go's poll() P2P
+// dispatch, via the Sharded interface/ShardCount) bound concurrency PER real Tor instance
+// rather than across all of them combined.
+//
+// socksProxyAddrs may be nil/empty (dial directly, no SOCKS proxy at all) or have exactly one
+// element (every address routes to that single proxy, byte-for-byte the pre-sharding
+// behavior) — both are handled correctly by proxyForAddr/P2PShardIndex without any special-
+// casing here. NewP2PClient/NewP2PClientWithSocksProxy/NewP2PClientWithOptions are all thin
+// wrappers around this constructor with a 0- or 1-element slice, so every existing caller/test
+// that passes a single proxy or none keeps working EXACTLY as before.
+func NewP2PClientWithShardedProxies(socksProxyAddrs []string, networkByte byte) NodeClient {
+	var single string
+	if len(socksProxyAddrs) > 0 {
+		single = socksProxyAddrs[0]
+	}
+	return &p2pNodeClient{
+		probes:          realP2PProbeFuncs{},
+		socksProxyAddrs: socksProxyAddrs,
+		socksProxyAddr:  single,
+		networkByte:     networkByte,
+	}
+}
+
+// proxyForAddr resolves the actual SOCKS5 proxy address to use for a dial to addr, via
+// P2PShardIndex(addr, len(c.socksProxyAddrs)) — see NewP2PClientWithShardedProxies' doc
+// comment. Returns "" (dial directly) if c.socksProxyAddrs is empty.
+func (c *p2pNodeClient) proxyForAddr(addr string) string {
+	if len(c.socksProxyAddrs) == 0 {
+		return ""
+	}
+	return c.socksProxyAddrs[P2PShardIndex(addr, len(c.socksProxyAddrs))]
+}
+
+// ShardCount implements the Sharded interface (see collector.go), returning the number of
+// independent SOCKS proxy shards this client dials across — max(1, len(c.socksProxyAddrs)), so
+// a caller bounding concurrency per shard always gets at least 1 (the degenerate "no sharding"
+// case for zero or one configured proxy).
+func (c *p2pNodeClient) ShardCount() int {
+	return max(1, len(c.socksProxyAddrs))
 }
 
 // GetInfo implements NodeClient.
@@ -162,7 +247,9 @@ func (c *p2pNodeClient) GetInfo(ctx context.Context, addr string) (NodeInfo, err
 	ctx, cancel := context.WithTimeout(ctx, p2pDialTimeout)
 	defer cancel()
 
-	meta, err := c.probes.probeChainMetadata(ctx, addr, p2p.ProbeOptions{SocksProxyAddr: c.socksProxyAddr, NetworkByte: c.networkByte})
+	proxyAddr := c.proxyForAddr(addr)
+
+	meta, err := c.probes.probeChainMetadata(ctx, addr, p2p.ProbeOptions{SocksProxyAddr: proxyAddr, NetworkByte: c.networkByte})
 	if err != nil {
 		return NodeInfo{}, fmt.Errorf("p2p ProbeChainMetadata %s: %w", addr, err)
 	}
@@ -171,7 +258,7 @@ func (c *p2pNodeClient) GetInfo(ctx context.Context, addr string) (NodeInfo, err
 		Reachable: true,
 	}
 
-	if peerInfo, err := c.probes.probeIdentity(ctx, addr, p2p.ProbeOptions{SocksProxyAddr: c.socksProxyAddr, NetworkByte: c.networkByte}); err != nil {
+	if peerInfo, err := c.probes.probeIdentity(ctx, addr, p2p.ProbeOptions{SocksProxyAddr: proxyAddr, NetworkByte: c.networkByte}); err != nil {
 		log.Printf("p2p GetInfo %s: probeIdentity failed (non-fatal, PublicKey left nil): %v", addr, err)
 	} else {
 		info.PublicKey = peerInfo.RemoteStaticPubKey
@@ -209,7 +296,7 @@ func (c *p2pNodeClient) GetPeers(ctx context.Context, addr string) ([]Discovered
 	ctx, cancel := context.WithTimeout(ctx, p2pDialTimeout)
 	defer cancel()
 
-	peers, err := c.probes.probeGetPeers(ctx, addr, p2p.DefaultGetPeersRequest(), p2p.ProbeOptions{SocksProxyAddr: c.socksProxyAddr, NetworkByte: c.networkByte})
+	peers, err := c.probes.probeGetPeers(ctx, addr, p2p.DefaultGetPeersRequest(), p2p.ProbeOptions{SocksProxyAddr: c.proxyForAddr(addr), NetworkByte: c.networkByte})
 	if err != nil {
 		return nil, fmt.Errorf("p2p ProbeGetPeers %s: %w", addr, err)
 	}

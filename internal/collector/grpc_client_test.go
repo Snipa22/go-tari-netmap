@@ -2,6 +2,7 @@ package collector
 
 import (
 	"context"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -267,5 +268,107 @@ func TestGRPCClientDialFailureReturnsError(t *testing.T) {
 
 	if _, err := client.GetInfo(ctx, "127.0.0.1:1"); err == nil {
 		t.Fatal("GetInfo against an unreachable address: expected error, got nil")
+	}
+}
+
+// recordingDialer is a fakeDialer used to exercise grpcNodeClient.dialNode's target-resolution
+// logic (the NETMAP_OWNED_GRPC_ADDRESSES / addressMap feature) without needing a real network
+// dial or a bufconn server -- these tests only care about WHAT ADDRESS was passed to dial, and
+// whether dial was invoked at all, not about any RPC succeeding afterward.
+type recordingDialer struct {
+	calls      int
+	lastTarget string
+	err        error
+}
+
+func (d *recordingDialer) dial(target string, opts ...grpc.DialOption) (*grpc.ClientConn, error) {
+	d.calls++
+	d.lastTarget = target
+	if d.err != nil {
+		return nil, d.err
+	}
+	// grpc.NewClient itself doesn't dial eagerly (see
+	// TestGRPCClientDialFailureReturnsError's doc comment), so a real
+	// *grpc.ClientConn dialed against a passthrough target is a safe,
+	// cheap stand-in here -- these tests never issue an RPC through it.
+	return grpc.NewClient(target, opts...)
+}
+
+// TestGRPCClientDialNodeNilAddressMapPreservesDialAddrAsIs verifies that a grpcNodeClient
+// constructed with a nil address map (NewGRPCClient() / NewGRPCClientWithAddressMap(nil))
+// preserves the EXACT pre-existing dialNode behavior: it dials addr as-is, unconditionally --
+// see grpcNodeClient.addressMap's doc comment.
+func TestGRPCClientDialNodeNilAddressMapPreservesDialAddrAsIs(t *testing.T) {
+	dialer := &recordingDialer{}
+	client := &grpcNodeClient{dial: dialer.dial, addressMap: nil}
+
+	if _, _, err := client.dialNode("23.226.69.178:18189"); err != nil {
+		t.Fatalf("dialNode: unexpected error: %v", err)
+	}
+	if dialer.calls != 1 {
+		t.Fatalf("dialer.calls = %d, want 1", dialer.calls)
+	}
+	if dialer.lastTarget != "23.226.69.178:18189" {
+		t.Errorf("dialer.lastTarget = %q, want %q (dial addr as-is)", dialer.lastTarget, "23.226.69.178:18189")
+	}
+}
+
+// TestGRPCClientDialNodeAddressMapHitDialsMappedGRPCAddress verifies that a populated address
+// map with a matching entry for the given P2P addr causes dialNode to dial the MAPPED gRPC
+// address, not the P2P address it was given.
+func TestGRPCClientDialNodeAddressMapHitDialsMappedGRPCAddress(t *testing.T) {
+	dialer := &recordingDialer{}
+	client := &grpcNodeClient{
+		dial: dialer.dial,
+		addressMap: map[string]string{
+			"23.226.69.178:18189": "23.226.69.178:18102",
+		},
+	}
+
+	if _, _, err := client.dialNode("23.226.69.178:18189"); err != nil {
+		t.Fatalf("dialNode: unexpected error: %v", err)
+	}
+	if dialer.calls != 1 {
+		t.Fatalf("dialer.calls = %d, want 1", dialer.calls)
+	}
+	if dialer.lastTarget != "23.226.69.178:18102" {
+		t.Errorf("dialer.lastTarget = %q, want mapped gRPC address %q", dialer.lastTarget, "23.226.69.178:18102")
+	}
+}
+
+// TestGRPCClientDialNodeAddressMapMissReturnsErrGRPCAddressUnknown verifies that a populated
+// address map with NO matching entry for the given addr returns ErrGRPCAddressUnknown and never
+// invokes the dialer at all -- dialNode must not attempt to dial the P2P address as a fallback.
+func TestGRPCClientDialNodeAddressMapMissReturnsErrGRPCAddressUnknown(t *testing.T) {
+	dialer := &recordingDialer{}
+	client := &grpcNodeClient{
+		dial: dialer.dial,
+		addressMap: map[string]string{
+			"some-other-owned-node:18189": "some-other-owned-node:18102",
+		},
+	}
+
+	_, _, err := client.dialNode("unknown-discovered-peer:18189")
+	if err == nil {
+		t.Fatal("dialNode: expected ErrGRPCAddressUnknown, got nil")
+	}
+	if !errors.Is(err, ErrGRPCAddressUnknown) {
+		t.Errorf("dialNode error = %v, want errors.Is(_, ErrGRPCAddressUnknown)", err)
+	}
+	if dialer.calls != 0 {
+		t.Errorf("dialer.calls = %d, want 0 (dial must never be attempted on an address-map miss)", dialer.calls)
+	}
+}
+
+// TestNewGRPCClientWithAddressMapNilMatchesNewGRPCClient verifies that
+// NewGRPCClientWithAddressMap(nil) is exactly equivalent to NewGRPCClient(), per
+// NewGRPCClient's doc comment.
+func TestNewGRPCClientWithAddressMapNilMatchesNewGRPCClient(t *testing.T) {
+	client, ok := NewGRPCClientWithAddressMap(nil).(*grpcNodeClient)
+	if !ok {
+		t.Fatalf("NewGRPCClientWithAddressMap(nil) = %T, want *grpcNodeClient", NewGRPCClientWithAddressMap(nil))
+	}
+	if client.addressMap != nil {
+		t.Errorf("addressMap = %v, want nil", client.addressMap)
 	}
 }
