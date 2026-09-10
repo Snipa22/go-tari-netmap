@@ -1,15 +1,38 @@
 // Command netmap is the entrypoint for the go-tari-netmap HTTP server.
+//
+// # Network flag (mainnet/testnet)
+//
+// This exact same binary is deployed unchanged to both a mainnet host (netmap.service) and a
+// testnet host (netmap-testnet.service), and both get scraped into a single shared Prometheus
+// backend -- so every metric this binary exposes at /metrics is prefixed by which network
+// produced it (see metrics.go's doc comment). The required -network flag (values:
+// mainnet|testnet, no default) drives that prefix; this binary fails fast at startup if it's
+// unset or an unrecognized value:
+//
+//	-network mainnet   e.g. netmap.service on CT102 :8080
+//	-network testnet    e.g. netmap-testnet.service on CT102 :8081
+//
+// # Metrics listener (-metrics-addr)
+//
+// This binary's existing -addr listener (e.g. 192.168.40.51:8080/:8081) is PROXIED -- Caddy
+// sits in front of it to serve the public dashboard -- so /metrics and /healthz are served on
+// a SEPARATE, opt-in -metrics-addr listener instead, exactly mirroring
+// cmd/netmap-p2p-responder's own -metrics-addr (see metrics.go's doc comment for the full
+// rationale and that binary's identical flag). Empty/unset (the default) disables it entirely.
 package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -21,8 +44,19 @@ import (
 )
 
 func main() {
-	addr := flag.String("addr", ":8080", "HTTP listen address")
+	addr := flag.String("addr", ":8080", "HTTP listen address (dashboard + JSON API) -- this is normally PROXIED (e.g. by Caddy) to serve the public dashboard; /metrics and /healthz are deliberately NOT served here, see -metrics-addr.")
+	network := flag.String("network", "", "REQUIRED, no default: which deployed instance of this binary this is -- \"mainnet\" or \"testnet\". "+
+		"Both networks' deployments of this exact same binary get scraped into one shared Prometheus backend, so every metric name this binary exposes at /metrics is prefixed netmap_<network>_collector_.../netmap_<network>_api_... "+
+		"Fails fast at startup if unset or not exactly one of these two values. This is distinct from NETMAP_NETWORK_BYTE below, which selects the actual Tari wire-protocol network the collector's P2P client dials -- see that flag's doc comment.")
+	metricsAddr := flag.String("metrics-addr", "", "address to serve Prometheus /metrics + /healthz on (default empty = disabled, opt-in). "+
+		"CRITICAL: bind to an INTERNAL-ONLY address, e.g. 192.168.40.x:PORT or 127.0.0.1:PORT -- NEVER the address Caddy proxies -addr from. "+
+		"This is a SEPARATE listener from -addr (which is proxied) -- if you set this at all, prefer a loopback-only address such as 127.0.0.1:9472; do NOT use a bare :PORT form (binds ALL interfaces).")
 	flag.Parse()
+
+	metrics, err := newNetmapMetrics(*network)
+	if err != nil {
+		log.Fatalf("netmap: %v", err)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -88,6 +122,13 @@ func main() {
 	c.Storage = store
 	c.GRPCClient = grpcClient
 	c.P2PClient = p2pClient
+	// OnPollResult feeds this process' own scheduled poll loops (PollConfirmed/
+	// PollUnconfirmed/PollNeverContacted) into netmap_<network>_collector_poll_result_total
+	// (see metrics.go's netmapMetrics.onPollResult/PollResultFunc) -- deliberately NOT wired
+	// into api.NewRouter's own grpcClient/p2pClient below, since its ad hoc admin-triggered
+	// probes (poll-now, submission approval) are a different, unrelated activity that must
+	// not skew this metric.
+	c.OnPollResult = metrics.onPollResult
 
 	go func() {
 		if err := c.Run(ctx); err != nil {
@@ -118,7 +159,11 @@ func main() {
 	mux.Handle("/", webHandler)
 	mux.Handle("/api/", http.StripPrefix("/api", api.NewRouter(store, grpcClient, p2pClient, adminCreds)))
 
-	srv := &http.Server{Addr: *addr, Handler: mux}
+	// instrumentHTTP wraps the whole dashboard+API mux above with httpRequestsTotal/
+	// httpRequestDuration -- see metrics.go's doc comment. This mux is served on *addr (the
+	// existing, Caddy-proxied listener) -- /metrics and /healthz are NEVER mounted here, see
+	// the separate -metrics-addr listener below.
+	srv := &http.Server{Addr: *addr, Handler: metrics.instrumentHTTP(mux)}
 
 	go func() {
 		<-ctx.Done()
@@ -129,10 +174,43 @@ func main() {
 		}
 	}()
 
+	// -metrics-addr is a SEPARATE, opt-in, internal-only listener for /metrics + /healthz --
+	// see this binary's own doc comment and metrics.go's doc comment for why this must never
+	// share *addr's (Caddy-proxied) listener/mux. Empty (the default) disables it entirely,
+	// including the periodic DB-derived-gauge refresh loop below -- a process with metrics
+	// disabled issues none of these extra periodic queries at all.
+	var metricsWG sync.WaitGroup
+	if *metricsAddr != "" {
+		metricsListener, err := net.Listen("tcp", *metricsAddr)
+		if err != nil {
+			log.Fatalf("netmap: listening on -metrics-addr %s: %v", *metricsAddr, err)
+		}
+		metricsServer := newMetricsServer(store, metrics)
+		log.Printf("netmap: serving /metrics and /healthz on %s (internal-only -- never expose this address publicly)", metricsListener.Addr())
+
+		metricsWG.Add(1)
+		go func() {
+			defer metricsWG.Done()
+			if err := metricsServer.Serve(metricsListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Printf("netmap: metrics server error: %v", err)
+			}
+		}()
+
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer shutdownCancel()
+			_ = metricsServer.Shutdown(shutdownCtx)
+		}()
+
+		go metrics.runMetricsRefreshLoop(ctx, store)
+	}
+
 	log.Printf("go-tari-netmap listening on %s", *addr)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("server error: %v", err)
 	}
+	metricsWG.Wait()
 }
 
 // parseSeedNodes parses a comma-separated list of seed node addresses,

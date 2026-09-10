@@ -47,6 +47,12 @@ type dbBackedResponder struct {
 	// logf is normally log.Printf; overridable in tests so failures are visible via t.Logf
 	// instead of stdout.
 	logf func(format string, args ...interface{})
+
+	// metrics holds this process' own dedicated *responderMetrics (see metrics.go) --
+	// threaded in explicitly rather than referenced as a package-level var, since metric
+	// names are network-scoped and only built once -network is parsed (see main.go's run()
+	// and newResponderMetrics).
+	metrics *responderMetrics
 }
 
 // onPeerIdentity implements ResponderConfig.OnPeerIdentity: on every successful Noise_XX
@@ -85,11 +91,11 @@ func (r *dbBackedResponder) onPeerIdentity(remoteAddr net.Addr, peerStaticKey []
 
 	node, err := r.store.UpsertConfirmedNode(ctx, remote, peerStaticKey, storage.DiscoverySourceP2P)
 	if err != nil {
-		netmapP2PResponderDBWriteResult.WithLabelValues(dbOperationUpsertNode, resultLabel(false)).Inc()
+		r.metrics.dbWriteResult.WithLabelValues(dbOperationUpsertNode, resultLabel(false)).Inc()
 		r.logf("netmap-p2p-responder: UpsertConfirmedNode(%s) failed: %v", remote, err)
 		return
 	}
-	netmapP2PResponderDBWriteResult.WithLabelValues(dbOperationUpsertNode, resultLabel(true)).Inc()
+	r.metrics.dbWriteResult.WithLabelValues(dbOperationUpsertNode, resultLabel(true)).Inc()
 
 	for _, raw := range identity.Addresses {
 		claimed, ok := collector.ParsePeerAddress(raw)
@@ -100,11 +106,11 @@ func (r *dbBackedResponder) onPeerIdentity(remoteAddr net.Addr, peerStaticKey []
 			continue
 		}
 		if _, err := r.store.UpsertConfirmedNode(ctx, claimed, peerStaticKey, storage.DiscoverySourceP2P); err != nil {
-			netmapP2PResponderDBWriteResult.WithLabelValues(dbOperationUpsertNode, resultLabel(false)).Inc()
+			r.metrics.dbWriteResult.WithLabelValues(dbOperationUpsertNode, resultLabel(false)).Inc()
 			r.logf("netmap-p2p-responder: UpsertConfirmedNode(%s, self-claimed address) failed: %v", claimed, err)
 			continue
 		}
-		netmapP2PResponderDBWriteResult.WithLabelValues(dbOperationUpsertNode, resultLabel(true)).Inc()
+		r.metrics.dbWriteResult.WithLabelValues(dbOperationUpsertNode, resultLabel(true)).Inc()
 	}
 
 	var version *string
@@ -129,11 +135,11 @@ func (r *dbBackedResponder) onPeerIdentity(remoteAddr net.Addr, peerStaticKey []
 		Version:               version,
 		PeerIdentityUpdatedAt: peerIdentityUpdatedAt,
 	}); err != nil {
-		netmapP2PResponderDBWriteResult.WithLabelValues(dbOperationRecordHealth, resultLabel(false)).Inc()
+		r.metrics.dbWriteResult.WithLabelValues(dbOperationRecordHealth, resultLabel(false)).Inc()
 		r.logf("netmap-p2p-responder: RecordHealthCheck(%s) failed: %v", node.ID, err)
 		return
 	}
-	netmapP2PResponderDBWriteResult.WithLabelValues(dbOperationRecordHealth, resultLabel(true)).Inc()
+	r.metrics.dbWriteResult.WithLabelValues(dbOperationRecordHealth, resultLabel(true)).Inc()
 }
 
 // peerListProvider implements ResponderConfig.PeerListProvider: it serves REAL confirmed-good

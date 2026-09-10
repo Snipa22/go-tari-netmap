@@ -98,6 +98,19 @@ func newTestStore(t *testing.T) storage.Store {
 	return store
 }
 
+// mustTestResponderMetrics builds a fresh *responderMetrics on its own dedicated registry (see
+// newResponderMetrics/responderMetrics' doc comments in metrics.go) for tests in this package
+// that need a non-nil dbBackedResponder.metrics but don't care about network-scoping
+// specifically (that's metrics_test.go's job) -- always "mainnet", arbitrarily.
+func mustTestResponderMetrics(t *testing.T) *responderMetrics {
+	t.Helper()
+	m, err := newResponderMetrics("mainnet")
+	if err != nil {
+		t.Fatalf("newResponderMetrics: %v", err)
+	}
+	return m
+}
+
 // testAddr wraps a plain string as a net.Addr, so onPeerIdentity (which takes net.Addr, exactly
 // as go-tari-lib/p2p.Serve calls it with conn.RemoteAddr()) can be exercised directly in tests
 // without a real net.Conn.
@@ -118,7 +131,7 @@ func TestOnPeerIdentityRecordsConfirmedNodeAndHealthCheck(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	r := &dbBackedResponder{store: store, logf: t.Logf}
+	r := &dbBackedResponder{store: store, logf: t.Logf, metrics: mustTestResponderMetrics(t)}
 
 	peerStaticKey := []byte{0xAA, 0xBB, 0xCC, 0xDD}
 	remote := testAddr("203.0.113.50:41000")
@@ -212,7 +225,7 @@ func TestOnPeerIdentityNoIdentitySignatureLeavesPeerIdentityUpdatedAtNil(t *test
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	r := &dbBackedResponder{store: store, logf: t.Logf}
+	r := &dbBackedResponder{store: store, logf: t.Logf, metrics: mustTestResponderMetrics(t)}
 
 	peerStaticKey := []byte{0x01, 0x02, 0x03, 0x04}
 	remote := testAddr("203.0.113.60:41000")
@@ -313,7 +326,7 @@ func TestPeerListProviderFiltersConfirmedRecentlyReachable(t *testing.T) {
 		t.Fatalf("insert dualAddr ipv6 address: %v", err)
 	}
 
-	r := &dbBackedResponder{store: store, logf: t.Logf}
+	r := &dbBackedResponder{store: store, logf: t.Logf, metrics: mustTestResponderMetrics(t)}
 
 	peers, err := r.peerListProvider(ctx)
 	if err != nil {
@@ -366,7 +379,7 @@ func TestPeerListProviderEmptyWhenNothingQualifies(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	r := &dbBackedResponder{store: store, logf: t.Logf}
+	r := &dbBackedResponder{store: store, logf: t.Logf, metrics: mustTestResponderMetrics(t)}
 
 	peers, err := r.peerListProvider(ctx)
 	if err != nil {
@@ -406,7 +419,7 @@ func TestEncodeStoredAddress(t *testing.T) {
 func TestOnPeerIdentityConcurrentSafety(t *testing.T) {
 	store := newTestStore(t)
 
-	r := &dbBackedResponder{store: store, logf: t.Logf}
+	r := &dbBackedResponder{store: store, logf: t.Logf, metrics: mustTestResponderMetrics(t)}
 
 	var wg sync.WaitGroup
 	for i := 0; i < 10; i++ {

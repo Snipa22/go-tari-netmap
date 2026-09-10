@@ -2091,3 +2091,71 @@ func TestDiscoverWithRespectsContextDeadline(t *testing.T) {
 		t.Fatalf("len(nodes) = %d, want < %d (the full graph) -- the context deadline should have cut the walk short before it could fully drain", len(nodes), total)
 	}
 }
+
+// TestQueueSizesPartitionsNodePopulation exercises QueueSizes (see cmd/netmap's Prometheus
+// metrics wiring) against a seeded mix of confirmed, unconfirmed-with-history, and
+// never-contacted nodes: it must report each of the three counts correctly, and the three
+// counts together must equal the total node population (a true partition, no
+// double-counting/gap), mirroring TestPollNeverContactedOnlyTouchesNeverContactedNodes/
+// TestListNodesHasHealthChecksFilter's proof that these three filters are disjoint.
+func TestQueueSizesPartitionsNodePopulation(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	// Two confirmed nodes.
+	if _, err := store.UpsertConfirmedNode(ctx, "confirmed:1", []byte{0x01}, storage.DiscoverySourceP2P); err != nil {
+		t.Fatalf("seed confirmed node 1: %v", err)
+	}
+	if _, err := store.UpsertConfirmedNode(ctx, "confirmed:2", []byte{0x02}, storage.DiscoverySourceP2P); err != nil {
+		t.Fatalf("seed confirmed node 2: %v", err)
+	}
+
+	// One unconfirmed node WITH history (belongs to PollUnconfirmed's queue).
+	withHistory, err := store.UpsertDiscoveredNode(ctx, "with-history:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("seed with-history node: %v", err)
+	}
+	recordHistory(t, ctx, store, withHistory.ID, false)
+
+	// Three unconfirmed nodes with ZERO history (belong to PollNeverContacted's queue).
+	for i := 0; i < 3; i++ {
+		if _, err := store.UpsertDiscoveredNode(ctx, fmt.Sprintf("never-contacted:%d", i), storage.DiscoverySourceP2P, nil, nil); err != nil {
+			t.Fatalf("seed never-contacted node %d: %v", i, err)
+		}
+	}
+
+	c := New(Config{})
+	c.Storage = store
+
+	confirmed, unconfirmed, neverContacted, err := c.QueueSizes(ctx)
+	if err != nil {
+		t.Fatalf("QueueSizes: %v", err)
+	}
+
+	if confirmed != 2 {
+		t.Errorf("confirmed = %d, want 2", confirmed)
+	}
+	if unconfirmed != 1 {
+		t.Errorf("unconfirmed = %d, want 1", unconfirmed)
+	}
+	if neverContacted != 3 {
+		t.Errorf("neverContacted = %d, want 3", neverContacted)
+	}
+
+	allNodes, err := store.ListNodes(ctx, storage.NodeFilter{})
+	if err != nil {
+		t.Fatalf("list all nodes: %v", err)
+	}
+	if total := confirmed + unconfirmed + neverContacted; total != len(allNodes) {
+		t.Errorf("confirmed+unconfirmed+neverContacted = %d, want %d (total node count) -- these three queues must be a true partition of the whole population", total, len(allNodes))
+	}
+}
+
+// TestQueueSizesRequiresStorage exercises QueueSizes' fail-fast guard when Storage is unset,
+// mirroring Discover/poll's own "collector: Storage is not configured" error.
+func TestQueueSizesRequiresStorage(t *testing.T) {
+	c := New(Config{})
+	if _, _, _, err := c.QueueSizes(context.Background()); err == nil {
+		t.Error("QueueSizes with no Storage configured = nil error, want an error")
+	}
+}

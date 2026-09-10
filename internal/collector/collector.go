@@ -368,6 +368,23 @@ type Collector struct {
 	// need to wait 30 minutes for anything.
 	OwnedDiscoveryTickInterval time.Duration
 
+	// OnPollResult is an OPTIONAL observer invoked once per individual probe attempt made by
+	// this Collector's own scheduled poll loops (PollConfirmed/PollUnconfirmed/
+	// PollNeverContacted, via poll()) -- see PollResultFunc's doc comment for exactly what
+	// "success" means. Nil (the zero value, and the default for every existing caller/test)
+	// means no observer at all -- poll() behaves identically either way, this is purely an
+	// observability hook. Wired from cmd/netmap/main.go to a Prometheus counter (see
+	// cmd/netmap/metrics.go); this package itself takes no direct Prometheus dependency.
+	// Deliberately NOT invoked for ad-hoc PollOnce calls made outside this Collector's own
+	// loops (e.g. internal/api's admin poll-now/submission-approval call sites) -- those
+	// call PollOnce directly, not through this Collector, and have no access to this field.
+	// Also deliberately NOT invoked from DiscoverOwned/discoverOwnedWith/walkNodePeers --
+	// those paths call client.GetPeers (a peer-list walk), never PollOnce/GetInfo, so there
+	// is no "poll result" to observe there; OnPollResult's PollResultFunc signature reports a
+	// probeSource/success pair that is specifically PollOnce's GetInfo-probe semantics (see
+	// pollOnceWithSource), not discovery's.
+	OnPollResult PollResultFunc
+
 	mu            sync.Mutex
 	nextPoll      map[string]time.Time // address -> next poll due time
 	nextDiscovery map[string]time.Time // discoveryCooldownKey(transport, address) -> next discovery-walk due time
@@ -1010,6 +1027,42 @@ func (c *Collector) PollNeverContacted(ctx context.Context) error {
 	return c.poll(ctx, storage.NodeFilter{Confirmed: &confirmed, HasHealthChecks: &hasHistory})
 }
 
+// QueueSizes returns the current size of each of the three disjoint poll queues
+// PollConfirmed/PollUnconfirmed/PollNeverContacted operate over (see their doc comments), for
+// gauge-style observability (see cmd/netmap's Prometheus metrics wiring, which exposes these as
+// netmap_<network>_collector_queue_backlog{queue="confirmed"|"unconfirmed"|"never_contacted"}).
+// This performs three ListNodes calls, one per filter -- exactly mirroring what
+// PollConfirmed/PollUnconfirmed/PollNeverContacted already query, with no new SQL query logic
+// of its own. The three results are a true partition of the whole node population: every node
+// belongs to exactly one of the three (see PollNeverContacted's doc comment), so
+// confirmed+unconfirmed+neverContacted always equals the total node count.
+func (c *Collector) QueueSizes(ctx context.Context) (confirmed, unconfirmed, neverContacted int, err error) {
+	if c.Storage == nil {
+		return 0, 0, 0, errors.New("collector: Storage is not configured")
+	}
+
+	isConfirmed := true
+	confirmedNodes, err := c.Storage.ListNodes(ctx, storage.NodeFilter{Confirmed: &isConfirmed})
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("collector: list confirmed nodes: %w", err)
+	}
+
+	isUnconfirmed := false
+	hasHistory := true
+	unconfirmedNodes, err := c.Storage.ListNodes(ctx, storage.NodeFilter{Confirmed: &isUnconfirmed, HasHealthChecks: &hasHistory})
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("collector: list unconfirmed nodes: %w", err)
+	}
+
+	noHistory := false
+	neverContactedNodes, err := c.Storage.ListNodes(ctx, storage.NodeFilter{Confirmed: &isUnconfirmed, HasHealthChecks: &noHistory})
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("collector: list never-contacted nodes: %w", err)
+	}
+
+	return len(confirmedNodes), len(unconfirmedNodes), len(neverContactedNodes), nil
+}
+
 // poll checks all nodes matching filter and, for those whose next-poll
 // time is due, calls PollOnce. Shared by PollConfirmed, PollUnconfirmed,
 // and PollNeverContacted — all three call the same due/setNextPoll/
@@ -1062,7 +1115,7 @@ func (c *Collector) poll(ctx context.Context, filter storage.NodeFilter) error {
 			if jitter := c.dialJitter(); jitter > 0 {
 				time.Sleep(jitter)
 			}
-			if err := PollOnce(ctx, c.GRPCClient, c.P2PClient, c.Storage, n); err != nil {
+			if err := PollOnce(ctx, c.GRPCClient, c.P2PClient, c.Storage, n, c.OnPollResult); err != nil {
 				log.Printf("collector: poll %s: %v", n.Address, err)
 			}
 			return nil
@@ -1071,6 +1124,15 @@ func (c *Collector) poll(ctx context.Context, filter storage.NodeFilter) error {
 	_ = g.Wait()
 	return nil
 }
+
+// PollResultFunc is an optional observer of each individual probe attempt PollOnce makes,
+// invoked once per configured transport (grpc/p2p) with probeSource and whether that probe
+// transport itself succeeded (client.GetInfo returned no error -- i.e. the node responded at
+// all over that transport, independent of any subsequent storage.Store recording error). This
+// lets a caller (see Collector.OnPollResult, wired from cmd/netmap/main.go's Prometheus metrics)
+// count poll outcomes per probe source without this package taking a direct Prometheus
+// dependency of its own -- collector stays free of any specific metrics backend.
+type PollResultFunc func(probeSource storage.ProbeSource, success bool)
 
 // PollOnce performs a single synchronous health check of node via
 // grpcClient and p2pClient — whichever of the two are non-nil — and
@@ -1086,16 +1148,36 @@ func (c *Collector) poll(ctx context.Context, filter storage.NodeFilter) error {
 // error is expected/normal for an unreachable node and is itself recorded
 // as a Reachable: false row, not surfaced as an error here); it exists
 // purely so call sites can log a combined failure, not for control flow.
-func PollOnce(ctx context.Context, grpcClient, p2pClient NodeClient, store storage.Store, node storage.Node) error {
+//
+// onResult is an OPTIONAL trailing PollResultFunc (variadic purely so existing callers, e.g.
+// internal/api's admin poll-now/submission-approval call sites, keep compiling unchanged with
+// no observer at all): if provided (onResult[0] != nil), it is invoked once per attempted
+// transport with that transport's probeSource and success (client.GetInfo err == nil). Only
+// the first element is ever consulted; passing more than one is meaningless and never done by
+// this package's own call sites.
+func PollOnce(ctx context.Context, grpcClient, p2pClient NodeClient, store storage.Store, node storage.Node, onResult ...PollResultFunc) error {
+	var observe PollResultFunc
+	if len(onResult) > 0 {
+		observe = onResult[0]
+	}
+
 	var errs []error
 
 	if grpcClient != nil {
-		if err := pollOnceWithSource(ctx, grpcClient, store, node, storage.ProbeSourceGRPC); err != nil {
+		success, err := pollOnceWithSource(ctx, grpcClient, store, node, storage.ProbeSourceGRPC)
+		if observe != nil {
+			observe(storage.ProbeSourceGRPC, success)
+		}
+		if err != nil {
 			errs = append(errs, fmt.Errorf("grpc probe %s: %w", node.Address, err))
 		}
 	}
 	if p2pClient != nil {
-		if err := pollOnceWithSource(ctx, p2pClient, store, node, storage.ProbeSourceP2P); err != nil {
+		success, err := pollOnceWithSource(ctx, p2pClient, store, node, storage.ProbeSourceP2P)
+		if observe != nil {
+			observe(storage.ProbeSourceP2P, success)
+		}
+		if err != nil {
 			errs = append(errs, fmt.Errorf("p2p probe %s: %w", node.Address, err))
 		}
 	}
@@ -1121,10 +1203,18 @@ func PollOnce(ctx context.Context, grpcClient, p2pClient NodeClient, store stora
 // recorded against the surviving node, not the now-deleted placeholder.
 // If info.PublicKey is nil/empty (GetInfo succeeded but didn't yield a
 // pubkey), the health check falls back to node.ID as before.
-func pollOnceWithSource(ctx context.Context, client NodeClient, store storage.Store, node storage.Node, probeSource storage.ProbeSource) error {
+//
+// The returned bool is whether client.GetInfo itself succeeded (the probe transport got a
+// response at all) — this is PollOnce's PollResultFunc "success" signal, deliberately distinct
+// from any subsequent RecordHealthCheck/UpsertConfirmedNode storage error (returned separately,
+// as error) and from info.Reachable (which, per both grpc_client.go's and p2p_client.go's own
+// GetInfo implementations, is always true whenever GetInfo itself returns a nil error — there
+// is no real-world case where GetInfo succeeds with Reachable: false today, but this return
+// value tracks the GetInfo err itself rather than assuming that equivalence holds forever).
+func pollOnceWithSource(ctx context.Context, client NodeClient, store storage.Store, node storage.Node, probeSource storage.ProbeSource) (bool, error) {
 	info, err := client.GetInfo(ctx, node.Address)
 	if err != nil {
-		return store.RecordHealthCheck(ctx, storage.HealthCheckInput{
+		return false, store.RecordHealthCheck(ctx, storage.HealthCheckInput{
 			NodeID:      node.ID,
 			Reachable:   false,
 			ProbeSource: probeSource,
@@ -1141,7 +1231,7 @@ func pollOnceWithSource(ctx context.Context, client NodeClient, store storage.St
 		}
 	}
 
-	return store.RecordHealthCheck(ctx, storage.HealthCheckInput{
+	return true, store.RecordHealthCheck(ctx, storage.HealthCheckInput{
 		NodeID:                nodeID,
 		Reachable:             info.Reachable,
 		ProbeSource:           probeSource,

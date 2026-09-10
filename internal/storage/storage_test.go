@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -549,6 +550,75 @@ func TestCountNodes(t *testing.T) {
 	}
 	if p2pCount != 2 {
 		t.Fatalf("p2pCount = %d, want 2", p2pCount)
+	}
+}
+
+// TestCountNodesRespectsConfirmedAndHasHealthChecks covers a real prior bug: CountNodes used
+// to build its WHERE clause independently of ListNodes and only ever applied
+// filter.DiscoverySource, silently ignoring filter.Confirmed/filter.HasHealthChecks entirely
+// (always returning the WHOLE population's count regardless of those two fields) -- this is
+// exactly the filter combination cmd/netmap's Prometheus poll-queue-backlog gauges rely on
+// (see cmd/netmap/metrics.go's refresh, which mirrors collector.PollConfirmed/PollUnconfirmed/
+// PollNeverContacted's own NodeFilter construction). Both ListNodes and CountNodes now share
+// nodeFilterClauses, so this asserts they agree: len(ListNodes(filter)) == CountNodes(filter)
+// for each of the three disjoint poll-queue filters.
+func TestCountNodesRespectsConfirmedAndHasHealthChecks(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	if _, err := store.UpsertConfirmedNode(ctx, "confirmed:1", []byte{0x01}, DiscoverySourceP2P); err != nil {
+		t.Fatalf("seed confirmed node 1: %v", err)
+	}
+	if _, err := store.UpsertConfirmedNode(ctx, "confirmed:2", []byte{0x02}, DiscoverySourceP2P); err != nil {
+		t.Fatalf("seed confirmed node 2: %v", err)
+	}
+
+	withHistory, err := store.UpsertDiscoveredNode(ctx, "with-history:1", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("seed with-history node: %v", err)
+	}
+	if err := store.RecordHealthCheck(ctx, HealthCheckInput{NodeID: withHistory.ID, Reachable: false, ProbeSource: ProbeSourceGRPC}); err != nil {
+		t.Fatalf("record health check: %v", err)
+	}
+
+	for i := 0; i < 3; i++ {
+		if _, err := store.UpsertDiscoveredNode(ctx, fmt.Sprintf("never-contacted:%d", i), DiscoverySourceP2P, nil, nil); err != nil {
+			t.Fatalf("seed never-contacted node %d: %v", i, err)
+		}
+	}
+
+	confirmed := true
+	unconfirmed := false
+	hasHistory := true
+	noHistory := false
+
+	cases := []struct {
+		name   string
+		filter NodeFilter
+		want   int
+	}{
+		{"confirmed", NodeFilter{Confirmed: &confirmed}, 2},
+		{"unconfirmed_with_history", NodeFilter{Confirmed: &unconfirmed, HasHealthChecks: &hasHistory}, 1},
+		{"never_contacted", NodeFilter{Confirmed: &unconfirmed, HasHealthChecks: &noHistory}, 3},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			count, err := store.CountNodes(ctx, tc.filter)
+			if err != nil {
+				t.Fatalf("CountNodes: %v", err)
+			}
+			if count != tc.want {
+				t.Errorf("CountNodes(%s) = %d, want %d", tc.name, count, tc.want)
+			}
+
+			nodes, err := store.ListNodes(ctx, tc.filter)
+			if err != nil {
+				t.Fatalf("ListNodes: %v", err)
+			}
+			if len(nodes) != count {
+				t.Errorf("ListNodes(%s) returned %d nodes, but CountNodes reported %d -- these must always agree", tc.name, len(nodes), count)
+			}
+		})
 	}
 }
 
