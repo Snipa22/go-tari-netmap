@@ -198,6 +198,11 @@ func TestOnSubstreamProtocolDeclinedIncrementsMetric(t *testing.T) {
 // TestOnPeerIdentityIncrementsDBWriteMetrics exercises the DB-write result counters wired
 // directly at dbBackedResponder's storage.Store call sites (responder.go), against the real
 // test database (same pattern as responder_test.go's newTestStore).
+//
+// The identity fixture claims a valid public address (rather than a zero-claims fixture) since
+// OPENCODE_BRIEF.md's "stop recording blank-address nodes" fix makes onPeerIdentity skip both
+// UpsertConfirmedNode and RecordHealthCheck entirely when there are no usable claimed
+// addresses -- this test needs those DB calls to actually happen to exercise their metrics.
 func TestOnPeerIdentityIncrementsDBWriteMetrics(t *testing.T) {
 	store := newTestStore(t)
 	metrics := mustTestResponderMetrics(t)
@@ -206,8 +211,13 @@ func TestOnPeerIdentityIncrementsDBWriteMetrics(t *testing.T) {
 	beforeUpsertSuccess := testutil.ToFloat64(metrics.dbWriteResult.WithLabelValues(dbOperationUpsertNode, "success"))
 	beforeHealthSuccess := testutil.ToFloat64(metrics.dbWriteResult.WithLabelValues(dbOperationRecordHealth, "success"))
 
+	claimedAddr, err := p2p.EncodeMultiaddrString("/ip4/198.51.100.90/tcp/18189")
+	if err != nil {
+		t.Fatalf("EncodeMultiaddrString: %v", err)
+	}
 	r.onPeerIdentity(testAddr("203.0.113.80:41000"), []byte{0x90}, &p2p.PeerInfo{
 		RemoteStaticPubKey: []byte{0x90},
+		Addresses:          [][]byte{claimedAddr},
 		Features:           p2p.FeaturesCommunicationNode,
 	})
 
@@ -242,6 +252,11 @@ func (f *failingStore) UpsertConfirmedNodeByPubKey(ctx context.Context, publicKe
 // db_write_result_total{operation="upsert_node",result="failure"} and must NOT reach
 // RecordHealthCheck at all (onPeerIdentity returns early on the first UpsertConfirmedNode
 // failure, see responder.go).
+//
+// The identity fixture claims a valid public address (rather than a zero-claims fixture) so
+// onPeerIdentity actually reaches the UpsertConfirmedNode call this test means to fail --
+// OPENCODE_BRIEF.md's "stop recording blank-address nodes" fix returns early before ever
+// calling into the store when there are no usable claimed addresses.
 func TestOnPeerIdentityRecordsDBWriteFailureMetric(t *testing.T) {
 	store := newTestStore(t)
 	metrics := mustTestResponderMetrics(t)
@@ -250,8 +265,13 @@ func TestOnPeerIdentityRecordsDBWriteFailureMetric(t *testing.T) {
 	beforeUpsertFailure := testutil.ToFloat64(metrics.dbWriteResult.WithLabelValues(dbOperationUpsertNode, "failure"))
 	beforeHealthSuccess := testutil.ToFloat64(metrics.dbWriteResult.WithLabelValues(dbOperationRecordHealth, "success"))
 
+	claimedAddr, err := p2p.EncodeMultiaddrString("/ip4/198.51.100.91/tcp/18189")
+	if err != nil {
+		t.Fatalf("EncodeMultiaddrString: %v", err)
+	}
 	r.onPeerIdentity(testAddr("203.0.113.81:41000"), []byte{0x91}, &p2p.PeerInfo{
 		RemoteStaticPubKey: []byte{0x91},
+		Addresses:          [][]byte{claimedAddr},
 		Features:           p2p.FeaturesCommunicationNode,
 	})
 

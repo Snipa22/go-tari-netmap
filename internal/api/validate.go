@@ -47,11 +47,24 @@ func validateSubmittedHost(host string) error {
 	}
 
 	if ip := net.ParseIP(host); ip != nil {
-		if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() ||
-			ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+		if IsPrivateOrReservedIP(ip) {
 			return errors.New("private/reserved IP addresses are not allowed")
 		}
 	}
 
 	return nil
+}
+
+// IsPrivateOrReservedIP reports whether ip is a private/loopback/
+// link-local/multicast/unspecified address — the same SSRF-hardening
+// classification validateSubmittedHost above applies to publicly
+// submitted addresses (see its doc comment for the full rationale). It
+// is exported so other trust-boundary callers that dial addresses a
+// remote peer claims about itself (e.g.
+// cmd/netmap-p2p-responder/responder.go's onPeerIdentity, for
+// self-claimed P2P identity-exchange addresses) can apply the exact same
+// classification without duplicating it.
+func IsPrivateOrReservedIP(ip net.IP) bool {
+	return ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified()
 }
