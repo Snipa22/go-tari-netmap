@@ -120,13 +120,14 @@ func (a testAddr) Network() string { return "tcp" }
 func (a testAddr) String() string  { return string(a) }
 
 // TestOnPeerIdentityRecordsConfirmedNodeAndHealthCheck exercises the OnPeerIdentity ->
-// UpsertConfirmedNode + RecordHealthCheck wiring (BRIEF3.md's testing requirement #1): a
-// synthetic identity exchange result is fed directly to dbBackedResponder.onPeerIdentity (the
-// same method wired as ResponderConfig.OnPeerIdentity in main.go), and this test asserts a real
-// nodes row lands with the correct pubkey/discovery_source, a real node_addresses row lands for
-// BOTH the remote-dialed-from address and the peer's own self-claimed address, and a real
-// node_health row lands with reachable=true, probe_source=p2p, the right version, and the right
-// peer_identity_updated_at (converted from the claimed IdentitySignature.UpdatedAt).
+// UpsertConfirmedNode + RecordHealthCheck wiring (BRIEF3.md's testing requirement #1, updated by
+// BRIEF6.md's fix): a synthetic identity exchange result is fed directly to
+// dbBackedResponder.onPeerIdentity (the same method wired as ResponderConfig.OnPeerIdentity in
+// main.go), and this test asserts a real nodes row lands with the correct pubkey/
+// discovery_source, a real node_addresses row lands for the peer's own self-claimed address
+// ONLY (never the raw remote-dialed-from address/ephemeral source port -- see BRIEF6.md), and a
+// real node_health row lands with reachable=true, probe_source=p2p, the right version, and the
+// right peer_identity_updated_at (converted from the claimed IdentitySignature.UpdatedAt).
 func TestOnPeerIdentityRecordsConfirmedNodeAndHealthCheck(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -134,6 +135,8 @@ func TestOnPeerIdentityRecordsConfirmedNodeAndHealthCheck(t *testing.T) {
 	r := &dbBackedResponder{store: store, logf: t.Logf, metrics: mustTestResponderMetrics(t)}
 
 	peerStaticKey := []byte{0xAA, 0xBB, 0xCC, 0xDD}
+	// remote uses an OS-assigned ephemeral source port, exactly the shape of address this
+	// fix must never persist as a dialable node_addresses row.
 	remote := testAddr("203.0.113.50:41000")
 
 	claimedAddr, err := p2p.EncodeMultiaddrString("/ip4/198.51.100.7/tcp/18189")
@@ -170,8 +173,9 @@ func TestOnPeerIdentityRecordsConfirmedNodeAndHealthCheck(t *testing.T) {
 		t.Errorf("node.DiscoverySource = %q, want %q", node.DiscoverySource, storage.DiscoverySourceP2P)
 	}
 
-	// Both the remote-dialed-from address and the peer's own self-claimed address must be
-	// recorded against this node.
+	// Only the peer's own self-claimed address must be recorded against this node -- the
+	// raw remote-dialed-from address (ephemeral source port) must NEVER appear (BRIEF6.md's
+	// fix).
 	addrs, err := store.ListNodeAddresses(ctx, node.ID)
 	if err != nil {
 		t.Fatalf("list node addresses: %v", err)
@@ -180,14 +184,14 @@ func TestOnPeerIdentityRecordsConfirmedNodeAndHealthCheck(t *testing.T) {
 	for _, a := range addrs {
 		got[a.Address] = true
 	}
-	if !got["203.0.113.50:41000"] {
-		t.Errorf("node_addresses missing the remote-dialed-from address, got %v", got)
+	if got["203.0.113.50:41000"] {
+		t.Errorf("node_addresses must NOT contain the raw remote-dialed-from address, got %v", got)
 	}
 	if !got["198.51.100.7:18189"] {
 		t.Errorf("node_addresses missing the peer's self-claimed address, got %v", got)
 	}
-	if len(got) != 2 {
-		t.Errorf("len(node_addresses) = %d, want 2, got %v", len(got), got)
+	if len(got) != 1 {
+		t.Errorf("len(node_addresses) = %d, want 1, got %v", len(got), got)
 	}
 
 	// A single health check must have landed, reachable, p2p-sourced, with the right
@@ -214,6 +218,129 @@ func TestOnPeerIdentityRecordsConfirmedNodeAndHealthCheck(t *testing.T) {
 	}
 	if !hc.PeerIdentityUpdatedAt.Equal(time.Unix(updatedAtUnix, 0)) {
 		t.Errorf("health check PeerIdentityUpdatedAt = %v, want %v", *hc.PeerIdentityUpdatedAt, time.Unix(updatedAtUnix, 0))
+	}
+}
+
+// TestOnPeerIdentityZeroClaimedAddressesRecordsNoAddress is BRIEF6.md's core regression test:
+// a peer that completes a full identity exchange but claims ZERO addresses of its own (e.g. a
+// bare probe/monitoring client) must still get a node row (via UpsertConfirmedNodeByPubKey) and
+// a health check row, but must NEVER get a node_addresses row for the raw TCP connection's
+// remote address (the client's OS-assigned ephemeral source port) -- that address is not a real
+// claim, and must not be persisted as if it were one.
+func TestOnPeerIdentityZeroClaimedAddressesRecordsNoAddress(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	r := &dbBackedResponder{store: store, logf: t.Logf, metrics: mustTestResponderMetrics(t)}
+
+	peerStaticKey := []byte{0xEE, 0xFF, 0x11, 0x22}
+	// remote uses an OS-assigned ephemeral source port -- exactly the shape of the garbage
+	// this bug used to write into node_addresses.
+	remote := testAddr("104.161.20.146:49456")
+
+	identity := &p2p.PeerInfo{
+		RemoteStaticPubKey: peerStaticKey,
+		Features:           p2p.FeaturesCommunicationNode,
+		// Addresses deliberately left nil/empty -- this peer claims nothing.
+	}
+
+	r.onPeerIdentity(remote, peerStaticKey, identity)
+
+	// The node row must still exist, confirmed, with the exact pubkey.
+	nodes, err := store.ListNodes(ctx, storage.NodeFilter{})
+	if err != nil {
+		t.Fatalf("list nodes: %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("len(nodes) = %d, want 1", len(nodes))
+	}
+	node := nodes[0]
+	if string(node.PublicKey) != string(peerStaticKey) {
+		t.Errorf("node.PublicKey = %x, want %x", node.PublicKey, peerStaticKey)
+	}
+
+	// NO node_addresses row must exist for this node -- specifically not one for the raw
+	// remote address, and not any other address either (the peer claimed none).
+	addrs, err := store.ListNodeAddresses(ctx, node.ID)
+	if err != nil {
+		t.Fatalf("list node addresses: %v", err)
+	}
+	if len(addrs) != 0 {
+		t.Errorf("len(node_addresses) = %d, want 0, got %+v", len(addrs), addrs)
+	}
+
+	// The health check must still have landed -- RecordHealthCheck links on node.ID, not on
+	// any address, so it's unaffected by there being no known address for this node.
+	checks, err := store.GetNodeHistory(ctx, node.ID, 10)
+	if err != nil {
+		t.Fatalf("get node history: %v", err)
+	}
+	if len(checks) != 1 {
+		t.Fatalf("len(checks) = %d, want 1", len(checks))
+	}
+	if !checks[0].Reachable {
+		t.Errorf("health check Reachable = false, want true")
+	}
+}
+
+// TestOnPeerIdentityWithClaimedAddressesUnaffectedByZeroAddressPath exercises the other half of
+// BRIEF6.md's requirement: a peer WITH claimed addresses must still get exactly those addresses
+// recorded (the legitimate identity.Addresses loop is unchanged by this fix), never the raw
+// remote address, and multiple claimed addresses must all land.
+func TestOnPeerIdentityWithClaimedAddressesUnaffectedByZeroAddressPath(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	r := &dbBackedResponder{store: store, logf: t.Logf, metrics: mustTestResponderMetrics(t)}
+
+	peerStaticKey := []byte{0x33, 0x44, 0x55, 0x66}
+	remote := testAddr("198.51.100.99:52413")
+
+	claimedIPv4, err := p2p.EncodeMultiaddrString("/ip4/198.51.100.7/tcp/18189")
+	if err != nil {
+		t.Fatalf("EncodeMultiaddrString ip4: %v", err)
+	}
+	claimedIPv4Second, err := p2p.EncodeMultiaddrString("/ip4/198.51.100.8/tcp/18189")
+	if err != nil {
+		t.Fatalf("EncodeMultiaddrString ip4 (second): %v", err)
+	}
+
+	identity := &p2p.PeerInfo{
+		RemoteStaticPubKey: peerStaticKey,
+		Addresses:          [][]byte{claimedIPv4, claimedIPv4Second},
+		Features:           p2p.FeaturesCommunicationNode,
+	}
+
+	r.onPeerIdentity(remote, peerStaticKey, identity)
+
+	nodes, err := store.ListNodes(ctx, storage.NodeFilter{})
+	if err != nil {
+		t.Fatalf("list nodes: %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("len(nodes) = %d, want 1", len(nodes))
+	}
+	node := nodes[0]
+
+	addrs, err := store.ListNodeAddresses(ctx, node.ID)
+	if err != nil {
+		t.Fatalf("list node addresses: %v", err)
+	}
+	got := map[string]bool{}
+	for _, a := range addrs {
+		got[a.Address] = true
+	}
+	if got["198.51.100.99:52413"] {
+		t.Errorf("node_addresses must NOT contain the raw remote-dialed-from address, got %v", got)
+	}
+	if !got["198.51.100.7:18189"] {
+		t.Errorf("node_addresses missing first claimed address, got %v", got)
+	}
+	if !got["198.51.100.8:18189"] {
+		t.Errorf("node_addresses missing second claimed address, got %v", got)
+	}
+	if len(got) != 2 {
+		t.Errorf("len(node_addresses) = %d, want 2, got %v", len(got), got)
 	}
 }
 

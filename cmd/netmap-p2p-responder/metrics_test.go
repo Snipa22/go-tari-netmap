@@ -220,14 +220,21 @@ func TestOnPeerIdentityIncrementsDBWriteMetrics(t *testing.T) {
 }
 
 // failingStore wraps a real storage.Store, delegating every method to it except
-// UpsertConfirmedNode, which always fails -- used to exercise onPeerIdentity's
-// failure-path metric recording without needing to actually break the test database.
+// UpsertConfirmedNode/UpsertConfirmedNodeByPubKey, which always fail -- used to exercise
+// onPeerIdentity's failure-path metric recording without needing to actually break the test
+// database. Both are overridden since onPeerIdentity's own address-vs-no-address branch (see
+// responder.go, BRIEF6.md) picks one or the other depending on whether the test's identity
+// claims any addresses.
 type failingStore struct {
 	storage.Store
 }
 
 func (f *failingStore) UpsertConfirmedNode(ctx context.Context, address string, publicKey []byte, discoverySource storage.DiscoverySource) (storage.Node, error) {
 	return storage.Node{}, errors.New("simulated UpsertConfirmedNode failure")
+}
+
+func (f *failingStore) UpsertConfirmedNodeByPubKey(ctx context.Context, publicKey []byte, discoverySource storage.DiscoverySource) (storage.Node, error) {
+	return storage.Node{}, errors.New("simulated UpsertConfirmedNodeByPubKey failure")
 }
 
 // TestOnPeerIdentityRecordsDBWriteFailureMetric exercises the failure-path branch of the

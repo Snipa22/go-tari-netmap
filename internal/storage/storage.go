@@ -72,6 +72,31 @@ type Store interface {
 	// placeholder id(s) being retired.
 	UpsertConfirmedNode(ctx context.Context, address string, publicKey []byte, discoverySource DiscoverySource) (Node, error)
 
+	// UpsertConfirmedNodeByPubKey is UpsertConfirmedNode's address-less
+	// sibling: it records/ensures a node row for a confirmed pubkey
+	// WITHOUT any address at all — no node_addresses row is touched,
+	// and nodes.address is left as/created as "" (empty string) rather
+	// than a fabricated placeholder value. This exists for exactly one
+	// case: a directly-confirmed pubkey (e.g. a real handshake) whose
+	// peer claims zero advertised addresses of its own — there is
+	// nothing genuinely dialable to record, but the node/pubkey
+	// identity itself, and any health check against it, is still real
+	// and worth persisting (see cmd/netmap-p2p-responder/responder.go's
+	// onPeerIdentity). Every other caller with a real address to record
+	// must use UpsertConfirmedNode instead — this method must never be
+	// used to dodge recording a genuinely-known address.
+	//
+	// Two cases, both simpler than UpsertConfirmedNode's four (no
+	// address lookup is ever performed):
+	//   - pubkey not yet known: insert a brand-new node row with
+	//     address = "" and no node_addresses row.
+	//   - pubkey already known: leave the existing row (and its
+	//     address/node_addresses, whatever they are) untouched aside
+	//     from bumping last_seen and merging discoverySource, mirroring
+	//     UpsertConfirmedNode case (b)'s bump semantics minus the
+	//     address-touching part.
+	UpsertConfirmedNodeByPubKey(ctx context.Context, publicKey []byte, discoverySource DiscoverySource) (Node, error)
+
 	// ListNodeAddresses returns every address a node has ever been seen
 	// at, oldest first.
 	ListNodeAddresses(ctx context.Context, nodeID uuid.UUID) ([]NodeAddress, error)
@@ -667,6 +692,60 @@ func (s *pgStore) UpsertConfirmedNode(ctx context.Context, address string, publi
 			return Node{}, err
 		}
 		nodeID = newID
+	}
+
+	n, err := getNodeByID(ctx, tx, nodeID)
+	if err != nil {
+		return Node{}, fmt.Errorf("storage: get upserted node: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return Node{}, fmt.Errorf("storage: commit: %w", err)
+	}
+	return n, nil
+}
+
+// UpsertConfirmedNodeByPubKey is UpsertConfirmedNode's address-less
+// sibling — see its doc comment on the Store interface for the full
+// rationale. It never looks up or touches node_addresses/nodes.address
+// for an existing row, and creates address = "" (never NULL — nodes.address
+// remains NOT NULL, see 0001_init.sql/0006_pubkey_identity.sql) for a
+// brand-new row.
+func (s *pgStore) UpsertConfirmedNodeByPubKey(ctx context.Context, publicKey []byte, discoverySource DiscoverySource) (Node, error) {
+	if len(publicKey) == 0 {
+		return Node{}, fmt.Errorf("storage: public_key is required")
+	}
+	if discoverySource == "" {
+		return Node{}, fmt.Errorf("storage: discovery_source is required")
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Node{}, fmt.Errorf("storage: begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
+
+	var nodeID uuid.UUID
+	found := true
+	if err := tx.QueryRow(ctx, `SELECT id FROM nodes WHERE public_key = $1`, publicKey).Scan(&nodeID); err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return Node{}, fmt.Errorf("storage: lookup node by pubkey: %w", err)
+		}
+		found = false
+	}
+
+	if found {
+		if err := bumpNodeSeen(ctx, tx, nodeID, discoverySource); err != nil {
+			return Node{}, err
+		}
+	} else {
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO nodes (address, public_key, discovery_source, tags, label, first_seen, last_seen)
+			VALUES ('', $1, $2, '{}'::jsonb, NULL, now(), now())
+			RETURNING id
+		`, publicKey, string(discoverySource)).Scan(&nodeID); err != nil {
+			return Node{}, fmt.Errorf("storage: insert confirmed node (no address): %w", err)
+		}
 	}
 
 	n, err := getNodeByID(ctx, tx, nodeID)

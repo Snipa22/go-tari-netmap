@@ -2081,3 +2081,85 @@ func TestUpsertConfirmedNodeMergesPlaceholderIntoConfirmedNode(t *testing.T) {
 		t.Fatalf("peer_edge_observations from=a.ID to=other.ID count = %d, want 2 (A's original edge + B's repointed edge)", fromCount)
 	}
 }
+
+// TestUpsertConfirmedNodeByPubKeyCreatesNodeWithNoAddress is
+// UpsertConfirmedNodeByPubKey's brand-new-pubkey case (BRIEF6.md): it must
+// create a confirmed node row with the given pubkey, address = "" (never a
+// fabricated address), and crucially NO node_addresses row at all.
+func TestUpsertConfirmedNodeByPubKeyCreatesNodeWithNoAddress(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	pubkey := []byte("no-address-pubkey-1")
+	n, err := store.UpsertConfirmedNodeByPubKey(ctx, pubkey, DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("upsert confirmed by pubkey: %v", err)
+	}
+
+	if !bytes.Equal(n.PublicKey, pubkey) {
+		t.Errorf("n.PublicKey = %x, want %x", n.PublicKey, pubkey)
+	}
+	if n.Address != "" {
+		t.Errorf("n.Address = %q, want \"\" (no fabricated address)", n.Address)
+	}
+	if n.DiscoverySource != DiscoverySourceP2P {
+		t.Errorf("n.DiscoverySource = %q, want %q", n.DiscoverySource, DiscoverySourceP2P)
+	}
+
+	addrs, err := store.ListNodeAddresses(ctx, n.ID)
+	if err != nil {
+		t.Fatalf("list node addresses: %v", err)
+	}
+	if len(addrs) != 0 {
+		t.Errorf("len(addrs) = %d, want 0, got %+v", len(addrs), addrs)
+	}
+}
+
+// TestUpsertConfirmedNodeByPubKeyBumpsExistingNode covers the "pubkey
+// already known" case: a second call with the same pubkey must return the
+// SAME node id, bump last_seen/merge discovery_source, and must not touch
+// (add, remove, or otherwise alter) any node_addresses row the node
+// already has from an earlier, real UpsertConfirmedNode call.
+func TestUpsertConfirmedNodeByPubKeyBumpsExistingNode(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	pubkey := []byte("no-address-pubkey-2")
+	n1, err := store.UpsertConfirmedNode(ctx, "real-addr:1", pubkey, DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("upsert confirmed (real address): %v", err)
+	}
+
+	n2, err := store.UpsertConfirmedNodeByPubKey(ctx, pubkey, DiscoverySourceRegistry)
+	if err != nil {
+		t.Fatalf("upsert confirmed by pubkey: %v", err)
+	}
+
+	if n2.ID != n1.ID {
+		t.Fatalf("n2.ID = %v, want same as n1.ID = %v (same pubkey => same node)", n2.ID, n1.ID)
+	}
+	if n2.DiscoverySource != DiscoverySourceBoth {
+		t.Errorf("n2.DiscoverySource = %q, want %q (merged p2p + registry)", n2.DiscoverySource, DiscoverySourceBoth)
+	}
+
+	// The node's real, previously-recorded address must be completely
+	// untouched -- UpsertConfirmedNodeByPubKey never looks at addresses.
+	addrs, err := store.ListNodeAddresses(ctx, n1.ID)
+	if err != nil {
+		t.Fatalf("list node addresses: %v", err)
+	}
+	if len(addrs) != 1 || addrs[0].Address != "real-addr:1" {
+		t.Fatalf("addrs = %+v, want exactly [real-addr:1] untouched", addrs)
+	}
+}
+
+// TestUpsertConfirmedNodeByPubKeyRequiresPubKey covers the guard clause:
+// an empty publicKey must error rather than silently doing nothing.
+func TestUpsertConfirmedNodeByPubKeyRequiresPubKey(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	if _, err := store.UpsertConfirmedNodeByPubKey(ctx, nil, DiscoverySourceP2P); err == nil {
+		t.Fatal("expected an error for an empty public key, got nil")
+	}
+}
