@@ -1682,19 +1682,19 @@ func (c *concurrencyTrackingClient) GetInfo(ctx context.Context, addr string) (N
 // TestPollBoundedConcurrency is the core regression/proof test for Part
 // 1 of the collector-concurrency-brief: poll() (shared by PollConfirmed/
 // PollUnconfirmed/PollNeverContacted) must never have more than
-// maxPollWorkers (100) PollOnce calls in flight at once, no matter how
+// maxPollWorkers (250) PollOnce calls in flight at once, no matter how
 // many more nodes than that are simultaneously due. It seeds
-// numNodesDue (250, more than double maxPollWorkers) never-contacted
-// nodes -- all due immediately, since none has ever been polled -- and
-// asserts the concurrencyTrackingClient's observed peak concurrent
-// GetInfo call count is both (a) greater than 1 (proving the pass is
-// genuinely running concurrently at all, not accidentally back to
-// sequential) and (b) never more than maxPollWorkers.
+// numNodesDue (600, comfortably more than double maxPollWorkers) never-
+// contacted nodes -- all due immediately, since none has ever been
+// polled -- and asserts the concurrencyTrackingClient's observed peak
+// concurrent GetInfo call count is both (a) greater than 1 (proving the
+// pass is genuinely running concurrently at all, not accidentally back
+// to sequential) and (b) never more than maxPollWorkers.
 func TestPollBoundedConcurrency(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	const numNodesDue = 250 // comfortably more than 2x maxPollWorkers (100)
+	const numNodesDue = 600 // comfortably more than 2x maxPollWorkers (250)
 	for i := 0; i < numNodesDue; i++ {
 		addr := fmt.Sprintf("bounded-concurrency:%d", i)
 		if _, err := store.UpsertDiscoveredNode(ctx, addr, storage.DiscoverySourceP2P, nil, nil); err != nil {
