@@ -75,11 +75,15 @@ func ComputeNodeCounts(nodes []storage.Node, addrsByNode map[uuid.UUID][]storage
 	return counts
 }
 
-// fetchNodeCounts is ComputeNodeCounts's fetch-then-compute convenience
-// wrapper for callers (handleStats below) that have no other use for the
-// underlying nodes/addrsByNode data and just want the whole-population
-// counts.
-func fetchNodeCounts(ctx context.Context, store storage.Store) (NodeCounts, error) {
+// FetchNodeCounts is ComputeNodeCounts's fetch-then-compute convenience
+// wrapper for callers (handleStats below, and cmd/netmap's own Prometheus
+// collector-metrics gauges, see cmd/netmap/metrics.go's netmapMetrics.refresh)
+// that have no other use for the underlying nodes/addrsByNode data and just
+// want the whole-population counts. Exported so cmd/netmap can reuse this
+// exact query/computation for its known-node-count gauges rather than
+// duplicating the ListNodes/ListNodeAddressesForNodes/ComputeNodeCounts
+// round trip.
+func FetchNodeCounts(ctx context.Context, store storage.Store) (NodeCounts, error) {
 	nodes, err := store.ListNodes(ctx, storage.NodeFilter{})
 	if err != nil {
 		return NodeCounts{}, err
@@ -127,7 +131,7 @@ type statsResponse struct {
 // other non-admin routes in this file (no auth).
 func handleStats(store storage.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		counts, err := fetchNodeCounts(r.Context(), store)
+		counts, err := FetchNodeCounts(r.Context(), store)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return

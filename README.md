@@ -48,6 +48,40 @@ implementation is a one-function change.
   MainNet (0) if unset/empty. Example: Esmeralda testnet = 38 (0x26 hex). This is what lets a
   second deployed instance of this binary monitor Esmeralda testnet peers instead of Mainnet
   peers.
+- `-network` (CLI flag, `cmd/netmap`) — **required**, no default: `mainnet` or `testnet`.
+  Disambiguates which of the two deployed instances of this binary (e.g. `netmap.service` vs
+  `netmap-testnet.service`) a given Prometheus metric series came from, since both get scraped
+  into a single shared backend. Every metric this binary exposes at `/metrics` is prefixed
+  `netmap_<network>_collector_...` / `netmap_<network>_api_...`. This is a separate axis from
+  `NETMAP_NETWORK_BYTE` above (which selects the actual Tari wire-protocol network the
+  collector's P2P client dials) — fails fast at startup if unset or not exactly `mainnet` or
+  `testnet`.
+- `-metrics-addr` (CLI flag, `cmd/netmap`) — address to serve Prometheus `/metrics` +
+  `/healthz` on. Empty (the default) disables it entirely. This is a SEPARATE listener from
+  `-addr` (which is normally Caddy-proxied to serve the public dashboard) — must be bound
+  internal-only, never the address Caddy proxies from.
+
+## Observability
+
+Both binaries in this repo (`cmd/netmap` and `cmd/netmap-p2p-responder`) expose Prometheus
+metrics and a `/healthz` endpoint, network-scoped via a required `-network` CLI flag
+(`mainnet`/`testnet`, no default — fails fast if unset or unrecognized). This exists because the
+exact same binary is deployed to both a mainnet host and a testnet host, and both get scraped
+into a single shared Prometheus backend, so metric names must disambiguate which network
+produced them.
+
+Both binaries serve `/metrics` and `/healthz` on their own SEPARATE, opt-in `-metrics-addr`
+listener — never on their existing app-facing listener (`-addr`), which is normally proxied
+(e.g. by Caddy for `cmd/netmap`'s dashboard, or simply public-facing for
+`cmd/netmap-p2p-responder`'s P2P port). `-metrics-addr` must be bound internal-only (see each
+binary's own flag help text for the loud warning).
+
+- `cmd/netmap` — metric names: `netmap_<network>_collector_*` (poll-loop health per probe
+  source, poll-queue backlog, known-node counts by discovery source, DB health) and
+  `netmap_<network>_api_*` (HTTP request counts/latency for the dashboard + JSON API).
+- `cmd/netmap-p2p-responder` — metric names: `netmap_<network>_p2p_responder_*` (connections
+  accepted, handshake/identity-exchange results, get_peers served, substream protocol
+  declines, DB write results).
 
 ## Development
 

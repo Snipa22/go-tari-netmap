@@ -105,10 +105,12 @@ type Store interface {
 	ListNodes(ctx context.Context, filter NodeFilter) ([]Node, error)
 
 	// CountNodes returns the total number of nodes matching filter's
-	// DiscoverySource (if set), ignoring filter.Limit/filter.Offset — it
-	// always reports the full matching population, for pagination
-	// metadata (e.g. "page N of M" / has-more-pages checks) alongside a
-	// paginated ListNodes call using the same filter.
+	// DiscoverySource/ReachableSince/Confirmed/HasHealthChecks (whichever are set — see
+	// NodeFilter's doc comment on each), ignoring filter.Limit/filter.Offset — it always
+	// reports the full matching population, for pagination metadata (e.g. "page N of M" /
+	// has-more-pages checks) alongside a paginated ListNodes call using the same filter, or
+	// for gauge-style counts (e.g. cmd/netmap's Prometheus poll-queue-backlog metrics) that
+	// need a count without fetching every matching row.
 	CountNodes(ctx context.Context, filter NodeFilter) (int, error)
 
 	// GetNode returns a single node by ID. Returns ErrNotFound if no such
@@ -743,11 +745,16 @@ func (s *pgStore) ListNodeAddressesForNodes(ctx context.Context, nodeIDs []uuid.
 	return out, nil
 }
 
-func (s *pgStore) ListNodes(ctx context.Context, filter NodeFilter) ([]Node, error) {
-	query := "SELECT " + nodeColumns + " FROM nodes"
-	args := []any{}
-	var clauses []string
-
+// nodeFilterClauses builds the SQL WHERE clauses (and corresponding query args, starting at
+// $1) for every NodeFilter field that filters row-membership (DiscoverySource, ReachableSince,
+// Confirmed, HasHealthChecks, Owned) -- deliberately NOT Limit/Offset, which are pagination,
+// not a membership filter, and so are applied separately by each caller (ListNodes only -- see
+// CountNodes' own doc comment on why it always ignores them). Shared by ListNodes and
+// CountNodes so the two can never drift apart on what "matching filter" means -- see
+// CountNodes' prior bug (it silently ignored Confirmed/HasHealthChecks entirely, only ever
+// filtering by DiscoverySource) that motivated pulling this out into one shared helper instead
+// of two independently-maintained copies of the same WHERE-clause logic.
+func nodeFilterClauses(filter NodeFilter) (clauses []string, args []any) {
 	if filter.DiscoverySource != "" {
 		args = append(args, string(filter.DiscoverySource))
 		clauses = append(clauses, fmt.Sprintf("discovery_source = $%d", len(args)))
@@ -811,6 +818,13 @@ func (s *pgStore) ListNodes(ctx context.Context, filter NodeFilter) ([]Node, err
 		}
 	}
 
+	return clauses, args
+}
+
+func (s *pgStore) ListNodes(ctx context.Context, filter NodeFilter) ([]Node, error) {
+	query := "SELECT " + nodeColumns + " FROM nodes"
+	clauses, args := nodeFilterClauses(filter)
+
 	if len(clauses) > 0 {
 		query += " WHERE " + strings.Join(clauses, " AND ")
 	}
@@ -851,14 +865,15 @@ func (s *pgStore) ListNodes(ctx context.Context, filter NodeFilter) ([]Node, err
 }
 
 // CountNodes returns the total number of nodes matching filter's
-// DiscoverySource (if set), ignoring filter.Limit/filter.Offset entirely
-// — it always reports the full matching population.
+// DiscoverySource/ReachableSince/Confirmed/HasHealthChecks/Owned (whichever are set — see
+// nodeFilterClauses, shared with ListNodes so the two can never drift apart on what "matching
+// filter" means), ignoring filter.Limit/filter.Offset entirely — it always reports the full
+// matching population.
 func (s *pgStore) CountNodes(ctx context.Context, filter NodeFilter) (int, error) {
 	query := "SELECT count(*) FROM nodes"
-	args := []any{}
-	if filter.DiscoverySource != "" {
-		args = append(args, string(filter.DiscoverySource))
-		query += " WHERE discovery_source = $1"
+	clauses, args := nodeFilterClauses(filter)
+	if len(clauses) > 0 {
+		query += " WHERE " + strings.Join(clauses, " AND ")
 	}
 
 	var count int

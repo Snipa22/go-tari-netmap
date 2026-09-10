@@ -21,6 +21,18 @@
 //
 //	-public-tcp-addr /ip4/<public-ip>/tcp/<port>   e.g. -public-tcp-addr /ip4/203.0.113.7/tcp/18189
 //	-onion3-addr     /onion3/<addr>:<port>          e.g. -onion3-addr /onion3/abc...xyz:18189
+//
+// # Network flag (mainnet/testnet)
+//
+// This exact same binary is deployed unchanged to both a mainnet host and a testnet host, and
+// both get scraped into a single shared Prometheus backend -- so every metric this binary
+// exposes must be prefixed by which network produced it (see metrics.go's doc comment). The
+// required -network flag (values: mainnet|testnet, no default) drives that prefix; this binary
+// fails fast at startup if it's unset or an unrecognized value, mirroring the existing
+// -public-tcp-addr/-onion3-addr fail-fast pattern above:
+//
+//	-network mainnet   e.g. on CT129
+//	-network testnet    e.g. on CT132
 package main
 
 import (
@@ -59,8 +71,16 @@ func run() error {
 		metricsAddr   = flag.String("metrics-addr", "", "address to serve Prometheus /metrics + /healthz on (default empty = disabled, opt-in like -public-tcp-addr/-onion3-addr). "+
 			"CRITICAL: bind to an INTERNAL-ONLY address, e.g. 192.168.40.x:PORT or 127.0.0.1:PORT -- NEVER the public IP this binary also advertises via -public-tcp-addr. "+
 			"If you set this at all, prefer a loopback-only address such as 127.0.0.1:9471; do NOT use a bare :PORT form (binds ALL interfaces, including the public one).")
+		network = flag.String("network", "", "REQUIRED, no default: which Tari network this deployment monitors -- \"mainnet\" or \"testnet\". "+
+			"Both networks' deployments of this exact same binary get scraped into one shared Prometheus backend, so every metric name this binary exposes is prefixed netmap_<network>_p2p_responder_... "+
+			"(e.g. netmap_mainnet_p2p_responder_connections_accepted_total on the mainnet deployment). Fails fast at startup if unset or not exactly one of these two values.")
 	)
 	flag.Parse()
+
+	metrics, err := newResponderMetrics(*network)
+	if err != nil {
+		return err
+	}
 
 	ourAddresses, err := parseAdvertisedAddresses(*publicTCPAddr, *onion3Addr)
 	if err != nil {
@@ -120,7 +140,7 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("listening on -metrics-addr %s: %w", *metricsAddr, err)
 		}
-		metricsServer := newMetricsServer(store)
+		metricsServer := newMetricsServer(store, metrics)
 		log.Printf("main: serving /metrics and /healthz on %s (internal-only -- never expose this address publicly)", metricsListener.Addr())
 
 		metricsWG.Add(1)
@@ -139,7 +159,7 @@ func run() error {
 		}()
 	}
 
-	responder := &dbBackedResponder{store: store, logf: log.Printf}
+	responder := &dbBackedResponder{store: store, logf: log.Printf, metrics: metrics}
 
 	cfg := p2p.ResponderConfig{
 		StaticKeypair:               staticKeypair,
@@ -148,11 +168,11 @@ func run() error {
 		PeerListProvider:            responder.peerListProvider,
 		OnPeerIdentity:              responder.onPeerIdentity,
 		Logf:                        log.Printf,
-		OnConnectionAccepted:        onConnectionAccepted,
-		OnHandshakeResult:           onHandshakeResult,
-		OnIdentityExchangeResult:    onIdentityExchangeResult,
-		OnGetPeersServed:            onGetPeersServed,
-		OnSubstreamProtocolDeclined: onSubstreamProtocolDeclined,
+		OnConnectionAccepted:        metrics.onConnectionAccepted,
+		OnHandshakeResult:           metrics.onHandshakeResult,
+		OnIdentityExchangeResult:    metrics.onIdentityExchangeResult,
+		OnGetPeersServed:            metrics.onGetPeersServed,
+		OnSubstreamProtocolDeclined: metrics.onSubstreamProtocolDeclined,
 	}
 
 	err = p2p.Serve(ctx, listener, cfg)

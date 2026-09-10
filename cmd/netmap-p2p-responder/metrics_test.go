@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,63 +21,153 @@ import (
 	"github.com/Snipa22/go-tari-netmap/internal/storage"
 )
 
+// TestValidateNetwork exercises the required -network flag's fail-fast validation (see
+// BRIEF5.md's testing requirement: "an invalid/missing -network value fails fast rather than
+// defaulting silently") -- "mainnet"/"testnet" must succeed, everything else (including empty)
+// must return an error.
+func TestValidateNetwork(t *testing.T) {
+	cases := []struct {
+		network string
+		wantErr bool
+	}{
+		{network: "mainnet", wantErr: false},
+		{network: "testnet", wantErr: false},
+		{network: "", wantErr: true},
+		{network: "Mainnet", wantErr: true},
+		{network: "TESTNET", wantErr: true},
+		{network: "devnet", wantErr: true},
+	}
+	for _, tc := range cases {
+		err := validateNetwork(tc.network)
+		if tc.wantErr && err == nil {
+			t.Errorf("validateNetwork(%q) = nil, want an error", tc.network)
+		}
+		if !tc.wantErr && err != nil {
+			t.Errorf("validateNetwork(%q) = %v, want nil", tc.network, err)
+		}
+	}
+}
+
+// TestNewResponderMetricsRejectsInvalidNetwork mirrors TestValidateNetwork at the
+// newResponderMetrics constructor level -- it must fail fast (no metrics built/registered) for
+// an unset or unrecognized -network value rather than silently defaulting to some prefix.
+func TestNewResponderMetricsRejectsInvalidNetwork(t *testing.T) {
+	if _, err := newResponderMetrics(""); err == nil {
+		t.Error("newResponderMetrics(\"\") = nil error, want an error")
+	}
+	if _, err := newResponderMetrics("devnet"); err == nil {
+		t.Error("newResponderMetrics(\"devnet\") = nil error, want an error")
+	}
+}
+
+// TestNewResponderMetricsProducesNetworkScopedNames is this file's core coverage for BRIEF5.md's
+// Change 1: building a *responderMetrics for "mainnet" must produce metric names prefixed
+// netmap_mainnet_p2p_responder_..., and for "testnet" netmap_testnet_p2p_responder_... -- both
+// checked by actually incrementing a metric and scraping each instance's own dedicated registry
+// via promhttp, exactly what a real Prometheus scrape would see.
+func TestNewResponderMetricsProducesNetworkScopedNames(t *testing.T) {
+	for _, network := range []string{"mainnet", "testnet"} {
+		t.Run(network, func(t *testing.T) {
+			m, err := newResponderMetrics(network)
+			if err != nil {
+				t.Fatalf("newResponderMetrics(%q): %v", network, err)
+			}
+			m.onConnectionAccepted(testAddr("203.0.113.1:1"))
+
+			body := scrapeRegistry(t, m.registry)
+
+			want := "netmap_" + network + "_p2p_responder_connections_accepted_total"
+			if !strings.Contains(body, want) {
+				t.Errorf("scrape output missing %q, got:\n%s", want, body)
+			}
+
+			// Cross-check: the OTHER network's prefix must never appear on this instance's
+			// registry -- names are strictly per-instance, not accidentally shared/leaked.
+			other := "mainnet"
+			if network == "mainnet" {
+				other = "testnet"
+			}
+			wrongPrefix := "netmap_" + other + "_p2p_responder_"
+			if strings.Contains(body, wrongPrefix) {
+				t.Errorf("scrape output for network=%q unexpectedly contains the other network's prefix %q, got:\n%s", network, wrongPrefix, body)
+			}
+		})
+	}
+}
+
+// scrapeRegistry renders reg's current state through newMetricsServer's own /metrics handler
+// (promhttp.HandlerFor(reg, ...), see metrics.go) and returns the raw exposition-format body --
+// the exact same code path a real Prometheus scrape hits.
+func scrapeRegistry(t *testing.T, reg *prometheus.Registry) string {
+	t.Helper()
+	server := newMetricsServer(nil, &responderMetrics{registry: reg})
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	server.Handler.ServeHTTP(rec, req)
+	return rec.Body.String()
+}
+
 // TestOnConnectionAcceptedIncrementsMetric through TestOnSubstreamProtocolDeclinedIncrementsMetric
-// exercise the standalone callback functions wired directly as p2p.ResponderConfig's
+// exercise responderMetrics' own methods, which are wired directly as p2p.ResponderConfig's
 // On*/observability fields in main.go (see metrics.go) -- each just increments/observes the
-// matching Prometheus metric, so these are plain "call it, check the delta" unit tests, using
-// testutil.ToFloat64 to read the counter/vec value before/after (a delta rather than an
-// absolute assertion, since these are process-global prometheus.DefaultRegisterer metrics
-// shared across every test in this package/run).
+// matching Prometheus metric. Every test below builds its own *responderMetrics on its own
+// dedicated registry (see newResponderMetrics), so plain before/after absolute assertions work
+// fine -- no shared global registry to worry about (unlike this file's previous
+// prometheus.DefaultRegisterer-based version).
 
 func TestOnConnectionAcceptedIncrementsMetric(t *testing.T) {
-	before := testutil.ToFloat64(netmapP2PResponderConnectionsAccepted)
-	onConnectionAccepted(testAddr("203.0.113.1:1"))
-	after := testutil.ToFloat64(netmapP2PResponderConnectionsAccepted)
+	m := mustTestResponderMetrics(t)
+	before := testutil.ToFloat64(m.connectionsAccepted)
+	m.onConnectionAccepted(testAddr("203.0.113.1:1"))
+	after := testutil.ToFloat64(m.connectionsAccepted)
 	if after != before+1 {
-		t.Errorf("netmap_p2p_responder_connections_accepted_total = %v, want %v", after, before+1)
+		t.Errorf("connections_accepted_total = %v, want %v", after, before+1)
 	}
 }
 
 func TestOnHandshakeResultIncrementsMetric(t *testing.T) {
-	beforeSuccess := testutil.ToFloat64(netmapP2PResponderHandshakeResult.WithLabelValues("success"))
-	beforeFailure := testutil.ToFloat64(netmapP2PResponderHandshakeResult.WithLabelValues("failure"))
+	m := mustTestResponderMetrics(t)
+	beforeSuccess := testutil.ToFloat64(m.handshakeResult.WithLabelValues("success"))
+	beforeFailure := testutil.ToFloat64(m.handshakeResult.WithLabelValues("failure"))
 
-	onHandshakeResult(testAddr("203.0.113.2:1"), true)
-	onHandshakeResult(testAddr("203.0.113.3:1"), false)
+	m.onHandshakeResult(testAddr("203.0.113.2:1"), true)
+	m.onHandshakeResult(testAddr("203.0.113.3:1"), false)
 
-	if got := testutil.ToFloat64(netmapP2PResponderHandshakeResult.WithLabelValues("success")); got != beforeSuccess+1 {
+	if got := testutil.ToFloat64(m.handshakeResult.WithLabelValues("success")); got != beforeSuccess+1 {
 		t.Errorf("handshake_result_total{result=success} = %v, want %v", got, beforeSuccess+1)
 	}
-	if got := testutil.ToFloat64(netmapP2PResponderHandshakeResult.WithLabelValues("failure")); got != beforeFailure+1 {
+	if got := testutil.ToFloat64(m.handshakeResult.WithLabelValues("failure")); got != beforeFailure+1 {
 		t.Errorf("handshake_result_total{result=failure} = %v, want %v", got, beforeFailure+1)
 	}
 }
 
 func TestOnIdentityExchangeResultIncrementsMetric(t *testing.T) {
-	beforeSuccess := testutil.ToFloat64(netmapP2PResponderIdentityExchangeResult.WithLabelValues("success"))
-	beforeFailure := testutil.ToFloat64(netmapP2PResponderIdentityExchangeResult.WithLabelValues("failure"))
+	m := mustTestResponderMetrics(t)
+	beforeSuccess := testutil.ToFloat64(m.identityExchangeResult.WithLabelValues("success"))
+	beforeFailure := testutil.ToFloat64(m.identityExchangeResult.WithLabelValues("failure"))
 
-	onIdentityExchangeResult(testAddr("203.0.113.4:1"), true)
-	onIdentityExchangeResult(testAddr("203.0.113.5:1"), false)
+	m.onIdentityExchangeResult(testAddr("203.0.113.4:1"), true)
+	m.onIdentityExchangeResult(testAddr("203.0.113.5:1"), false)
 
-	if got := testutil.ToFloat64(netmapP2PResponderIdentityExchangeResult.WithLabelValues("success")); got != beforeSuccess+1 {
+	if got := testutil.ToFloat64(m.identityExchangeResult.WithLabelValues("success")); got != beforeSuccess+1 {
 		t.Errorf("identity_exchange_result_total{result=success} = %v, want %v", got, beforeSuccess+1)
 	}
-	if got := testutil.ToFloat64(netmapP2PResponderIdentityExchangeResult.WithLabelValues("failure")); got != beforeFailure+1 {
+	if got := testutil.ToFloat64(m.identityExchangeResult.WithLabelValues("failure")); got != beforeFailure+1 {
 		t.Errorf("identity_exchange_result_total{result=failure} = %v, want %v", got, beforeFailure+1)
 	}
 }
 
 func TestOnGetPeersServedIncrementsMetricAndObservesHistogram(t *testing.T) {
-	beforeServed := testutil.ToFloat64(netmapP2PResponderGetPeersServed)
-	beforeSampleCount := histogramSampleCount(t, netmapP2PResponderGetPeersPeerCount)
+	m := mustTestResponderMetrics(t)
+	beforeServed := testutil.ToFloat64(m.getPeersServed)
+	beforeSampleCount := histogramSampleCount(t, m.getPeersPeerCount)
 
-	onGetPeersServed(testAddr("203.0.113.6:1"), 7)
+	m.onGetPeersServed(testAddr("203.0.113.6:1"), 7)
 
-	if got := testutil.ToFloat64(netmapP2PResponderGetPeersServed); got != beforeServed+1 {
+	if got := testutil.ToFloat64(m.getPeersServed); got != beforeServed+1 {
 		t.Errorf("get_peers_served_total = %v, want %v", got, beforeServed+1)
 	}
-	if got := histogramSampleCount(t, netmapP2PResponderGetPeersPeerCount); got != beforeSampleCount+1 {
+	if got := histogramSampleCount(t, m.getPeersPeerCount); got != beforeSampleCount+1 {
 		t.Errorf("get_peers_peer_count sample count = %d, want %d", got, beforeSampleCount+1)
 	}
 }
@@ -95,9 +186,10 @@ func histogramSampleCount(t *testing.T, h prometheus.Histogram) uint64 {
 }
 
 func TestOnSubstreamProtocolDeclinedIncrementsMetric(t *testing.T) {
-	before := testutil.ToFloat64(netmapP2PResponderSubstreamProtocolDeclined.WithLabelValues("t/msg/0.1"))
-	onSubstreamProtocolDeclined(testAddr("203.0.113.7:1"), []byte("t/msg/0.1"))
-	after := testutil.ToFloat64(netmapP2PResponderSubstreamProtocolDeclined.WithLabelValues("t/msg/0.1"))
+	m := mustTestResponderMetrics(t)
+	before := testutil.ToFloat64(m.substreamProtocolDeclined.WithLabelValues("t/msg/0.1"))
+	m.onSubstreamProtocolDeclined(testAddr("203.0.113.7:1"), []byte("t/msg/0.1"))
+	after := testutil.ToFloat64(m.substreamProtocolDeclined.WithLabelValues("t/msg/0.1"))
 	if after != before+1 {
 		t.Errorf("substream_protocol_declined_total{protocol=\"t/msg/0.1\"} = %v, want %v", after, before+1)
 	}
@@ -108,20 +200,21 @@ func TestOnSubstreamProtocolDeclinedIncrementsMetric(t *testing.T) {
 // test database (same pattern as responder_test.go's newTestStore).
 func TestOnPeerIdentityIncrementsDBWriteMetrics(t *testing.T) {
 	store := newTestStore(t)
-	r := &dbBackedResponder{store: store, logf: t.Logf}
+	metrics := mustTestResponderMetrics(t)
+	r := &dbBackedResponder{store: store, logf: t.Logf, metrics: metrics}
 
-	beforeUpsertSuccess := testutil.ToFloat64(netmapP2PResponderDBWriteResult.WithLabelValues(dbOperationUpsertNode, "success"))
-	beforeHealthSuccess := testutil.ToFloat64(netmapP2PResponderDBWriteResult.WithLabelValues(dbOperationRecordHealth, "success"))
+	beforeUpsertSuccess := testutil.ToFloat64(metrics.dbWriteResult.WithLabelValues(dbOperationUpsertNode, "success"))
+	beforeHealthSuccess := testutil.ToFloat64(metrics.dbWriteResult.WithLabelValues(dbOperationRecordHealth, "success"))
 
 	r.onPeerIdentity(testAddr("203.0.113.80:41000"), []byte{0x90}, &p2p.PeerInfo{
 		RemoteStaticPubKey: []byte{0x90},
 		Features:           p2p.FeaturesCommunicationNode,
 	})
 
-	if got := testutil.ToFloat64(netmapP2PResponderDBWriteResult.WithLabelValues(dbOperationUpsertNode, "success")); got != beforeUpsertSuccess+1 {
+	if got := testutil.ToFloat64(metrics.dbWriteResult.WithLabelValues(dbOperationUpsertNode, "success")); got != beforeUpsertSuccess+1 {
 		t.Errorf("db_write_result_total{operation=upsert_node,result=success} = %v, want %v", got, beforeUpsertSuccess+1)
 	}
-	if got := testutil.ToFloat64(netmapP2PResponderDBWriteResult.WithLabelValues(dbOperationRecordHealth, "success")); got != beforeHealthSuccess+1 {
+	if got := testutil.ToFloat64(metrics.dbWriteResult.WithLabelValues(dbOperationRecordHealth, "success")); got != beforeHealthSuccess+1 {
 		t.Errorf("db_write_result_total{operation=record_health,result=success} = %v, want %v", got, beforeHealthSuccess+1)
 	}
 }
@@ -144,20 +237,21 @@ func (f *failingStore) UpsertConfirmedNode(ctx context.Context, address string, 
 // failure, see responder.go).
 func TestOnPeerIdentityRecordsDBWriteFailureMetric(t *testing.T) {
 	store := newTestStore(t)
-	r := &dbBackedResponder{store: &failingStore{Store: store}, logf: t.Logf}
+	metrics := mustTestResponderMetrics(t)
+	r := &dbBackedResponder{store: &failingStore{Store: store}, logf: t.Logf, metrics: metrics}
 
-	beforeUpsertFailure := testutil.ToFloat64(netmapP2PResponderDBWriteResult.WithLabelValues(dbOperationUpsertNode, "failure"))
-	beforeHealthSuccess := testutil.ToFloat64(netmapP2PResponderDBWriteResult.WithLabelValues(dbOperationRecordHealth, "success"))
+	beforeUpsertFailure := testutil.ToFloat64(metrics.dbWriteResult.WithLabelValues(dbOperationUpsertNode, "failure"))
+	beforeHealthSuccess := testutil.ToFloat64(metrics.dbWriteResult.WithLabelValues(dbOperationRecordHealth, "success"))
 
 	r.onPeerIdentity(testAddr("203.0.113.81:41000"), []byte{0x91}, &p2p.PeerInfo{
 		RemoteStaticPubKey: []byte{0x91},
 		Features:           p2p.FeaturesCommunicationNode,
 	})
 
-	if got := testutil.ToFloat64(netmapP2PResponderDBWriteResult.WithLabelValues(dbOperationUpsertNode, "failure")); got != beforeUpsertFailure+1 {
+	if got := testutil.ToFloat64(metrics.dbWriteResult.WithLabelValues(dbOperationUpsertNode, "failure")); got != beforeUpsertFailure+1 {
 		t.Errorf("db_write_result_total{operation=upsert_node,result=failure} = %v, want %v", got, beforeUpsertFailure+1)
 	}
-	if got := testutil.ToFloat64(netmapP2PResponderDBWriteResult.WithLabelValues(dbOperationRecordHealth, "success")); got != beforeHealthSuccess {
+	if got := testutil.ToFloat64(metrics.dbWriteResult.WithLabelValues(dbOperationRecordHealth, "success")); got != beforeHealthSuccess {
 		t.Errorf("db_write_result_total{operation=record_health,result=success} = %v, want unchanged %v (RecordHealthCheck must never be reached after a failed UpsertConfirmedNode)", got, beforeHealthSuccess)
 	}
 }
@@ -165,12 +259,14 @@ func TestOnPeerIdentityRecordsDBWriteFailureMetric(t *testing.T) {
 // TestServeWiresObservabilityCallbacksOverLoopback is this package's version of BRIEF4.md's
 // "reuse this repo's existing p2p.Serve-over-loopback test pattern... dial with a fake client,
 // assert the metric moved" testing requirement: it runs a REAL p2p.Serve loop configured with
-// this binary's exact observability callbacks (mirroring main.go's cfg wiring) on a loopback
-// listener, dials it with go-tari-lib's own probe clients, and asserts every metric these
-// callbacks feed actually moved.
+// this binary's exact observability callbacks (mirroring main.go's cfg wiring, now bound to a
+// single test-local *responderMetrics rather than package-level vars) on a loopback listener,
+// dials it with go-tari-lib's own probe clients, and asserts every metric these callbacks feed
+// actually moved.
 func TestServeWiresObservabilityCallbacksOverLoopback(t *testing.T) {
 	store := newTestStore(t)
-	responder := &dbBackedResponder{store: store, logf: t.Logf}
+	metrics := mustTestResponderMetrics(t)
+	responder := &dbBackedResponder{store: store, logf: t.Logf, metrics: metrics}
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -189,18 +285,18 @@ func TestServeWiresObservabilityCallbacksOverLoopback(t *testing.T) {
 		PeerListProvider:            responder.peerListProvider,
 		OnPeerIdentity:              responder.onPeerIdentity,
 		Logf:                        t.Logf,
-		OnConnectionAccepted:        onConnectionAccepted,
-		OnHandshakeResult:           onHandshakeResult,
-		OnIdentityExchangeResult:    onIdentityExchangeResult,
-		OnGetPeersServed:            onGetPeersServed,
-		OnSubstreamProtocolDeclined: onSubstreamProtocolDeclined,
+		OnConnectionAccepted:        metrics.onConnectionAccepted,
+		OnHandshakeResult:           metrics.onHandshakeResult,
+		OnIdentityExchangeResult:    metrics.onIdentityExchangeResult,
+		OnGetPeersServed:            metrics.onGetPeersServed,
+		OnSubstreamProtocolDeclined: metrics.onSubstreamProtocolDeclined,
 	}
 
-	beforeAccepted := testutil.ToFloat64(netmapP2PResponderConnectionsAccepted)
-	beforeHandshakeSuccess := testutil.ToFloat64(netmapP2PResponderHandshakeResult.WithLabelValues("success"))
-	beforeIdentitySuccess := testutil.ToFloat64(netmapP2PResponderIdentityExchangeResult.WithLabelValues("success"))
-	beforeGetPeersServed := testutil.ToFloat64(netmapP2PResponderGetPeersServed)
-	beforeDeclined := testutil.ToFloat64(netmapP2PResponderSubstreamProtocolDeclined.WithLabelValues(string(rpcpkg.BlockSyncProtocolID)))
+	beforeAccepted := testutil.ToFloat64(metrics.connectionsAccepted)
+	beforeHandshakeSuccess := testutil.ToFloat64(metrics.handshakeResult.WithLabelValues("success"))
+	beforeIdentitySuccess := testutil.ToFloat64(metrics.identityExchangeResult.WithLabelValues("success"))
+	beforeGetPeersServed := testutil.ToFloat64(metrics.getPeersServed)
+	beforeDeclined := testutil.ToFloat64(metrics.substreamProtocolDeclined.WithLabelValues(string(rpcpkg.BlockSyncProtocolID)))
 
 	serveCtx, serveCancel := context.WithCancel(context.Background())
 	serveErrCh := make(chan error, 1)
@@ -232,25 +328,25 @@ func TestServeWiresObservabilityCallbacksOverLoopback(t *testing.T) {
 
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		if testutil.ToFloat64(netmapP2PResponderSubstreamProtocolDeclined.WithLabelValues(string(rpcpkg.BlockSyncProtocolID))) > beforeDeclined || time.Now().After(deadline) {
+		if testutil.ToFloat64(metrics.substreamProtocolDeclined.WithLabelValues(string(rpcpkg.BlockSyncProtocolID))) > beforeDeclined || time.Now().After(deadline) {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	if got := testutil.ToFloat64(netmapP2PResponderConnectionsAccepted); got != beforeAccepted+2 {
+	if got := testutil.ToFloat64(metrics.connectionsAccepted); got != beforeAccepted+2 {
 		t.Errorf("connections_accepted_total = %v, want %v", got, beforeAccepted+2)
 	}
-	if got := testutil.ToFloat64(netmapP2PResponderHandshakeResult.WithLabelValues("success")); got != beforeHandshakeSuccess+2 {
+	if got := testutil.ToFloat64(metrics.handshakeResult.WithLabelValues("success")); got != beforeHandshakeSuccess+2 {
 		t.Errorf("handshake_result_total{result=success} = %v, want %v", got, beforeHandshakeSuccess+2)
 	}
-	if got := testutil.ToFloat64(netmapP2PResponderIdentityExchangeResult.WithLabelValues("success")); got != beforeIdentitySuccess+2 {
+	if got := testutil.ToFloat64(metrics.identityExchangeResult.WithLabelValues("success")); got != beforeIdentitySuccess+2 {
 		t.Errorf("identity_exchange_result_total{result=success} = %v, want %v", got, beforeIdentitySuccess+2)
 	}
-	if got := testutil.ToFloat64(netmapP2PResponderGetPeersServed); got != beforeGetPeersServed+1 {
+	if got := testutil.ToFloat64(metrics.getPeersServed); got != beforeGetPeersServed+1 {
 		t.Errorf("get_peers_served_total = %v, want %v (only connection 1 completed get_peers)", got, beforeGetPeersServed+1)
 	}
-	if got := testutil.ToFloat64(netmapP2PResponderSubstreamProtocolDeclined.WithLabelValues(string(rpcpkg.BlockSyncProtocolID))); got != beforeDeclined+1 {
+	if got := testutil.ToFloat64(metrics.substreamProtocolDeclined.WithLabelValues(string(rpcpkg.BlockSyncProtocolID))); got != beforeDeclined+1 {
 		t.Errorf("substream_protocol_declined_total{protocol=%q} = %v, want %v", rpcpkg.BlockSyncProtocolID, got, beforeDeclined+1)
 	}
 }
@@ -259,7 +355,7 @@ func TestServeWiresObservabilityCallbacksOverLoopback(t *testing.T) {
 // database: it must return 200 with {"status":"ok"}.
 func TestHealthzOK(t *testing.T) {
 	store := newTestStore(t)
-	server := newMetricsServer(store)
+	server := newMetricsServer(store, mustTestResponderMetrics(t))
 
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
@@ -292,7 +388,7 @@ func (u *unreachableStore) Ping(ctx context.Context) error {
 // at all -- this endpoint's whole point is to be checkable independent of the P2P listener).
 func TestHealthzUnreachableDB(t *testing.T) {
 	store := newTestStore(t)
-	server := newMetricsServer(&unreachableStore{Store: store})
+	server := newMetricsServer(&unreachableStore{Store: store}, mustTestResponderMetrics(t))
 
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
@@ -304,15 +400,18 @@ func TestHealthzUnreachableDB(t *testing.T) {
 }
 
 // TestMetricsEndpointServesPrometheusFormat exercises newMetricsServer's /metrics handler,
-// confirming it serves promhttp.Handler()'s real Prometheus exposition format, including at
-// least one of this binary's own custom metrics by name.
+// confirming it serves this responderMetrics instance's own dedicated-registry Prometheus
+// exposition format (see responderMetrics' doc comment on why it's no longer
+// prometheus.DefaultGatherer), including at least one of this binary's own custom metrics by
+// its network-scoped name, plus the standard process/Go collectors we now register explicitly.
 func TestMetricsEndpointServesPrometheusFormat(t *testing.T) {
 	store := newTestStore(t)
-	server := newMetricsServer(store)
+	metrics := mustTestResponderMetrics(t) // network="mainnet"
+	server := newMetricsServer(store, metrics)
 
 	// Increment something first so its HELP/TYPE lines are guaranteed to be emitted (a fresh
 	// CounterVec with zero label combinations used yet emits nothing).
-	onConnectionAccepted(testAddr("203.0.113.90:1"))
+	metrics.onConnectionAccepted(testAddr("203.0.113.90:1"))
 
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 	rec := httptest.NewRecorder()
@@ -322,19 +421,10 @@ func TestMetricsEndpointServesPrometheusFormat(t *testing.T) {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
 	}
 	body := rec.Body.String()
-	if !containsSubstring(body, "netmap_p2p_responder_connections_accepted_total") {
-		t.Errorf("/metrics response missing netmap_p2p_responder_connections_accepted_total, got:\n%s", body)
+	if !strings.Contains(body, "netmap_mainnet_p2p_responder_connections_accepted_total") {
+		t.Errorf("/metrics response missing netmap_mainnet_p2p_responder_connections_accepted_total, got:\n%s", body)
 	}
-	if !containsSubstring(body, "go_goroutines") {
-		t.Errorf("/metrics response missing the standard Go collector's go_goroutines (see metrics.go's doc comment on relying on the default collectors), got:\n%s", body)
+	if !strings.Contains(body, "go_goroutines") {
+		t.Errorf("/metrics response missing the standard Go collector's go_goroutines (see newResponderMetrics registering it explicitly on our dedicated registry), got:\n%s", body)
 	}
-}
-
-func containsSubstring(haystack, needle string) bool {
-	for i := 0; i+len(needle) <= len(haystack); i++ {
-		if haystack[i:i+len(needle)] == needle {
-			return true
-		}
-	}
-	return false
 }
