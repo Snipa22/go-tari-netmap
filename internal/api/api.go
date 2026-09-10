@@ -77,8 +77,13 @@ func NewRouter(store storage.Store, grpcClient, p2pClient collector.NodeClient, 
 
 	// Whole-population node counts + network-height snapshot (see
 	// internal/api/stats.go). Same trust level as the other read
-	// routes above — deliberately NOT under /admin.
-	mux.HandleFunc("GET /stats", handleStats(store))
+	// routes above — deliberately NOT under /admin. Versioned
+	// (/v1/stats, served as /api/v1/stats via cmd/netmap's /api/
+	// StripPrefix mount) per Alex: "no reason not to version" — this
+	// is the API's first versioned route; future breaking changes to
+	// its response shape get their own /v2/ route instead of breaking
+	// existing callers in place.
+	mux.HandleFunc("GET /v1/stats", handleStats(store))
 
 	// Seed-node suggestion + Tari config.toml peer_seeds generator. Same
 	// trust level as the other read routes above (GET /nodes, GET
