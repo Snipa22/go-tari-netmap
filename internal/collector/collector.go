@@ -130,6 +130,48 @@ const defaultTickInterval = 5 * time.Minute
 // the confirmed loop happens to be configured with.
 const defaultNeverContactedTickInterval = 1 * time.Minute
 
+// DiscoveryPassDeadline bounds how long a single discoverWith pass (the
+// general-population BFS over the known peer graph, started fresh from
+// Config.SeedNodes) is allowed to run before it's cut short. Named and
+// exported (unlike a plain unexported constant) so the relationship to
+// defaultTickInterval below is explicit and can be referenced from
+// elsewhere if needed, rather than silently drifting if
+// defaultTickInterval is ever changed without this being revisited.
+//
+// defaultTickInterval (5 minutes) is how often Run kicks off a fresh
+// Discover pass; DiscoveryPassDeadline is set comfortably under that —
+// 4 minutes — so discoverWith always returns control to its caller
+// before the next tick fires, even when the walk can't finish covering
+// the whole graph in a single pass. Before this existed, an unbounded
+// `for len(queue) > 0` BFS over tens of thousands of nodes could run
+// for hours against the real mainnet graph, which meant a node near the
+// front of the queue (see discoverWith's per-node cooldown) had to wait
+// for the ENTIRE walk to finish before being revisited — starving
+// Config.SeedNodes and any pool-owned node of their intended
+// DiscoveryIntervalPoolOwned cadence. DiscoverOwned (see its doc
+// comment) is the primary fix for owned/seed nodes specifically; this
+// deadline is the complementary fix for the general population, so a
+// slow/huge graph can never again delay the next Discover tick
+// indefinitely, regardless of which nodes happen to be at the front of
+// the queue.
+const DiscoveryPassDeadline = 4 * time.Minute
+
+// ownedDiscoveryWorkers bounds the number of concurrent in-flight
+// GetPeers calls within a single DiscoverOwned pass, mirroring
+// maxPollWorkers' errgroup.SetLimit pattern in poll() but sized very
+// differently: there are only ever a handful of owned/seed nodes in
+// production (unlike the tens of thousands of generic nodes
+// maxPollWorkers is sized for), so serializing them behind each other's
+// dial timeouts (up to dialTimeout, 180s, each — see
+// grpc_client.go/p2p_client.go) is exactly the kind of avoidable
+// head-of-line delay DiscoverOwned exists to eliminate. 16 is a
+// deliberate, named choice within this repo's suggested 10-20-worker
+// range for this loop — comfortably more than the expected owned/seed
+// population size, so every owned/seed node's GetPeers call can be
+// genuinely in flight at once every pass, with no queueing at all in
+// the common case.
+const ownedDiscoveryWorkers = 16
+
 // maxPollWorkers bounds the number of concurrent in-flight PollOnce calls
 // within a single poll() pass (shared by PollConfirmed, PollUnconfirmed,
 // and PollNeverContacted). Each PollOnce dial can take up to dialTimeout
@@ -305,6 +347,27 @@ type Collector struct {
 	// loop's cadence happens to be configured.
 	NeverContactedTickInterval time.Duration
 
+	// OwnedDiscoveryTickInterval governs how often Run checks
+	// Config.SeedNodes and every pool-owned node for a fresh peer-walk,
+	// via the independent DiscoverOwned loop (see runOwnedDiscoverLoop)
+	// — this is a distinct concept from TickInterval/
+	// UnconfirmedTickInterval/NeverContactedTickInterval above (which
+	// all govern POLL loops, i.e. health-check dials) and from
+	// DiscoveryIntervalPoolOwned (which is the per-node discovery-walk
+	// cooldown enforced WITHIN a single DiscoverOwned/Discover pass,
+	// not how often Run kicks off a fresh pass). Optional: mirroring
+	// NeverContactedTickInterval's optional-field-with-sensible-default
+	// pattern, this defaults to DiscoveryIntervalPoolOwned itself (30
+	// minutes) when left unset/<= 0 — the natural default tick for a
+	// loop whose entire purpose is guaranteeing DiscoveryIntervalPoolOwned's
+	// intended cadence for owned/seed nodes actually gets honored (see
+	// DiscoverOwned's doc comment for the starvation bug this loop
+	// fixes). Set this explicitly only if the owned-discovery loop's
+	// tick cadence needs to differ from DiscoveryIntervalPoolOwned
+	// itself — e.g. in tests, which use a short interval so they don't
+	// need to wait 30 minutes for anything.
+	OwnedDiscoveryTickInterval time.Duration
+
 	mu            sync.Mutex
 	nextPoll      map[string]time.Time // address -> next poll due time
 	nextDiscovery map[string]time.Time // discoveryCooldownKey(transport, address) -> next discovery-walk due time
@@ -331,9 +394,11 @@ func New(cfg Config) *Collector {
 //
 //   - a slow or never-ending Discover pass (a synchronous BFS over the
 //     real peer graph, with real network dials — this can take minutes
-//     against the real mainnet, or longer as the network grows) cannot
-//     starve either poll loop, which is what actually produces the
-//     health-check data the rest of this tool is for.
+//     against the real mainnet, or longer as the network grows, though
+//     now bounded per-pass by DiscoveryPassDeadline — see discoverWith's
+//     doc comment) cannot starve either poll loop, which is what
+//     actually produces the health-check data the rest of this tool is
+//     for.
 //   - the unconfirmed-node poll loop (PollUnconfirmed) cannot starve the
 //     confirmed-node poll loop (PollConfirmed), even when the unconfirmed
 //     node population vastly outnumbers confirmed nodes (in production,
@@ -349,20 +414,39 @@ func New(cfg Config) *Collector {
 //     the confirmed or unconfirmed backlogs are. See PollNeverContacted's
 //     doc comment for why this queue exists as a THIRD, distinct
 //     category rather than folding into PollUnconfirmed.
+//   - the owned-discovery loop (DiscoverOwned) cannot be starved by, or
+//     starve, any of the other four — it runs on its own
+//     goroutine/ticker (see OwnedDiscoveryTickInterval/
+//     runOwnedDiscoverLoop), so Config.SeedNodes and every pool-owned
+//     node get a fresh peer-walk on their own short, independent
+//     cadence regardless of how large the general-population peer
+//     graph is or how long the general Discover BFS takes. This is the
+//     primary fix for the owned/seed discovery-starvation bug: without
+//     it, an owned/seed node — walked once at the very start of
+//     discoverWith's BFS — had to wait for the ENTIRE unbounded walk to
+//     finish before being revisited, defeating
+//     DiscoveryIntervalPoolOwned's intended cadence. See DiscoverOwned's
+//     doc comment for the full rationale.
 //
-// All four goroutines share Storage and the NodeClients, and all
-// observe ctx cancellation independently. Run blocks until all four have
+// All five goroutines share Storage and the NodeClients, and all
+// observe ctx cancellation independently. Run blocks until all five have
 // exited (via a sync.WaitGroup) and returns nil on clean shutdown.
 //
-// Discover() only ever touches Storage and the NodeClients — never
-// c.nextPoll — so running it concurrently with the poll loops introduces
-// no new data race. c.nextPoll access is already guarded by c.mu, which
-// is generic over address keys and thus safe for concurrent due/
-// setNextPoll access from all three poll loops simultaneously —
-// PollConfirmed, PollUnconfirmed, and PollNeverContacted only ever touch
-// disjoint address keys (a node belongs to exactly one of the three
-// categories at any given time — see PollNeverContacted's doc comment),
-// but the mutex makes this safe even so.
+// Discover() and DiscoverOwned() only ever touch Storage and the
+// NodeClients — never c.nextPoll — so running them concurrently with the
+// poll loops introduces no new data race. c.nextPoll access is already
+// guarded by c.mu, which is generic over address keys and thus safe for
+// concurrent due/setNextPoll access from all three poll loops
+// simultaneously — PollConfirmed, PollUnconfirmed, and
+// PollNeverContacted only ever touch disjoint address keys (a node
+// belongs to exactly one of the three categories at any given time —
+// see PollNeverContacted's doc comment), but the mutex makes this safe
+// even so. c.nextDiscovery is shared between Discover and DiscoverOwned
+// (both key it identically via discoveryCooldownKey) and is likewise
+// guarded by c.mu — a shared owned/seed address being discovery-walked
+// concurrently by both loops is a race on WHICH of the two happens to
+// perform that particular dial, never a data race, and either outcome
+// is a correct, complete discovery-walk of that address.
 func (c *Collector) Run(ctx context.Context) error {
 	tick := c.TickInterval
 	if tick <= 0 {
@@ -379,8 +463,13 @@ func (c *Collector) Run(ctx context.Context) error {
 		neverContactedTick = defaultNeverContactedTickInterval
 	}
 
+	ownedDiscoveryTick := c.OwnedDiscoveryTickInterval
+	if ownedDiscoveryTick <= 0 {
+		ownedDiscoveryTick = DiscoveryIntervalPoolOwned
+	}
+
 	var wg sync.WaitGroup
-	wg.Add(4)
+	wg.Add(5)
 
 	go func() {
 		defer wg.Done()
@@ -400,6 +489,11 @@ func (c *Collector) Run(ctx context.Context) error {
 	go func() {
 		defer wg.Done()
 		c.runNeverContactedPollLoop(ctx, neverContactedTick)
+	}()
+
+	go func() {
+		defer wg.Done()
+		c.runOwnedDiscoverLoop(ctx, ownedDiscoveryTick)
 	}()
 
 	wg.Wait()
@@ -515,6 +609,35 @@ func (c *Collector) runNeverContactedPollLoop(ctx context.Context, tick time.Dur
 	}
 }
 
+// runOwnedDiscoverLoop runs DiscoverOwned once immediately, then on
+// every tick, until ctx is cancelled. It runs entirely independently of
+// runDiscoverLoop, runPollLoop, runUnconfirmedPollLoop, and
+// runNeverContactedPollLoop, on its own ticker (see Run's
+// ownedDiscoveryTick) — this is the loop that actually guarantees
+// DiscoveryIntervalPoolOwned's intended cadence for Config.SeedNodes and
+// every pool-owned node, regardless of how long the general-population
+// discoverWith BFS (run by runDiscoverLoop) takes. See DiscoverOwned's
+// doc comment for the full starvation-bug rationale.
+func (c *Collector) runOwnedDiscoverLoop(ctx context.Context, tick time.Duration) {
+	ticker := time.NewTicker(tick)
+	defer ticker.Stop()
+
+	if err := c.DiscoverOwned(ctx); err != nil {
+		log.Printf("collector: owned discovery pass error: %v", err)
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := c.DiscoverOwned(ctx); err != nil {
+				log.Printf("collector: owned discovery pass error: %v", err)
+			}
+		}
+	}
+}
+
 // Discover walks the peer graph starting from Config.SeedNodes, deduping
 // visited addresses per transport, and records discovered nodes and edges
 // in Storage. GRPCClient and P2PClient (if non-nil) are each walked as a
@@ -579,12 +702,36 @@ func (c *Collector) Discover(ctx context.Context) error {
 // would be an easy mistake (the data is right there!) but would let a
 // single misbehaving/malicious peer plant an arbitrary pubkey-to-address
 // binding into storage without ever being probed itself.
+//
+// The walk is bounded by DiscoveryPassDeadline: ctx is wrapped in its
+// own context.WithTimeout derived from the ctx passed in (so an outer
+// cancellation still propagates immediately — it is never lost), and
+// the loop checks ctx.Done() on every iteration, logging (at INFO-ish
+// level, not as an error — running out of pass budget on a
+// large/slow-to-respond graph is an expected, normal outcome, not a
+// bug) and returning cleanly if the deadline is hit before the queue
+// drains. See DiscoveryPassDeadline's doc comment for why this exists:
+// without it, an unbounded BFS over a large peer graph could run for
+// hours, silently delaying every node still queued — historically
+// including owned/seed nodes, which is why they now also get their own
+// independent DiscoverOwned loop rather than relying on this deadline
+// alone to get revisited promptly.
 func (c *Collector) discoverWith(ctx context.Context, client NodeClient, transportLabel string) {
+	ctx, cancel := context.WithTimeout(ctx, DiscoveryPassDeadline)
+	defer cancel()
+
 	visited := make(map[string]bool)
 	queue := append([]string{}, c.cfg.SeedNodes...)
 	now := time.Now()
 
 	for len(queue) > 0 {
+		select {
+		case <-ctx.Done():
+			log.Printf("collector: [%s] discovery pass cut short by DiscoveryPassDeadline with %d node(s) still queued", transportLabel, len(queue))
+			return
+		default:
+		}
+
 		addr := queue[0]
 		queue = queue[1:]
 		if visited[addr] {
@@ -592,42 +739,8 @@ func (c *Collector) discoverWith(ctx context.Context, client NodeClient, transpo
 		}
 		visited[addr] = true
 
-		fromNode, err := c.Storage.UpsertDiscoveredNode(ctx, addr, storage.DiscoverySourceP2P, nil, nil)
-		if err != nil {
-			log.Printf("collector: [%s] upsert node %s: %v", transportLabel, addr, err)
-			continue
-		}
-
-		cooldownKey := discoveryCooldownKey(transportLabel, addr)
-		if !c.dueForDiscovery(cooldownKey, now) {
-			continue
-		}
-
-		if jitter := c.dialJitter(); jitter > 0 {
-			time.Sleep(jitter)
-		}
-
-		peers, err := client.GetPeers(ctx, addr)
-		if err != nil {
-			log.Printf("collector: [%s] get peers for %s: %v", transportLabel, addr, err)
-			continue
-		}
-		c.setNextDiscovery(cooldownKey, now.Add(c.discoveryInterval(fromNode)))
-
+		peers := c.walkNodePeers(ctx, client, transportLabel, addr, now)
 		for _, peer := range peers {
-			// See this method's doc comment: peer.PublicKey is
-			// intentionally not passed through to storage here — only
-			// address-based discovery is recorded from a peer-walk hop.
-			toNode, err := c.Storage.UpsertDiscoveredNode(ctx, peer.Address, storage.DiscoverySourceP2P, nil, nil)
-			if err != nil {
-				log.Printf("collector: [%s] upsert node %s: %v", transportLabel, peer.Address, err)
-				continue
-			}
-
-			if err := c.Storage.RecordPeerEdgeObservation(ctx, fromNode.ID, toNode.ID); err != nil {
-				log.Printf("collector: [%s] record edge observation %s -> %s: %v", transportLabel, addr, peer.Address, err)
-			}
-
 			if !visited[peer.Address] {
 				queue = append(queue, peer.Address)
 			}
@@ -635,11 +748,184 @@ func (c *Collector) discoverWith(ctx context.Context, client NodeClient, transpo
 	}
 }
 
+// walkNodePeers performs the actual discovery-walk work for a single
+// addr: it upserts addr into Storage, and — gated by the same per-
+// transport discovery cooldown (dueForDiscovery/setNextDiscovery) as
+// always — calls client.GetPeers and records every reported peer as a
+// discovered node plus a peer-edge observation from addr to it, exactly
+// mirroring discoverWith's original inline per-node logic (including
+// the doc-comment-documented rule that peer-reported pubkeys are never
+// passed to UpsertDiscoveredNode/never trigger UpsertConfirmedNode —
+// see discoverWith's doc comment above for the full rationale, which
+// this helper does not repeat).
+//
+// It is shared by discoverWith's multi-hop BFS (which uses the returned
+// peers to keep enqueuing/walking outward) and DiscoverOwned's flat,
+// single-level fan-out (which deliberately ignores the returned peers —
+// see DiscoverOwned's doc comment for why it only cares about addr's
+// own peer list being fresh, not further traversal from it). now is
+// passed in (rather than called fresh here) so that every node
+// processed within the same discoverWith/discoverOwnedWith pass shares
+// one consistent timestamp for discoveryInterval's cooldown math, as
+// before this extraction.
+func (c *Collector) walkNodePeers(ctx context.Context, client NodeClient, transportLabel, addr string, now time.Time) []DiscoveredPeer {
+	fromNode, err := c.Storage.UpsertDiscoveredNode(ctx, addr, storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		log.Printf("collector: [%s] upsert node %s: %v", transportLabel, addr, err)
+		return nil
+	}
+
+	cooldownKey := discoveryCooldownKey(transportLabel, addr)
+	if !c.dueForDiscovery(cooldownKey, now) {
+		return nil
+	}
+
+	if jitter := c.dialJitter(); jitter > 0 {
+		time.Sleep(jitter)
+	}
+
+	peers, err := client.GetPeers(ctx, addr)
+	if err != nil {
+		log.Printf("collector: [%s] get peers for %s: %v", transportLabel, addr, err)
+		return nil
+	}
+	c.setNextDiscovery(cooldownKey, now.Add(c.discoveryInterval(fromNode)))
+
+	for _, peer := range peers {
+		// See discoverWith's doc comment: peer.PublicKey is
+		// intentionally not passed through to storage here — only
+		// address-based discovery is recorded from a peer-walk hop.
+		toNode, err := c.Storage.UpsertDiscoveredNode(ctx, peer.Address, storage.DiscoverySourceP2P, nil, nil)
+		if err != nil {
+			log.Printf("collector: [%s] upsert node %s: %v", transportLabel, peer.Address, err)
+			continue
+		}
+
+		if err := c.Storage.RecordPeerEdgeObservation(ctx, fromNode.ID, toNode.ID); err != nil {
+			log.Printf("collector: [%s] record edge observation %s -> %s: %v", transportLabel, addr, peer.Address, err)
+		}
+	}
+
+	return peers
+}
+
 // discoveryCooldownKey builds the nextDiscovery map key for a given
 // transport+address pair. See discoverWith's doc comment for why this is
 // scoped per-transport rather than just per-address.
 func discoveryCooldownKey(transportLabel, addr string) string {
 	return transportLabel + ":" + addr
+}
+
+// DiscoverOwned walks ONLY Config.SeedNodes plus every node in Storage
+// tagged pool-owned (per isPoolOwned's exact predicate — see
+// storage.NodeFilter.Owned's doc comment for how this is expressed as a
+// SQL/JSONB clause), fanning out CONCURRENTLY across a small bounded
+// worker pool (see ownedDiscoveryWorkers) rather than walking a queue
+// one hop at a time like discoverWith's general-population BFS.
+//
+// This exists to fix a specific starvation bug: discoverWith's BFS
+// visits Config.SeedNodes (and thus any pool-owned node reachable from
+// them) exactly once, right at the start of its walk, and then — since
+// it's a single synchronous, unbounded `for len(queue) > 0` loop over
+// the ENTIRE peer graph — cannot revisit them again until the whole
+// walk finishes, which in production can take hours (see
+// DiscoveryPassDeadline's doc comment for the complementary fix on the
+// general-population side). This defeats DiscoveryIntervalPoolOwned's
+// intended ~30-minute cadence for exactly the nodes production cares
+// most about having fresh topology data for.
+//
+// Unlike discoverWith, this is deliberately a FLAT, single-level
+// fan-out, not a multi-hop queue: DiscoverOwned only cares about
+// Config.SeedNodes'/owned nodes' own direct peer lists being fresh, not
+// deep graph traversal from them (that's still discoverWith's job, on
+// its own independent cadence). Each worker still goes through the same
+// walkNodePeers helper discoverWith uses — same upsert/edge-recording
+// semantics, same per-transport discovery cooldown
+// (dueForDiscovery/setNextDiscovery) gating the actual GetPeers call,
+// same peer-reported-pubkeys-never-confirmed rule — just without
+// enqueuing the returned peers for further traversal.
+//
+// GRPCClient and P2PClient (if non-nil) are each walked as a separate,
+// independent pass over the same deduped address set, exactly mirroring
+// Discover's structure.
+func (c *Collector) DiscoverOwned(ctx context.Context) error {
+	if c.Storage == nil {
+		return errors.New("collector: Storage is not configured")
+	}
+
+	if c.GRPCClient != nil {
+		if err := c.discoverOwnedWith(ctx, c.GRPCClient, "grpc"); err != nil {
+			return err
+		}
+	}
+	if c.P2PClient != nil {
+		if err := c.discoverOwnedWith(ctx, c.P2PClient, "p2p"); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// discoverOwnedWith fans out walkNodePeers calls, bounded to at most
+// ownedDiscoveryWorkers concurrent in-flight GetPeers calls via an
+// errgroup.Group with SetLimit — mirroring poll()'s existing
+// maxPollWorkers pattern exactly, just with a much smaller pool sized
+// for a much smaller (owned/seed-only) node set. Every worker always
+// returns nil (errors are logged inline by walkNodePeers itself,
+// exactly as discoverWith does), so g.Wait()'s return value can never
+// itself report an error — it is returned anyway for symmetry with
+// ownedAddresses' error return, not because it can be non-nil today.
+func (c *Collector) discoverOwnedWith(ctx context.Context, client NodeClient, transportLabel string) error {
+	addrs, err := c.ownedAddresses(ctx)
+	if err != nil {
+		return err
+	}
+
+	now := time.Now()
+	var g errgroup.Group
+	g.SetLimit(ownedDiscoveryWorkers)
+
+	for _, addr := range addrs {
+		addr := addr
+		g.Go(func() error {
+			c.walkNodePeers(ctx, client, transportLabel, addr, now)
+			return nil
+		})
+	}
+	return g.Wait()
+}
+
+// ownedAddresses returns the deduped set of addresses DiscoverOwned
+// should walk: every address in Config.SeedNodes, plus the address of
+// every node in Storage for which isPoolOwned reports true (queried via
+// storage.NodeFilter.Owned, which expresses the identical predicate as
+// a SQL/JSONB clause — see its doc comment). Deduping here ensures a
+// seed node that is ALSO tagged pool-owned isn't walked twice in the
+// same DiscoverOwned pass.
+func (c *Collector) ownedAddresses(ctx context.Context) ([]string, error) {
+	seen := make(map[string]bool)
+	addrs := make([]string, 0, len(c.cfg.SeedNodes))
+	for _, addr := range c.cfg.SeedNodes {
+		if !seen[addr] {
+			seen[addr] = true
+			addrs = append(addrs, addr)
+		}
+	}
+
+	owned := true
+	nodes, err := c.Storage.ListNodes(ctx, storage.NodeFilter{Owned: &owned})
+	if err != nil {
+		return nil, fmt.Errorf("collector: list owned nodes: %w", err)
+	}
+	for _, n := range nodes {
+		if !seen[n.Address] {
+			seen[n.Address] = true
+			addrs = append(addrs, n.Address)
+		}
+	}
+
+	return addrs, nil
 }
 
 // PollConfirmed checks all known confirmed nodes (Node.PublicKey != nil)

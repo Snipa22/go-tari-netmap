@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1070,15 +1071,21 @@ func TestRunRespectsContextCancellation(t *testing.T) {
 // assert Poll produced data *before* the slow Discover call unblocked —
 // i.e. that Poll genuinely wasn't waiting on it.
 type slowPeersFastInfoClient struct {
-	unblock      chan struct{}
-	peersCalled  chan struct{}
-	getPeersDone atomic.Bool
+	unblock         chan struct{}
+	peersCalled     chan struct{}
+	peersCalledOnce sync.Once
+	getPeersDone    atomic.Bool
 
 	info map[string]NodeInfo
 }
 
+// GetPeers may now legitimately be called concurrently by more than one
+// caller (the general Discover loop AND the independent DiscoverOwned
+// loop both walk Config.SeedNodes — see DiscoverOwned's doc comment),
+// so peersCalled is only ever closed once, via sync.Once, rather than
+// panicking on a second close.
 func (s *slowPeersFastInfoClient) GetPeers(ctx context.Context, addr string) ([]DiscoveredPeer, error) {
-	close(s.peersCalled)
+	s.peersCalledOnce.Do(func() { close(s.peersCalled) })
 	defer s.getPeersDone.Store(true)
 	select {
 	case <-s.unblock:
@@ -1810,7 +1817,6 @@ func TestPollNeverContactedNotStarvedBySlowUnconfirmedPoll(t *testing.T) {
 	if !history[0].Reachable {
 		t.Errorf("expected reachable = true")
 	}
-
 	// Cancel ctx so all loops exit -- the hung GetInfo call observes
 	// ctx.Done() and returns rather than staying hung forever -- and
 	// confirm Run actually returns promptly and without error.
@@ -1823,5 +1829,265 @@ func TestPollNeverContactedNotStarvedBySlowUnconfirmedPoll(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not return after ctx cancellation")
+	}
+}
+
+// slowAddrPeersClient is a NodeClient fixture whose GetPeers blocks
+// (until unblock is closed or ctx is cancelled) ONLY for one configured
+// address (slowAddr), returning immediately -- from an in-memory
+// fixture -- for every other address. This lets a test simulate the
+// general-population BFS hanging on one particular node while a
+// SEPARATE owned/seed node's own GetPeers call stays fast, mirroring
+// slowInfoClient's per-address-slow pattern but for GetPeers instead of
+// GetInfo. slowCalled/slowCalledOnce/slowDone mirror
+// slowPeersFastInfoClient/slowInfoClient's own synchronization fields
+// exactly.
+type slowAddrPeersClient struct {
+	slowAddr string
+	unblock  chan struct{}
+
+	slowCalled     chan struct{}
+	slowCalledOnce sync.Once
+	slowDone       atomic.Bool
+
+	peers map[string][]string
+}
+
+func (s *slowAddrPeersClient) GetPeers(ctx context.Context, addr string) ([]DiscoveredPeer, error) {
+	if addr == s.slowAddr {
+		s.slowCalledOnce.Do(func() { close(s.slowCalled) })
+		defer s.slowDone.Store(true)
+		select {
+		case <-s.unblock:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	addrs := s.peers[addr]
+	peers := make([]DiscoveredPeer, len(addrs))
+	for i, a := range addrs {
+		peers[i] = DiscoveredPeer{Address: a}
+	}
+	return peers, nil
+}
+
+func (s *slowAddrPeersClient) GetInfo(ctx context.Context, addr string) (NodeInfo, error) {
+	return NodeInfo{Reachable: true}, nil
+}
+
+// TestDiscoverOwnedIndependentOfSlowGeneralDiscovery is the core
+// regression/proof test for DiscoverOwned's whole reason for existing
+// (see its doc comment): the general-population discoverWith BFS
+// hanging on some non-owned, non-seed node must NOT delay or starve the
+// independent owned-discovery loop's walk of a SEPARATE owned node.
+//
+// Config.SeedNodes is set to a single address ("hang:1") whose GetPeers
+// call hangs -- this is deliberately the SEED itself (not a node
+// reached via a second hop), so that the general BFS's very first dial
+// is guaranteed to be the hang, with no race against whichever loop
+// happens to reach it first: both runDiscoverLoop's general pass and
+// runOwnedDiscoverLoop's pass (which also always walks Config.SeedNodes
+// -- see DiscoverOwned's doc comment) will each independently call
+// GetPeers("hang:1") and each independently block, in their own
+// goroutines, since dueForDiscovery's cooldown for that address is
+// never set while the call is hung (setNextDiscovery only runs AFTER
+// GetPeers returns) -- so this can never flakily skip the hang in
+// either loop.
+//
+// A separate node ("owned:1") is pre-tagged pool-owned (non-empty owner
+// tag) and is NOT reachable from "hang:1"'s (nonexistent, since it
+// never returns) peer list, so the general BFS never reaches it at all.
+// The owned-discovery loop, via its own small bounded worker pool (see
+// ownedDiscoveryWorkers), walks "owned:1" concurrently with -- and
+// genuinely independently of -- its own stuck "hang:1" worker, and
+// records "owned:1"'s reported peer ("owned-peer:1") into storage well
+// within a bounded deadline, while the hang is still (verifiably) in
+// flight.
+func TestDiscoverOwnedIndependentOfSlowGeneralDiscovery(t *testing.T) {
+	store := newTestStore(t)
+	seedCtx := context.Background()
+
+	client := &slowAddrPeersClient{
+		slowAddr:   "hang:1",
+		unblock:    make(chan struct{}),
+		slowCalled: make(chan struct{}),
+		peers: map[string][]string{
+			"owned:1": {"owned-peer:1"},
+		},
+	}
+	// Ensures both stuck GetPeers("hang:1") calls (general AND owned
+	// loop) actually unblock/exit at the end of the test, even on
+	// failure, rather than leaking goroutines blocked forever on a
+	// channel nothing else will ever close.
+	t.Cleanup(func() { close(client.unblock) })
+
+	if _, err := store.UpsertDiscoveredNode(seedCtx, "owned:1", storage.DiscoverySourceP2P, map[string]any{"owner": "pool-ops"}, nil); err != nil {
+		t.Fatalf("seed owned node: %v", err)
+	}
+
+	c := New(Config{SeedNodes: []string{"hang:1"}})
+	c.Storage = store
+	c.GRPCClient = client
+	c.TickInterval = 20 * time.Millisecond
+	c.OwnedDiscoveryTickInterval = 20 * time.Millisecond
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- c.Run(runCtx) }()
+
+	// Wait for GetPeers("hang:1") to actually be reached (and hang), so
+	// we know the general BFS (and/or the owned loop's own walk of the
+	// same seed address) is genuinely in flight for the rest of the
+	// test rather than, say, not having started yet.
+	select {
+	case <-client.slowCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("GetPeers(hang:1) was never called")
+	}
+
+	// The owned-discovery loop ticks independently of the hung general
+	// BFS; poll storage for owned:1's reported peer to show up within a
+	// deadline that comfortably exceeds several tick intervals.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		nodes, err := store.ListNodes(seedCtx, storage.NodeFilter{})
+		if err != nil {
+			t.Fatalf("list nodes: %v", err)
+		}
+		found := false
+		for _, n := range nodes {
+			if n.Address == "owned-peer:1" {
+				found = true
+				break
+			}
+		}
+		if found {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("owned-peer:1 was never discovered while GetPeers(hang:1) was still hung -- the owned-discovery loop appears starved by the general BFS")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// The whole point: confirm the hung GetPeers(hang:1) call genuinely
+	// had not returned yet when owned-peer:1 showed up above. If this
+	// were false, the test above wouldn't actually be proving
+	// independence -- it'd just mean the hang happened to resolve fast.
+	if client.slowDone.Load() {
+		t.Fatal("GetPeers(hang:1) had already returned by the time owned-peer:1 was discovered -- test doesn't prove independence")
+	}
+
+	// Cancel ctx so every loop exits -- the hung GetPeers calls observe
+	// ctx.Done() and return rather than staying hung forever -- and
+	// confirm Run actually returns promptly and without error.
+	cancel()
+
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Errorf("Run returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after ctx cancellation")
+	}
+}
+
+// wideBranchingClient is a NodeClient fixture whose GetPeers generates
+// an artificially large reachable graph: every address gets `branching`
+// children (addr + "/0", addr + "/1", ...) up to maxDepth hops from the
+// root, and every call sleeps for `delay` first. This lets a test
+// construct a discoverWith BFS queue that is provably impossible to
+// fully drain within a short deadline (branching^maxDepth nodes, each
+// costing at least `delay` sequentially, since discoverWith's BFS is
+// single-threaded/non-concurrent) without relying on hard-to-reproduce
+// real-network timing or an indefinite hang.
+type wideBranchingClient struct {
+	branching int
+	maxDepth  int
+	delay     time.Duration
+}
+
+func (w *wideBranchingClient) GetPeers(ctx context.Context, addr string) ([]DiscoveredPeer, error) {
+	if w.delay > 0 {
+		select {
+		case <-time.After(w.delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	if strings.Count(addr, "/") >= w.maxDepth {
+		return nil, nil
+	}
+	peers := make([]DiscoveredPeer, w.branching)
+	for i := 0; i < w.branching; i++ {
+		peers[i] = DiscoveredPeer{Address: fmt.Sprintf("%s/%d", addr, i)}
+	}
+	return peers, nil
+}
+
+func (w *wideBranchingClient) GetInfo(ctx context.Context, addr string) (NodeInfo, error) {
+	return NodeInfo{Reachable: true}, nil
+}
+
+// TestDiscoverWithRespectsContextDeadline is the core regression/proof
+// test for Fix part (b) of the discovery-starvation fix: discoverWith's
+// BFS must stop cleanly, without hanging or erroring, once its ctx is
+// exceeded mid-walk -- and must genuinely leave nodes unwalked, proving
+// the deadline actually cut the pass short rather than the graph simply
+// being small enough to finish anyway.
+//
+// discoverWith derives its own internal DiscoveryPassDeadline-based
+// sub-context from whatever ctx is passed in (see its doc comment), and
+// context.WithTimeout always takes the EARLIER of the parent's deadline
+// and its own new one -- so passing Discover(ctx) a ctx with a much
+// shorter deadline than DiscoveryPassDeadline (4 minutes) exercises the
+// exact same ctx.Done() short-circuit path a real DiscoveryPassDeadline
+// expiry would, without needing to wait 4 minutes or mutate the
+// production constant. wideBranchingClient's graph (branching=4,
+// maxDepth=6, 5461 nodes total if fully drained) combined with a 5ms
+// per-call delay and a 200ms deadline makes full drainage take upwards
+// of 27 seconds sequentially -- so the graph cannot possibly finish
+// within 200ms, comfortably proving the cutoff is doing real work.
+func TestDiscoverWithRespectsContextDeadline(t *testing.T) {
+	store := newTestStore(t)
+
+	client := &wideBranchingClient{branching: 4, maxDepth: 6, delay: 5 * time.Millisecond}
+
+	c := New(Config{SeedNodes: []string{"root"}})
+	c.Storage = store
+	c.GRPCClient = client
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	// Discover's own return value must stay nil -- the deadline being
+	// hit mid-walk is logged, not surfaced as an error.
+	if err := c.Discover(ctx); err != nil {
+		t.Fatalf("discover: %v", err)
+	}
+
+	// Total reachable nodes if the BFS were to fully drain: sum of
+	// branching^depth for depth in [0, maxDepth].
+	total := 0
+	n := 1
+	for d := 0; d <= client.maxDepth; d++ {
+		total += n
+		n *= client.branching
+	}
+
+	nodes, err := store.ListNodes(context.Background(), storage.NodeFilter{})
+	if err != nil {
+		t.Fatalf("list nodes: %v", err)
+	}
+	if len(nodes) == 0 {
+		t.Fatal("expected at least the root node to have been upserted before the deadline hit")
+	}
+	if len(nodes) >= total {
+		t.Fatalf("len(nodes) = %d, want < %d (the full graph) -- the context deadline should have cut the walk short before it could fully drain", len(nodes), total)
 	}
 }

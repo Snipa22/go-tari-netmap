@@ -138,6 +138,21 @@ type NodeFilter struct {
 	// population, so no node is ever double-polled or skipped by both
 	// loops.
 	HasHealthChecks *bool
+
+	// Owned, if non-nil, restricts results by the exact same
+	// pool-owned predicate as collector.isPoolOwned (see
+	// internal/collector/collector.go): true means "tags contains
+	// pool_owned: true (a JSON boolean, not a truthy string) OR a
+	// non-empty owner string", false means neither. A nil Owned (the
+	// zero value) means "no filtering", following the same convention
+	// as Confirmed/HasHealthChecks above — a zero-value NodeFilter{}
+	// must remain completely unaffected by this field's mere
+	// existence. This backs the collector's independent owned/seed
+	// discovery loop (see collector.DiscoverOwned), which needs to
+	// find the (typically tiny) owned-node population without a full
+	// unfiltered ListNodes scan over the entire node table on every
+	// tick.
+	Owned *bool
 }
 
 // TopologyFilter filters/caps the result of ListTopology. A zero-value

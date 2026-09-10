@@ -351,6 +351,106 @@ func TestListNodesHasHealthChecksFilter(t *testing.T) {
 	}
 }
 
+// TestListNodesOwnedFilter exercises NodeFilter.Owned: a true value
+// restricts results to nodes tagged pool-owned by the exact same
+// predicate as collector.isPoolOwned (see internal/collector/
+// collector.go's doc comment on that function) -- tags["pool_owned"]
+// being the JSON boolean true (never a truthy string, never false), OR
+// tags["owner"] being a non-empty JSON string (never merely a non-empty
+// non-string value) -- and a nil value (the zero-value default) applies
+// no filtering at all, mirroring the same "nil means unset" convention
+// as Confirmed/HasHealthChecks above. This backs the collector's
+// independent owned/seed discovery loop (see collector.DiscoverOwned).
+//
+// Storage cannot import the collector package to call isPoolOwned
+// directly (collector depends on storage, not the reverse -- see this
+// repo's AGENTS.md), so this test instead seeds every case from
+// isPoolOwned's own doc comment/decision table (true-bool, non-empty
+// owner string, empty-string owner, non-bool "true" string, explicit
+// false, and no tags at all) and asserts ListNodes(Owned) partitions
+// them exactly the way that decision table says isPoolOwned would.
+func TestListNodesOwnedFilter(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	ownedByFlag, err := store.UpsertDiscoveredNode(ctx, "owned-flag:1", DiscoverySourceP2P, map[string]any{"pool_owned": true}, nil)
+	if err != nil {
+		t.Fatalf("upsert owned-flag: %v", err)
+	}
+	ownedByOwner, err := store.UpsertDiscoveredNode(ctx, "owned-owner:1", DiscoverySourceP2P, map[string]any{"owner": "Jagtech"}, nil)
+	if err != nil {
+		t.Fatalf("upsert owned-owner: %v", err)
+	}
+	// Empty-string owner does NOT count as owned -- mirrors
+	// isPoolOwned's doc comment exactly ("an empty-string owner tag
+	// does NOT count").
+	emptyOwner, err := store.UpsertDiscoveredNode(ctx, "empty-owner:1", DiscoverySourceP2P, map[string]any{"owner": ""}, nil)
+	if err != nil {
+		t.Fatalf("upsert empty-owner: %v", err)
+	}
+	// pool_owned as a non-boolean JSON string "true" does NOT count --
+	// isPoolOwned only ever type-asserts to bool, never parses strings.
+	stringPoolOwned, err := store.UpsertDiscoveredNode(ctx, "string-pool-owned:1", DiscoverySourceP2P, map[string]any{"pool_owned": "true"}, nil)
+	if err != nil {
+		t.Fatalf("upsert string-pool-owned: %v", err)
+	}
+	// pool_owned explicitly false does NOT count.
+	poolOwnedFalse, err := store.UpsertDiscoveredNode(ctx, "pool-owned-false:1", DiscoverySourceP2P, map[string]any{"pool_owned": false}, nil)
+	if err != nil {
+		t.Fatalf("upsert pool-owned-false: %v", err)
+	}
+	plain, err := store.UpsertDiscoveredNode(ctx, "plain:1", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert plain: %v", err)
+	}
+
+	yes := true
+	owned, err := store.ListNodes(ctx, NodeFilter{Owned: &yes})
+	if err != nil {
+		t.Fatalf("list Owned=true: %v", err)
+	}
+	gotOwned := make(map[uuid.UUID]bool)
+	for _, n := range owned {
+		gotOwned[n.ID] = true
+	}
+	if len(owned) != 2 || !gotOwned[ownedByFlag.ID] || !gotOwned[ownedByOwner.ID] {
+		t.Fatalf("Owned=true filter = %+v, want just %s and %s", owned, ownedByFlag.Address, ownedByOwner.Address)
+	}
+
+	no := false
+	unowned, err := store.ListNodes(ctx, NodeFilter{Owned: &no})
+	if err != nil {
+		t.Fatalf("list Owned=false: %v", err)
+	}
+	gotUnowned := make(map[uuid.UUID]bool)
+	for _, n := range unowned {
+		gotUnowned[n.ID] = true
+	}
+	wantUnowned := []Node{emptyOwner, stringPoolOwned, poolOwnedFalse, plain}
+	if len(unowned) != len(wantUnowned) {
+		t.Fatalf("len(unowned) = %d, want %d (empty-owner, string-pool-owned, pool-owned-false, plain)", len(unowned), len(wantUnowned))
+	}
+	for _, n := range wantUnowned {
+		if !gotUnowned[n.ID] {
+			t.Errorf("Owned=false filter missing expected unowned node %s", n.Address)
+		}
+	}
+	if gotUnowned[ownedByFlag.ID] || gotUnowned[ownedByOwner.ID] {
+		t.Errorf("Owned=false filter unexpectedly included an owned node")
+	}
+
+	// Critical invariant: a zero-value filter (Owned left nil) must
+	// return everything, completely unaffected by the new field's mere
+	// existence.
+	all, err := store.ListNodes(ctx, NodeFilter{})
+	if err != nil {
+		t.Fatalf("list all (zero-value filter): %v", err)
+	}
+	if len(all) != 6 {
+		t.Fatalf("len(all) = %d, want 6 (zero-value NodeFilter{} must be unaffected by Owned)", len(all))
+	}
+}
+
 // TestListNodesPagination verifies that NodeFilter.Limit/Offset apply
 // real SQL-level pagination (a correct page, in the same address-sorted
 // order ListNodes always uses), and that a zero-value filter still
