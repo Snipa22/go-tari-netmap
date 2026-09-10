@@ -431,29 +431,21 @@ func buildNodeTableData(ctx context.Context, store storage.Store, reachableSince
 		return counts, nil, pagination, err
 	}
 
-	for _, n := range allNodes {
-		counts.Total++
-		switch n.DiscoverySource {
-		case storage.DiscoverySourceP2P:
-			counts.P2P++
-		case storage.DiscoverySourceRegistry:
-			counts.Registry++
-		case storage.DiscoverySourceBoth:
-			counts.Both++
-		}
+	// Shared with the JSON GET /api/stats endpoint (internal/api's
+	// ComputeNodeCounts) rather than reimplementing this
+	// counts-by-discovery-source/confirmation/capability loop here —
+	// see its doc comment.
+	nc := api.ComputeNodeCounts(allNodes, addrsByNode)
+	counts = dashboardCounts{
+		Total:    nc.Total,
+		P2P:      nc.P2P,
+		Registry: nc.Registry,
+		Both:     nc.Both,
 
-		view := scrubForDisplay(n, addrsByNode[n.ID])
-		if view.Identity.Confirmed {
-			counts.Confirmed++
-		} else {
-			counts.Unconfirmed++
-		}
-		if view.Capabilities.HasOnion {
-			counts.OnionCapable++
-		}
-		if (view.Capabilities.HasIPv4 || view.Capabilities.HasIPv6) && !view.Capabilities.HasOnion {
-			counts.ClearnetOnly++
-		}
+		Confirmed:    nc.Confirmed,
+		Unconfirmed:  nc.Unconfirmed,
+		OnionCapable: nc.OnionCapable,
+		ClearnetOnly: nc.ClearnetOnly,
 	}
 
 	// Paginated: the actual SQL-level LIMIT/OFFSET query backing the

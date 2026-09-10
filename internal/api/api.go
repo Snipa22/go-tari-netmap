@@ -75,6 +75,11 @@ func NewRouter(store storage.Store, grpcClient, p2pClient collector.NodeClient, 
 	mux.HandleFunc("GET /topology", handleTopology(store))
 	mux.HandleFunc("GET /topology/top-peered", handleTopPeeredNodes(store))
 
+	// Whole-population node counts + network-height snapshot (see
+	// internal/api/stats.go). Same trust level as the other read
+	// routes above — deliberately NOT under /admin.
+	mux.HandleFunc("GET /stats", handleStats(store))
+
 	// Seed-node suggestion + Tari config.toml peer_seeds generator. Same
 	// trust level as the other read routes above (GET /nodes, GET
 	// /topology) — deliberately NOT under /admin. These are opted-in,
