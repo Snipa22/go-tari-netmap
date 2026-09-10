@@ -12,6 +12,7 @@ import (
 	"github.com/Snipa22/go-tari-lib/p2p"
 	pb "github.com/Snipa22/go-tari-lib/p2p/proto"
 
+	"github.com/Snipa22/go-tari-netmap/internal/api"
 	"github.com/Snipa22/go-tari-netmap/internal/collector"
 	"github.com/Snipa22/go-tari-netmap/internal/storage"
 )
@@ -71,18 +72,27 @@ type dbBackedResponder struct {
 // The only addresses ever recorded are genuinely self-claimed ones: every entry in
 // identity.Addresses, decoded from its raw rust-multiaddr binary encoding via
 // collector.ParsePeerAddress (the exact same decoder already proven against gRPC/P2P GetPeers
-// claims elsewhere in this repo — see grpc_client.go's parsePeerAddress).
+// claims elsewhere in this repo — see grpc_client.go's parsePeerAddress), and then validated by
+// isClaimedAddressAllowed to reject private/loopback/link-local/multicast/unspecified clearnet
+// IPs — a peer's own self-claimed address is no more trustworthy than a public HTTP submission
+// (internal/api/validate.go's validateSubmittedHost applies the exact same rejection to that
+// path, for the exact same reason: this service's own async health-check/probe machinery dials
+// every recorded address, so accepting a private/loopback claim is an SSRF vector). See
+// OPENCODE_BRIEF.md ("reject invalid P2P self-claimed addresses") for the full incident
+// writeup and the confirmed-live garbage (127.0.0.1:*, 192.168.0.120:18189, etc.) this produced.
 //
-//   - If the peer claims at least one address, the first successfully-decoded one is used as
-//     the UpsertConfirmedNode call that ensures the node row exists (case (a)/(b)/(c)/(d) in its
-//     doc comment in internal/storage/storage.go, depending on prior state), and every
-//     subsequent claimed address gets its own UpsertConfirmedNode call (case (b):
+//   - If the peer claims at least one address that survives validation, the first such address
+//     is used in the UpsertConfirmedNode call that ensures the node row exists (case (a)/(b)/
+//     (c)/(d) in its doc comment in internal/storage/storage.go, depending on prior state), and
+//     every subsequent valid claimed address gets its own UpsertConfirmedNode call (case (b):
 //     "known pubkey, new address" is a no-op-beyond-ensuring-the-row, so looping it once per
 //     address is exactly BRIEF3.md's "address-add call once per claimed address", not a
 //     reinvention of its multi-address handling).
-//   - If the peer claims ZERO addresses (e.g. a bare probe/monitoring client), the node row is
-//     still ensured via UpsertConfirmedNodeByPubKey — pubkey identity alone, no address, no
-//     node_addresses row — so RecordHealthCheck below still has a real node.ID to link against.
+//   - If the peer claims ZERO addresses, or every claimed address is rejected by validation
+//     (e.g. a bare probe/monitoring client, or a peer claiming only 127.0.0.1), NO node row,
+//     node_addresses row, or health-check row is created for this identity exchange at all — a
+//     blank/address-less node row is itself an invalid record (per direct instruction from the
+//     project owner), not a lesser evil worth recording anyway.
 //
 // ResponderConfig.OnPeerIdentity's own signature has no context.Context or error return (it's a
 // plain synchronous reporting callback — see its doc comment in go-tari-lib/p2p/responder.go),
@@ -94,7 +104,8 @@ func (r *dbBackedResponder) onPeerIdentity(remoteAddr net.Addr, peerStaticKey []
 	defer cancel()
 
 	// Decode every genuinely self-claimed address up front, deduplicating so a peer that
-	// (redundantly) repeats the same claim twice doesn't issue two identical DB calls.
+	// (redundantly) repeats the same claim twice doesn't issue two identical DB calls, and
+	// rejecting any that fail isClaimedAddressAllowed's private/loopback/reserved-IP check.
 	var claimed []string
 	seen := make(map[string]bool, len(identity.Addresses))
 	for _, raw := range identity.Addresses {
@@ -104,17 +115,27 @@ func (r *dbBackedResponder) onPeerIdentity(remoteAddr net.Addr, peerStaticKey []
 			// "skip rather than emit garbage" convention elsewhere in this repo.
 			continue
 		}
+		if !isClaimedAddressAllowed(addr) {
+			// Skip private/loopback/link-local/multicast/unspecified clearnet claims,
+			// best-effort, same convention as the unparseable-claim skip above — this
+			// must never abort processing of the peer's other claimed addresses.
+			r.logf("netmap-p2p-responder: rejecting private/reserved self-claimed address %q from pubkey=%x", addr, peerStaticKey)
+			continue
+		}
 		seen[addr] = true
 		claimed = append(claimed, addr)
 	}
 
-	var node storage.Node
-	var err error
-	if len(claimed) > 0 {
-		node, err = r.store.UpsertConfirmedNode(ctx, claimed[0], peerStaticKey, storage.DiscoverySourceP2P)
-	} else {
-		node, err = r.store.UpsertConfirmedNodeByPubKey(ctx, peerStaticKey, storage.DiscoverySourceP2P)
+	if len(claimed) == 0 {
+		// No usable/valid claimed addresses (either the peer claimed none at all, or every
+		// claim was rejected above) — a blank-address node row is itself an invalid record
+		// (see this method's doc comment), so skip recording this identity exchange as a
+		// node/health-check row entirely, rather than calling UpsertConfirmedNodeByPubKey.
+		r.logf("netmap-p2p-responder: pubkey=%x claimed no usable addresses, skipping node record", peerStaticKey)
+		return
 	}
+
+	node, err := r.store.UpsertConfirmedNode(ctx, claimed[0], peerStaticKey, storage.DiscoverySourceP2P)
 	if err != nil {
 		r.metrics.dbWriteResult.WithLabelValues(dbOperationUpsertNode, resultLabel(false)).Inc()
 		r.logf("netmap-p2p-responder: UpsertConfirmedNode(pubkey=%x) failed: %v", peerStaticKey, err)
@@ -122,7 +143,11 @@ func (r *dbBackedResponder) onPeerIdentity(remoteAddr net.Addr, peerStaticKey []
 	}
 	r.metrics.dbWriteResult.WithLabelValues(dbOperationUpsertNode, resultLabel(true)).Inc()
 
-	for _, addr := range remainingClaims(claimed) {
+	// claimed is guaranteed non-empty here (the len(claimed) == 0 early-return above), so
+	// claimed[1:] is always safe: every entry after the first (already consumed by the
+	// UpsertConfirmedNode call above that ensures the node row exists) gets its own
+	// UpsertConfirmedNode call.
+	for _, addr := range claimed[1:] {
 		if _, err := r.store.UpsertConfirmedNode(ctx, addr, peerStaticKey, storage.DiscoverySourceP2P); err != nil {
 			r.metrics.dbWriteResult.WithLabelValues(dbOperationUpsertNode, resultLabel(false)).Inc()
 			r.logf("netmap-p2p-responder: UpsertConfirmedNode(%s, self-claimed address) failed: %v", addr, err)
@@ -160,16 +185,34 @@ func (r *dbBackedResponder) onPeerIdentity(remoteAddr net.Addr, peerStaticKey []
 	r.metrics.dbWriteResult.WithLabelValues(dbOperationRecordHealth, resultLabel(true)).Inc()
 }
 
-// remainingClaims returns every element of claimed after the first (the first was already
-// consumed by the UpsertConfirmedNode call above that ensures the node row exists). A plain
-// claimed[1:] would panic when claimed is empty (the zero-claimed-addresses case, where
-// UpsertConfirmedNodeByPubKey was used instead and this loop has nothing left to do) since a
-// low bound of 1 exceeds a zero-length slice's length.
-func remainingClaims(claimed []string) []string {
-	if len(claimed) == 0 {
-		return nil
+// isClaimedAddressAllowed reports whether a peer-self-claimed "host:port" address (as decoded
+// by collector.ParsePeerAddress) is safe to record and later dial by this service's own async
+// health-check/probe machinery. It mirrors internal/api/validate.go's validateSubmittedHost
+// exactly, via the shared api.IsPrivateOrReservedIP predicate: a self-claimed P2P identity
+// address is no more trustworthy than a publicly submitted one, and both are dialed by the same
+// probe machinery, so both get the same SSRF-hardening rejection of private/loopback/
+// link-local/multicast/unspecified IPs.
+//
+// Onion (.onion) addresses are never IPs — net.SplitHostPort followed by net.ParseIP simply
+// fails to produce an IP for them, so they fall through this check unchanged, exactly as
+// validateSubmittedHost's own onion handling does (see validateHostSyntax's onion branch).
+func isClaimedAddressAllowed(hostPort string) bool {
+	host, _, err := net.SplitHostPort(hostPort)
+	if err != nil {
+		// Should not happen — collector.ParsePeerAddress always returns "host:port" — but
+		// fail closed (reject) rather than dial something this function couldn't even
+		// parse into a host.
+		return false
 	}
-	return claimed[1:]
+
+	ip := net.ParseIP(host)
+	if ip == nil {
+		// Not an IP at all (e.g. a .onion host) — nothing for the private/reserved-IP
+		// check to apply to, so it passes unchanged.
+		return true
+	}
+
+	return !api.IsPrivateOrReservedIP(ip)
 }
 
 // peerListProvider implements ResponderConfig.PeerListProvider: it serves REAL confirmed-good

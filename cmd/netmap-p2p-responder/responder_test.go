@@ -221,13 +221,14 @@ func TestOnPeerIdentityRecordsConfirmedNodeAndHealthCheck(t *testing.T) {
 	}
 }
 
-// TestOnPeerIdentityZeroClaimedAddressesRecordsNoAddress is BRIEF6.md's core regression test:
-// a peer that completes a full identity exchange but claims ZERO addresses of its own (e.g. a
-// bare probe/monitoring client) must still get a node row (via UpsertConfirmedNodeByPubKey) and
-// a health check row, but must NEVER get a node_addresses row for the raw TCP connection's
-// remote address (the client's OS-assigned ephemeral source port) -- that address is not a real
-// claim, and must not be persisted as if it were one.
-func TestOnPeerIdentityZeroClaimedAddressesRecordsNoAddress(t *testing.T) {
+// TestOnPeerIdentityZeroClaimedAddressesRecordsNoNode is BRIEF6.md's original regression test,
+// updated by OPENCODE_BRIEF.md ("stop recording blank-address nodes"): a peer that completes a
+// full identity exchange but claims ZERO addresses of its own (e.g. a bare probe/monitoring
+// client) must NOT get a node row at all -- a blank/address-less node row is itself an invalid
+// record (per direct instruction from the project owner), so onPeerIdentity must skip recording
+// this peer entirely (no node row, no node_addresses row, no health-check row), rather than
+// falling back to UpsertConfirmedNodeByPubKey as it used to.
+func TestOnPeerIdentityZeroClaimedAddressesRecordsNoNode(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
@@ -246,7 +247,99 @@ func TestOnPeerIdentityZeroClaimedAddressesRecordsNoAddress(t *testing.T) {
 
 	r.onPeerIdentity(remote, peerStaticKey, identity)
 
-	// The node row must still exist, confirmed, with the exact pubkey.
+	// NO node row must exist for this pubkey at all.
+	nodes, err := store.ListNodes(ctx, storage.NodeFilter{})
+	if err != nil {
+		t.Fatalf("list nodes: %v", err)
+	}
+	for _, n := range nodes {
+		if string(n.PublicKey) == string(peerStaticKey) {
+			t.Fatalf("expected no node row for pubkey=%x, but found one: %+v", peerStaticKey, n)
+		}
+	}
+	if len(nodes) != 0 {
+		t.Fatalf("len(nodes) = %d, want 0, got %+v", len(nodes), nodes)
+	}
+}
+
+// TestOnPeerIdentityAllPrivateClaimedAddressesRecordsNoNode is OPENCODE_BRIEF.md's core
+// regression test for bug 1 + bug 2 combined: a peer claiming ONLY private/loopback addresses
+// (the live-production incident's exact shape: a peer claiming addresses that decode to
+// 127.0.0.1:*) must have every one of those claims rejected by isClaimedAddressAllowed, which
+// reduces claimed to empty exactly as if the peer had claimed nothing at all -- so, per bug 2's
+// fix, NO node row is created for that pubkey at all.
+func TestOnPeerIdentityAllPrivateClaimedAddressesRecordsNoNode(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	r := &dbBackedResponder{store: store, logf: t.Logf, metrics: mustTestResponderMetrics(t)}
+
+	peerStaticKey := []byte{0x18, 0x77, 0x90, 0x19}
+	remote := testAddr("144.31.80.127:60561")
+
+	// Mirrors the live production log line: a peer claiming two loopback addresses that
+	// decode to 127.0.0.1:49909 and 127.0.0.1:60878.
+	loopback1, err := p2p.EncodeMultiaddrString("/ip4/127.0.0.1/tcp/49909")
+	if err != nil {
+		t.Fatalf("EncodeMultiaddrString loopback1: %v", err)
+	}
+	loopback2, err := p2p.EncodeMultiaddrString("/ip4/127.0.0.1/tcp/60878")
+	if err != nil {
+		t.Fatalf("EncodeMultiaddrString loopback2: %v", err)
+	}
+
+	identity := &p2p.PeerInfo{
+		RemoteStaticPubKey: peerStaticKey,
+		Addresses:          [][]byte{loopback1, loopback2},
+		Features:           p2p.FeaturesCommunicationNode,
+	}
+
+	r.onPeerIdentity(remote, peerStaticKey, identity)
+
+	nodes, err := store.ListNodes(ctx, storage.NodeFilter{})
+	if err != nil {
+		t.Fatalf("list nodes: %v", err)
+	}
+	for _, n := range nodes {
+		if string(n.PublicKey) == string(peerStaticKey) {
+			t.Fatalf("expected no node row for pubkey=%x (all-private claims), but found one: %+v", peerStaticKey, n)
+		}
+	}
+	if len(nodes) != 0 {
+		t.Fatalf("len(nodes) = %d, want 0, got %+v", len(nodes), nodes)
+	}
+}
+
+// TestOnPeerIdentityMixOfValidAndPrivateAddressUsesOnlyValid covers the mixed case: a peer
+// claiming one genuinely valid public address AND one private/loopback address must still get a
+// node row -- using only the valid address -- while the private one is silently skipped and
+// never written to node_addresses.
+func TestOnPeerIdentityMixOfValidAndPrivateAddressUsesOnlyValid(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	r := &dbBackedResponder{store: store, logf: t.Logf, metrics: mustTestResponderMetrics(t)}
+
+	peerStaticKey := []byte{0x77, 0x88, 0x99, 0xAA}
+	remote := testAddr("198.51.100.201:53112")
+
+	validAddr, err := p2p.EncodeMultiaddrString("/ip4/198.51.100.9/tcp/18189")
+	if err != nil {
+		t.Fatalf("EncodeMultiaddrString valid: %v", err)
+	}
+	privateAddr, err := p2p.EncodeMultiaddrString("/ip4/192.168.0.120/tcp/18189")
+	if err != nil {
+		t.Fatalf("EncodeMultiaddrString private: %v", err)
+	}
+
+	identity := &p2p.PeerInfo{
+		RemoteStaticPubKey: peerStaticKey,
+		Addresses:          [][]byte{validAddr, privateAddr},
+		Features:           p2p.FeaturesCommunicationNode,
+	}
+
+	r.onPeerIdentity(remote, peerStaticKey, identity)
+
 	nodes, err := store.ListNodes(ctx, storage.NodeFilter{})
 	if err != nil {
 		t.Fatalf("list nodes: %v", err)
@@ -259,18 +352,25 @@ func TestOnPeerIdentityZeroClaimedAddressesRecordsNoAddress(t *testing.T) {
 		t.Errorf("node.PublicKey = %x, want %x", node.PublicKey, peerStaticKey)
 	}
 
-	// NO node_addresses row must exist for this node -- specifically not one for the raw
-	// remote address, and not any other address either (the peer claimed none).
 	addrs, err := store.ListNodeAddresses(ctx, node.ID)
 	if err != nil {
 		t.Fatalf("list node addresses: %v", err)
 	}
-	if len(addrs) != 0 {
-		t.Errorf("len(node_addresses) = %d, want 0, got %+v", len(addrs), addrs)
+	got := map[string]bool{}
+	for _, a := range addrs {
+		got[a.Address] = true
+	}
+	if got["192.168.0.120:18189"] {
+		t.Errorf("node_addresses must NOT contain the rejected private address, got %v", got)
+	}
+	if !got["198.51.100.9:18189"] {
+		t.Errorf("node_addresses missing the valid claimed address, got %v", got)
+	}
+	if len(got) != 1 {
+		t.Errorf("len(node_addresses) = %d, want 1, got %v", len(got), got)
 	}
 
-	// The health check must still have landed -- RecordHealthCheck links on node.ID, not on
-	// any address, so it's unaffected by there being no known address for this node.
+	// A health check must still have landed for this node, exactly as the happy path.
 	checks, err := store.GetNodeHistory(ctx, node.ID, 10)
 	if err != nil {
 		t.Fatalf("get node history: %v", err)
@@ -284,9 +384,12 @@ func TestOnPeerIdentityZeroClaimedAddressesRecordsNoAddress(t *testing.T) {
 }
 
 // TestOnPeerIdentityWithClaimedAddressesUnaffectedByZeroAddressPath exercises the other half of
-// BRIEF6.md's requirement: a peer WITH claimed addresses must still get exactly those addresses
-// recorded (the legitimate identity.Addresses loop is unchanged by this fix), never the raw
-// remote address, and multiple claimed addresses must all land.
+// BRIEF6.md's requirement, extended by OPENCODE_BRIEF.md to also cover onion addresses: a peer
+// WITH genuinely valid public claimed addresses (both clearnet IPv4 and onion) must still get
+// exactly those addresses recorded (the legitimate identity.Addresses loop's happy path is
+// unchanged by this fix's new isClaimedAddressAllowed check -- onion addresses are never IPs and
+// always pass it unchanged), never the raw remote address, and multiple claimed addresses must
+// all land.
 func TestOnPeerIdentityWithClaimedAddressesUnaffectedByZeroAddressPath(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -304,10 +407,14 @@ func TestOnPeerIdentityWithClaimedAddressesUnaffectedByZeroAddressPath(t *testin
 	if err != nil {
 		t.Fatalf("EncodeMultiaddrString ip4 (second): %v", err)
 	}
+	claimedOnion, err := p2p.EncodeMultiaddrString("/onion3/PG6MMCYYZ2SO4E5S66PB5HB3XG2AQF7SWCNCF63YATIWCRLSBEFWNGYD:9001")
+	if err != nil {
+		t.Fatalf("EncodeMultiaddrString onion: %v", err)
+	}
 
 	identity := &p2p.PeerInfo{
 		RemoteStaticPubKey: peerStaticKey,
-		Addresses:          [][]byte{claimedIPv4, claimedIPv4Second},
+		Addresses:          [][]byte{claimedIPv4, claimedIPv4Second, claimedOnion},
 		Features:           p2p.FeaturesCommunicationNode,
 	}
 
@@ -339,8 +446,11 @@ func TestOnPeerIdentityWithClaimedAddressesUnaffectedByZeroAddressPath(t *testin
 	if !got["198.51.100.8:18189"] {
 		t.Errorf("node_addresses missing second claimed address, got %v", got)
 	}
-	if len(got) != 2 {
-		t.Errorf("len(node_addresses) = %d, want 2, got %v", len(got), got)
+	if !got["pg6mmcyyz2so4e5s66pb5hb3xg2aqf7swcncf63yatiwcrlsbefwngyd.onion:9001"] {
+		t.Errorf("node_addresses missing claimed onion address, got %v", got)
+	}
+	if len(got) != 3 {
+		t.Errorf("len(node_addresses) = %d, want 3, got %v", len(got), got)
 	}
 }
 
@@ -348,6 +458,11 @@ func TestOnPeerIdentityWithClaimedAddressesUnaffectedByZeroAddressPath(t *testin
 // IdentitySignature" case (nil, per go-tari-lib/p2p.PeerInfo's own doc comment): PeerIdentity
 // UpdatedAt and Version must simply be left nil, exactly mirroring
 // internal/collector/p2p_client.go's GetInfo handling of the same case, rather than panicking.
+//
+// This fixture claims a valid public address (rather than the pre-OPENCODE_BRIEF.md zero-claims
+// fixture) so a node row is actually created under the new "no usable claims -> no node at all"
+// behavior (see onPeerIdentity's doc comment) -- this test's own purpose (the
+// Version/PeerIdentityUpdatedAt-nil handling below) is otherwise unrelated to that fix.
 func TestOnPeerIdentityNoIdentitySignatureLeavesPeerIdentityUpdatedAtNil(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -357,8 +472,14 @@ func TestOnPeerIdentityNoIdentitySignatureLeavesPeerIdentityUpdatedAtNil(t *test
 	peerStaticKey := []byte{0x01, 0x02, 0x03, 0x04}
 	remote := testAddr("203.0.113.60:41000")
 
+	claimedAddr, err := p2p.EncodeMultiaddrString("/ip4/198.51.100.11/tcp/18189")
+	if err != nil {
+		t.Fatalf("EncodeMultiaddrString: %v", err)
+	}
+
 	identity := &p2p.PeerInfo{
 		RemoteStaticPubKey: peerStaticKey,
+		Addresses:          [][]byte{claimedAddr},
 		Features:           p2p.FeaturesCommunicationNode,
 		// UserAgent left empty, IdentitySignature left nil.
 	}
@@ -543,6 +664,11 @@ func TestEncodeStoredAddress(t *testing.T) {
 // TestOnPeerIdentityConcurrentSafety is a light smoke test that concurrent OnPeerIdentity calls
 // (as would happen with multiple simultaneous inbound connections, each in its own goroutine per
 // go-tari-lib/p2p.Serve's doc comment) don't race/deadlock against the same Store.
+//
+// Each simulated peer claims a valid public address (rather than the pre-OPENCODE_BRIEF.md
+// zero-claims fixture) so a node row is actually created per peer under the new "no usable
+// claims -> no node at all" behavior (see onPeerIdentity's doc comment) -- this test's own
+// purpose (concurrency safety) is otherwise unrelated to that fix.
 func TestOnPeerIdentityConcurrentSafety(t *testing.T) {
 	store := newTestStore(t)
 
@@ -556,8 +682,14 @@ func TestOnPeerIdentityConcurrentSafety(t *testing.T) {
 			defer wg.Done()
 			key := []byte{byte(i), 0xFF}
 			remote := testAddr(fmt.Sprintf("203.0.113.%d:41000", 100+i))
+			claimedAddr, err := p2p.EncodeMultiaddrString(fmt.Sprintf("/ip4/198.51.100.%d/tcp/18189", 100+i))
+			if err != nil {
+				t.Errorf("EncodeMultiaddrString: %v", err)
+				return
+			}
 			r.onPeerIdentity(remote, key, &p2p.PeerInfo{
 				RemoteStaticPubKey: key,
+				Addresses:          [][]byte{claimedAddr},
 				Features:           p2p.FeaturesCommunicationNode,
 			})
 		}()
