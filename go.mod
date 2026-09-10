@@ -9,6 +9,7 @@ require (
 	github.com/Snipa22/go-tari-lib v1.3.0
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.6.0
+	golang.org/x/sync v0.18.0
 	golang.org/x/time v0.9.0
 	google.golang.org/grpc v1.72.0
 )
@@ -24,7 +25,6 @@ require (
 	github.com/rogpeppe/go-internal v1.6.1 // indirect
 	golang.org/x/crypto v0.44.0 // indirect
 	golang.org/x/net v0.46.0 // indirect
-	golang.org/x/sync v0.18.0 // indirect
 	golang.org/x/sys v0.38.0 // indirect
 	golang.org/x/text v0.31.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250218202821-56aae31c358a // indirect
