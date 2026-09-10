@@ -49,10 +49,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/flynn/noise"
-
 	"github.com/Snipa22/go-tari-lib/p2p"
 
+	"github.com/Snipa22/go-tari-netmap/internal/p2pidentity"
 	"github.com/Snipa22/go-tari-netmap/internal/storage"
 )
 
@@ -82,12 +81,12 @@ func run() error {
 		return err
 	}
 
-	ourAddresses, err := parseAdvertisedAddresses(*publicTCPAddr, *onion3Addr)
+	ourAddresses, err := p2pidentity.ParseAdvertisedAddresses(*publicTCPAddr, *onion3Addr)
 	if err != nil {
 		return err
 	}
 
-	staticKeypair, err := loadOrGenerateKeypair(*keyPath)
+	staticKeypair, err := p2pidentity.LoadOrGenerateKeypair(*keyPath)
 	if err != nil {
 		return fmt.Errorf("setting up static keypair: %w", err)
 	}
@@ -184,73 +183,10 @@ func run() error {
 	return nil
 }
 
-// parseAdvertisedAddresses validates and encodes this binary's -public-tcp-addr/-onion3-addr
-// flag values into the raw binary rust-multiaddr wire encoding p2p.ResponderConfig.OurAddresses
-// expects (see go-tari-lib's p2p/multiaddr.go EncodeMultiaddrString doc comment for exactly why
-// that, and not a UTF-8 string, is required). At least one of the two flags MUST be non-empty --
-// fails fast with a clear error otherwise, rather than silently starting an unreachable
-// COMMUNICATION_NODE peer (a real Tari node's comms/dht/src/peer_validator.rs
-// PeerHasNoAddresses/PeerHasNoUsableAddresses checks reject a peer with zero advertised
-// addresses).
-func parseAdvertisedAddresses(publicTCPAddr, onion3Addr string) ([][]byte, error) {
-	if publicTCPAddr == "" && onion3Addr == "" {
-		return nil, fmt.Errorf("at least one of -public-tcp-addr or -onion3-addr must be set: a COMMUNICATION_NODE peer with no advertised addresses is rejected by real Tari nodes' peer validation and would start unreachable")
-	}
-
-	var out [][]byte
-	if publicTCPAddr != "" {
-		encoded, err := p2p.EncodeMultiaddrString(publicTCPAddr)
-		if err != nil {
-			return nil, fmt.Errorf("-public-tcp-addr %q: %w", publicTCPAddr, err)
-		}
-		out = append(out, encoded)
-	}
-	if onion3Addr != "" {
-		encoded, err := p2p.EncodeMultiaddrString(onion3Addr)
-		if err != nil {
-			return nil, fmt.Errorf("-onion3-addr %q: %w", onion3Addr, err)
-		}
-		out = append(out, encoded)
-	}
-	return out, nil
-}
-
-// keyFileSize is the size, in bytes, of the file loadOrGenerateKeypair reads/writes: the 32-byte
-// private scalar followed by the 32-byte public point, i.e. exactly noise.DHKey's two fields
-// concatenated. Storing both (rather than just the private key and re-deriving the public key on
-// load) avoids needing to export Ristretto255 scalar-base-multiplication from package p2p purely
-// for this binary's key-persistence convenience.
-const keyFileSize = 64
-
-// loadOrGenerateKeypair loads a keypair from path (see keyFileSize) if path is non-empty and the
-// file exists; otherwise it generates a fresh keypair and, if path is non-empty, saves it there
-// (mode 0600) for reuse across restarts. An empty path always generates an ephemeral, unsaved
-// keypair.
-func loadOrGenerateKeypair(path string) (noise.DHKey, error) {
-	if path != "" {
-		if raw, err := os.ReadFile(path); err == nil {
-			if len(raw) != keyFileSize {
-				return noise.DHKey{}, fmt.Errorf("key file %s has %d bytes, want %d", path, len(raw), keyFileSize)
-			}
-			return noise.DHKey{
-				Private: append([]byte(nil), raw[:32]...),
-				Public:  append([]byte(nil), raw[32:]...),
-			}, nil
-		} else if !os.IsNotExist(err) {
-			return noise.DHKey{}, fmt.Errorf("reading key file %s: %w", path, err)
-		}
-	}
-
-	keypair, err := p2p.GenerateRistrettoKeypair()
-	if err != nil {
-		return noise.DHKey{}, fmt.Errorf("generating a fresh keypair: %w", err)
-	}
-
-	if path != "" {
-		raw := append(append([]byte(nil), keypair.Private...), keypair.Public...)
-		if err := os.WriteFile(path, raw, 0o600); err != nil {
-			return noise.DHKey{}, fmt.Errorf("saving fresh keypair to %s: %w", path, err)
-		}
-	}
-	return keypair, nil
-}
+// parseAdvertisedAddresses / loadOrGenerateKeypair used to live here as this binary's own
+// private helpers. They now live in internal/p2pidentity, shared with cmd/netmap-p2p-seed-push
+// (see BRIEF8.md) — both binaries MUST derive OurAddresses/StaticKeypair from the exact same
+// logic for a given deployment's identity key/advertised addresses to converge on one real Tari
+// identity; see that package's doc comment for the full reasoning. This binary now calls
+// p2pidentity.ParseAdvertisedAddresses/p2pidentity.LoadOrGenerateKeypair directly from run()
+// above, unchanged in behavior.
