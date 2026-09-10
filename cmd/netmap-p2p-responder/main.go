@@ -30,9 +30,12 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/flynn/noise"
 
@@ -53,6 +56,9 @@ func run() error {
 		keyPath       = flag.String("key", "", "path to a file holding our long-term Ristretto255 private key (32 raw bytes); if empty or the file doesn't exist, a fresh key is generated and, if -key was given, saved there for reuse across restarts")
 		publicTCPAddr = flag.String("public-tcp-addr", "", "our own publicly-dialable clearnet multiaddr to advertise, e.g. /ip4/203.0.113.7/tcp/18189 (optional, but at least one of -public-tcp-addr/-onion3-addr is REQUIRED -- a COMMUNICATION_NODE peer with zero advertised addresses is rejected by real Tari nodes' peer validation)")
 		onion3Addr    = flag.String("onion3-addr", "", "our own onion-v3 multiaddr to advertise, e.g. /onion3/<56-char-base32-addr>:18189 (optional, but at least one of -public-tcp-addr/-onion3-addr is REQUIRED, see -public-tcp-addr)")
+		metricsAddr   = flag.String("metrics-addr", "", "address to serve Prometheus /metrics + /healthz on (default empty = disabled, opt-in like -public-tcp-addr/-onion3-addr). "+
+			"CRITICAL: bind to an INTERNAL-ONLY address, e.g. 192.168.40.x:PORT or 127.0.0.1:PORT -- NEVER the public IP this binary also advertises via -public-tcp-addr. "+
+			"If you set this at all, prefer a loopback-only address such as 127.0.0.1:9471; do NOT use a bare :PORT form (binds ALL interfaces, including the public one).")
 	)
 	flag.Parse()
 
@@ -98,15 +104,55 @@ func run() error {
 		listener.Close()
 	}()
 
+	var metricsWG sync.WaitGroup
+	if *metricsAddr != "" {
+		// CRITICAL: this listener MUST be internal-only (see -metrics-addr's own help text
+		// above) -- it is a completely separate net.Listener/http.Server from the P2P listener
+		// above, bound to whatever address the operator configured. This binary does not
+		// enforce or validate that the given address isn't the public one; that's on the
+		// operator, per the flag's help text -- but never default *metricsAddr to a bare
+		// ":PORT" form yourself, and never wire it to *publicTCPAddr/listener.Addr() by
+		// accident. If you're reading this because you're about to change this call: binding
+		// 0.0.0.0 (or a public IP) here exposes internal metrics -- including per-substream
+		// protocol/DB-write detail -- to the same public network this responder's P2P port is
+		// deliberately exposed to; that is NOT the intent of this flag.
+		metricsListener, err := net.Listen("tcp", *metricsAddr)
+		if err != nil {
+			return fmt.Errorf("listening on -metrics-addr %s: %w", *metricsAddr, err)
+		}
+		metricsServer := newMetricsServer(store)
+		log.Printf("main: serving /metrics and /healthz on %s (internal-only -- never expose this address publicly)", metricsListener.Addr())
+
+		metricsWG.Add(1)
+		go func() {
+			defer metricsWG.Done()
+			if err := metricsServer.Serve(metricsListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Printf("main: metrics server error: %v", err)
+			}
+		}()
+
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer shutdownCancel()
+			_ = metricsServer.Shutdown(shutdownCtx)
+		}()
+	}
+
 	responder := &dbBackedResponder{store: store, logf: log.Printf}
 
 	cfg := p2p.ResponderConfig{
-		StaticKeypair:    staticKeypair,
-		OurFeatures:      p2p.FeaturesCommunicationNode,
-		OurAddresses:     ourAddresses,
-		PeerListProvider: responder.peerListProvider,
-		OnPeerIdentity:   responder.onPeerIdentity,
-		Logf:             log.Printf,
+		StaticKeypair:               staticKeypair,
+		OurFeatures:                 p2p.FeaturesCommunicationNode,
+		OurAddresses:                ourAddresses,
+		PeerListProvider:            responder.peerListProvider,
+		OnPeerIdentity:              responder.onPeerIdentity,
+		Logf:                        log.Printf,
+		OnConnectionAccepted:        onConnectionAccepted,
+		OnHandshakeResult:           onHandshakeResult,
+		OnIdentityExchangeResult:    onIdentityExchangeResult,
+		OnGetPeersServed:            onGetPeersServed,
+		OnSubstreamProtocolDeclined: onSubstreamProtocolDeclined,
 	}
 
 	err = p2p.Serve(ctx, listener, cfg)
@@ -114,6 +160,7 @@ func run() error {
 		return fmt.Errorf("serving: %w", err)
 	}
 	log.Printf("main: responder loop exited cleanly")
+	metricsWG.Wait()
 	return nil
 }
 
