@@ -60,23 +60,29 @@ type dbBackedResponder struct {
 // confirmed pubkey recovered directly from the handshake, per UpsertConfirmedNode's contract —
 // this is NOT a third-party claim) and records one health-check row for it.
 //
-// Two kinds of addresses get recorded, both via UpsertConfirmedNode (which already handles
-// "known pubkey, new address" as a no-op-beyond-ensuring-the-row case — see its doc comment in
-// internal/storage/storage.go, case (b) — so looping it once per address is exactly the
-// "address-add call once per claimed address" BRIEF3.md asks for, not a reinvention of its
-// multi-address handling):
+// remoteAddr — the raw TCP connection's remote address (the client's OS-assigned ephemeral
+// source port, e.g. "104.161.20.146:49456") — is NEVER recorded as a claimed, dialable address.
+// It is only evidence that some connection from this peer happened, which the health-check row
+// below already captures via node.ID linkage; treating it as an advertised address would let a
+// probe/monitoring client that claims zero real addresses pollute node_addresses with garbage
+// that peerListProvider could later serve back out to real peers as if it were dialable (see
+// BRIEF6.md for the full incident writeup and the confirmed-live garbage this produced).
 //
-//  1. remoteAddr — the address the peer actually connected FROM. This is the FIRST
-//     UpsertConfirmedNode call, so a brand-new pubkey's node row (if this is the first time
-//     we've ever seen it) is created at this address specifically (case (a) in
-//     UpsertConfirmedNode's doc comment).
-//  2. Every address in identity.Addresses — the peer's OWN self-claimed addresses (onion and/or
-//     clearnet), decoded from their raw rust-multiaddr binary encoding via
-//     collector.ParsePeerAddress (the exact same decoder already proven against gRPC/P2P
-//     GetPeers claims elsewhere in this repo — see grpc_client.go's parsePeerAddress). These are
-//     separate from, and additional to, remoteAddr — a peer can be dialed from one address while
-//     claiming other reachable addresses too (e.g. it dialed us over clearnet but also
-//     advertises an onion address).
+// The only addresses ever recorded are genuinely self-claimed ones: every entry in
+// identity.Addresses, decoded from its raw rust-multiaddr binary encoding via
+// collector.ParsePeerAddress (the exact same decoder already proven against gRPC/P2P GetPeers
+// claims elsewhere in this repo — see grpc_client.go's parsePeerAddress).
+//
+//   - If the peer claims at least one address, the first successfully-decoded one is used as
+//     the UpsertConfirmedNode call that ensures the node row exists (case (a)/(b)/(c)/(d) in its
+//     doc comment in internal/storage/storage.go, depending on prior state), and every
+//     subsequent claimed address gets its own UpsertConfirmedNode call (case (b):
+//     "known pubkey, new address" is a no-op-beyond-ensuring-the-row, so looping it once per
+//     address is exactly BRIEF3.md's "address-add call once per claimed address", not a
+//     reinvention of its multi-address handling).
+//   - If the peer claims ZERO addresses (e.g. a bare probe/monitoring client), the node row is
+//     still ensured via UpsertConfirmedNodeByPubKey — pubkey identity alone, no address, no
+//     node_addresses row — so RecordHealthCheck below still has a real node.ID to link against.
 //
 // ResponderConfig.OnPeerIdentity's own signature has no context.Context or error return (it's a
 // plain synchronous reporting callback — see its doc comment in go-tari-lib/p2p/responder.go),
@@ -87,27 +93,39 @@ func (r *dbBackedResponder) onPeerIdentity(remoteAddr net.Addr, peerStaticKey []
 	ctx, cancel := context.WithTimeout(context.Background(), dbCallTimeout)
 	defer cancel()
 
-	remote := remoteAddr.String()
+	// Decode every genuinely self-claimed address up front, deduplicating so a peer that
+	// (redundantly) repeats the same claim twice doesn't issue two identical DB calls.
+	var claimed []string
+	seen := make(map[string]bool, len(identity.Addresses))
+	for _, raw := range identity.Addresses {
+		addr, ok := collector.ParsePeerAddress(raw)
+		if !ok || seen[addr] {
+			// Skip unparseable claims, best-effort, matching parsePeerAddress's existing
+			// "skip rather than emit garbage" convention elsewhere in this repo.
+			continue
+		}
+		seen[addr] = true
+		claimed = append(claimed, addr)
+	}
 
-	node, err := r.store.UpsertConfirmedNode(ctx, remote, peerStaticKey, storage.DiscoverySourceP2P)
+	var node storage.Node
+	var err error
+	if len(claimed) > 0 {
+		node, err = r.store.UpsertConfirmedNode(ctx, claimed[0], peerStaticKey, storage.DiscoverySourceP2P)
+	} else {
+		node, err = r.store.UpsertConfirmedNodeByPubKey(ctx, peerStaticKey, storage.DiscoverySourceP2P)
+	}
 	if err != nil {
 		r.metrics.dbWriteResult.WithLabelValues(dbOperationUpsertNode, resultLabel(false)).Inc()
-		r.logf("netmap-p2p-responder: UpsertConfirmedNode(%s) failed: %v", remote, err)
+		r.logf("netmap-p2p-responder: UpsertConfirmedNode(pubkey=%x) failed: %v", peerStaticKey, err)
 		return
 	}
 	r.metrics.dbWriteResult.WithLabelValues(dbOperationUpsertNode, resultLabel(true)).Inc()
 
-	for _, raw := range identity.Addresses {
-		claimed, ok := collector.ParsePeerAddress(raw)
-		if !ok || claimed == remote {
-			// Skip unparseable claims (best-effort, matching parsePeerAddress's existing
-			// "skip rather than emit garbage" convention elsewhere in this repo) and skip
-			// remote itself, already recorded above — no point re-issuing an identical call.
-			continue
-		}
-		if _, err := r.store.UpsertConfirmedNode(ctx, claimed, peerStaticKey, storage.DiscoverySourceP2P); err != nil {
+	for _, addr := range remainingClaims(claimed) {
+		if _, err := r.store.UpsertConfirmedNode(ctx, addr, peerStaticKey, storage.DiscoverySourceP2P); err != nil {
 			r.metrics.dbWriteResult.WithLabelValues(dbOperationUpsertNode, resultLabel(false)).Inc()
-			r.logf("netmap-p2p-responder: UpsertConfirmedNode(%s, self-claimed address) failed: %v", claimed, err)
+			r.logf("netmap-p2p-responder: UpsertConfirmedNode(%s, self-claimed address) failed: %v", addr, err)
 			continue
 		}
 		r.metrics.dbWriteResult.WithLabelValues(dbOperationUpsertNode, resultLabel(true)).Inc()
@@ -140,6 +158,18 @@ func (r *dbBackedResponder) onPeerIdentity(remoteAddr net.Addr, peerStaticKey []
 		return
 	}
 	r.metrics.dbWriteResult.WithLabelValues(dbOperationRecordHealth, resultLabel(true)).Inc()
+}
+
+// remainingClaims returns every element of claimed after the first (the first was already
+// consumed by the UpsertConfirmedNode call above that ensures the node row exists). A plain
+// claimed[1:] would panic when claimed is empty (the zero-claimed-addresses case, where
+// UpsertConfirmedNodeByPubKey was used instead and this loop has nothing left to do) since a
+// low bound of 1 exceeds a zero-length slice's length.
+func remainingClaims(claimed []string) []string {
+	if len(claimed) == 0 {
+		return nil
+	}
+	return claimed[1:]
 }
 
 // peerListProvider implements ResponderConfig.PeerListProvider: it serves REAL confirmed-good
