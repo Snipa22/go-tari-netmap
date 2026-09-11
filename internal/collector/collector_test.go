@@ -3,6 +3,7 @@ package collector
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"sync"
@@ -282,6 +283,87 @@ func TestDiscoverRespectsPerNodeCooldown(t *testing.T) {
 		if n.Address == "newPeer:1" {
 			t.Fatalf("newPeer:1 was discovered even though seed:1's discovery cooldown should have blocked re-dialing it; nodes = %+v", nodes)
 		}
+	}
+}
+
+// TestDiscoverRejectsPrivatePeerAddresses verifies that when a walked node's GetPeers response
+// reports only private/loopback/reserved addresses as its peers, none of those addresses are
+// upserted into storage or edge-recorded — only the seed node itself ends up discovered.
+func TestDiscoverRejectsPrivatePeerAddresses(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	client := &fakeClient{
+		peers: map[string][]string{
+			"seed:1": {"127.0.0.1:18189", "192.168.1.5:18189", "10.0.0.5:18189"},
+		},
+	}
+
+	c := New(Config{SeedNodes: []string{"seed:1"}})
+	c.Storage = store
+	c.GRPCClient = client
+
+	if err := c.Discover(ctx); err != nil {
+		t.Fatalf("discover: %v", err)
+	}
+
+	nodes, err := store.ListNodes(ctx, storage.NodeFilter{})
+	if err != nil {
+		t.Fatalf("list nodes: %v", err)
+	}
+	if len(nodes) != 1 || nodes[0].Address != "seed:1" {
+		t.Fatalf("nodes = %+v, want only seed:1 (private peer addresses must not be upserted)", nodes)
+	}
+
+	_, edges, err := store.ListTopology(ctx, storage.TopologyFilter{})
+	if err != nil {
+		t.Fatalf("list topology: %v", err)
+	}
+	if len(edges) != 0 {
+		t.Fatalf("edges = %+v, want none (no edge should be recorded to a rejected private peer address)", edges)
+	}
+}
+
+// TestDiscoverMixedPeerAddressesOnlyValidOneRecorded verifies that when a walked node's
+// GetPeers response mixes one valid public address with private/reserved ones, only the valid
+// address is upserted and edge-recorded, exactly as if the private one(s) had never been
+// reported at all.
+func TestDiscoverMixedPeerAddressesOnlyValidOneRecorded(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	client := &fakeClient{
+		peers: map[string][]string{
+			"seed:1": {"8.8.8.8:18189", "127.0.0.1:18189", "192.168.1.5:18189"},
+		},
+	}
+
+	c := New(Config{SeedNodes: []string{"seed:1"}})
+	c.Storage = store
+	c.GRPCClient = client
+
+	if err := c.Discover(ctx); err != nil {
+		t.Fatalf("discover: %v", err)
+	}
+
+	nodes, err := store.ListNodes(ctx, storage.NodeFilter{})
+	if err != nil {
+		t.Fatalf("list nodes: %v", err)
+	}
+	addrs := make(map[string]bool, len(nodes))
+	for _, n := range nodes {
+		addrs[n.Address] = true
+	}
+	if len(nodes) != 2 || !addrs["seed:1"] || !addrs["8.8.8.8:18189"] {
+		t.Fatalf("nodes = %+v, want exactly seed:1 and 8.8.8.8:18189 (private peer addresses must be excluded)", nodes)
+	}
+
+	_, edges, err := store.ListTopology(ctx, storage.TopologyFilter{})
+	if err != nil {
+		t.Fatalf("list topology: %v", err)
+	}
+	if len(edges) != 1 {
+		t.Fatalf("edges = %+v, want exactly 1 (seed:1 -> 8.8.8.8:18189)", edges)
 	}
 }
 
@@ -2273,9 +2355,28 @@ func (w *wideBranchingClient) GetPeers(ctx context.Context, addr string) ([]Disc
 	if strings.Count(addr, "/") >= w.maxDepth {
 		return nil, nil
 	}
+
+	// addr is a syntactically valid "host:port" for every call except the very first
+	// (the root seed, which has no port at all). Strip any existing ":port" suffix
+	// before appending the next path segment so the freshly-appended ":1" below is
+	// always the ONLY colon in the resulting address -- net.SplitHostPort rejects
+	// strings with more than one colon ("too many colons in address"), so naively
+	// suffixing an already-suffixed addr (e.g. "root/0:1" -> "root/0:1/1:1") would
+	// make every address from depth 2 onward fail to parse and get rejected by
+	// peerAddressAllowed all over again. strings.Count(addr, "/") above still counts
+	// depth correctly regardless of this suffix, since it only counts "/" characters.
+	base := addr
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		base = host
+	}
+
 	peers := make([]DiscoveredPeer, w.branching)
 	for i := 0; i < w.branching; i++ {
-		peers[i] = DiscoveredPeer{Address: fmt.Sprintf("%s/%d", addr, i)}
+		// The host portion ("root/0/1/...") is deliberately not an IP -- like a
+		// .onion host, net.ParseIP returns nil for it, so peerAddressAllowed passes
+		// it through unchanged. Only the appended ":1" makes it a syntactically
+		// valid host:port that net.SplitHostPort can parse at all.
+		peers[i] = DiscoveredPeer{Address: fmt.Sprintf("%s/%d:1", base, i)}
 	}
 	return peers, nil
 }

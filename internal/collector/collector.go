@@ -14,11 +14,13 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"sync"
 	"time"
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/Snipa22/go-tari-netmap/internal/netaddr"
 	"github.com/Snipa22/go-tari-netmap/internal/storage"
 )
 
@@ -812,6 +814,37 @@ func (c *Collector) discoverWith(ctx context.Context, client NodeClient, transpo
 	}
 }
 
+// peerAddressAllowed reports whether a peer-reported "host:port" address (DiscoveredPeer.Address,
+// as decoded by parsePeerAddress in grpc_client.go/p2p_client.go from a remote GetPeers response)
+// is safe to record and later dial by this service's own poll/probe machinery. Mirrors
+// cmd/netmap-p2p-responder/responder.go's isClaimedAddressAllowed exactly (a peer reporting
+// another address as "one of its peers" is no more trustworthy than a peer self-claiming an
+// address during identity exchange -- both are dialed by this service's probe machinery, so both
+// get the same SSRF-hardening rejection of private/loopback/link-local/multicast/unspecified
+// IPs), via the netaddr package shared with internal/api (collector cannot import internal/api
+// directly: internal/api already imports internal/collector, so importing api from collector
+// would be a cycle -- see internal/netaddr's doc comment).
+//
+// Onion (.onion) addresses are never IPs -- net.SplitHostPort followed by net.ParseIP simply
+// fails to produce an IP for them, so they pass this check unchanged.
+func peerAddressAllowed(hostPort string) bool {
+	host, _, err := net.SplitHostPort(hostPort)
+	if err != nil {
+		// Should not happen -- parsePeerAddress always returns "host:port" -- but fail closed
+		// (reject) rather than dial something this function couldn't even parse into a host.
+		return false
+	}
+
+	ip := net.ParseIP(host)
+	if ip == nil {
+		// Not an IP at all (e.g. a .onion host) -- nothing for the private/reserved-IP check to
+		// apply to, so it passes unchanged.
+		return true
+	}
+
+	return !netaddr.IsPrivateOrReservedIP(ip)
+}
+
 // walkNodePeers performs the actual discovery-walk work for a single
 // addr: it upserts addr into Storage, and — gated by the same per-
 // transport discovery cooldown (dueForDiscovery/setNextDiscovery) as
@@ -832,6 +865,16 @@ func (c *Collector) discoverWith(ctx context.Context, client NodeClient, transpo
 // processed within the same discoverWith/discoverOwnedWith pass shares
 // one consistent timestamp for discoveryInterval's cooldown math, as
 // before this extraction.
+//
+// NOTE: addr itself is deliberately NOT re-validated by peerAddressAllowed here — only the
+// peers reported *by* addr (peer.Address, below) are. Every possible caller of addr has already
+// passed the identical check once: discoverWith's BFS only enqueues addresses that were
+// themselves a peer.Address returned (and thus already validated) by a prior walkNodePeers call,
+// on top of an operator-trusted Config.SeedNodes seed; DiscoverOwned's fan-out only adds
+// addresses tagged owned, and the sole code path that ever sets that tag
+// (internal/api's handleApproveSubmission) always uses an address that already passed the same
+// private/reserved-IP check via validateSubmittedHost when it was first submitted. Re-validating
+// addr here would be redundant.
 func (c *Collector) walkNodePeers(ctx context.Context, client NodeClient, transportLabel, addr string, now time.Time) []DiscoveredPeer {
 	fromNode, err := c.Storage.UpsertDiscoveredNode(ctx, addr, storage.DiscoverySourceP2P, nil, nil)
 	if err != nil {
@@ -855,7 +898,18 @@ func (c *Collector) walkNodePeers(ctx context.Context, client NodeClient, transp
 	}
 	c.setNextDiscovery(cooldownKey, now.Add(c.discoveryInterval(fromNode)))
 
+	allowed := make([]DiscoveredPeer, 0, len(peers))
 	for _, peer := range peers {
+		if !peerAddressAllowed(peer.Address) {
+			// Reject private/loopback/link-local/multicast/unspecified clearnet peer claims,
+			// best-effort, same convention as the isClaimedAddressAllowed skip in
+			// cmd/netmap-p2p-responder/responder.go's onPeerIdentity — a peer reporting a
+			// private address as one of its own peers must never be upserted, edge-recorded,
+			// or enqueued for further walking by discoverWith's BFS.
+			log.Printf("collector: [%s] rejecting peer-reported address %s from %s: private/loopback/reserved IP", transportLabel, peer.Address, addr)
+			continue
+		}
+
 		// See discoverWith's doc comment: peer.PublicKey is
 		// intentionally not passed through to storage here — only
 		// address-based discovery is recorded from a peer-walk hop.
@@ -868,9 +922,11 @@ func (c *Collector) walkNodePeers(ctx context.Context, client NodeClient, transp
 		if err := c.Storage.RecordPeerEdgeObservation(ctx, fromNode.ID, toNode.ID); err != nil {
 			log.Printf("collector: [%s] record edge observation %s -> %s: %v", transportLabel, addr, peer.Address, err)
 		}
+
+		allowed = append(allowed, peer)
 	}
 
-	return peers
+	return allowed
 }
 
 // discoveryCooldownKey builds the nextDiscovery map key for a given
