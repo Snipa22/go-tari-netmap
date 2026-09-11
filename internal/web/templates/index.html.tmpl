@@ -26,11 +26,11 @@
         <div class="card">
           <div class="card-label">Total nodes</div>
           <div class="card-value">{{.Counts.Total}}</div>
+          <div class="card-sub">{{.Counts.Unconfirmed}} unconfirmed</div>
         </div>
         <div class="card">
           <div class="card-label">Confirmed (24h active)</div>
           <div class="card-value">{{.Counts.Confirmed24h}}</div>
-          <div class="card-sub">{{.Counts.Unconfirmed}} unconfirmed</div>
           <div class="card-sub">lifetime confirmed: {{.Counts.Confirmed}}</div>
         </div>
         <div class="card">
