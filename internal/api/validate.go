@@ -5,6 +5,8 @@ import (
 	"net"
 	"regexp"
 	"strings"
+
+	"github.com/Snipa22/go-tari-netmap/internal/netaddr"
 )
 
 // onionHostPattern matches a syntactically plausible Tor onion address:
@@ -63,8 +65,11 @@ func validateSubmittedHost(host string) error {
 // remote peer claims about itself (e.g.
 // cmd/netmap-p2p-responder/responder.go's onPeerIdentity, for
 // self-claimed P2P identity-exchange addresses) can apply the exact same
-// classification without duplicating it.
+// classification without duplicating it. It delegates to
+// internal/netaddr, the canonical implementation shared with
+// internal/collector (which cannot import this package directly, since
+// internal/api already imports internal/collector — see netaddr's doc
+// comment for why the predicate had to move to its own leaf package).
 func IsPrivateOrReservedIP(ip net.IP) bool {
-	return ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified()
+	return netaddr.IsPrivateOrReservedIP(ip)
 }
