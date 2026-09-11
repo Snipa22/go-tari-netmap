@@ -648,6 +648,71 @@ func TestDashboardReachableWithinWindowFilter(t *testing.T) {
 	}
 }
 
+// TestDashboardConfirmed24hCard asserts the dashboard's "Confirmed"
+// summary card headlines Confirmed24h (confirmed nodes reachable within
+// the last 24h), while still showing the lifetime confirmed total as a
+// secondary stat -- mirroring TestStatsEndpointConfirmed24h's setup in
+// internal/api: 3 confirmed nodes total, but only 2 have a recent
+// (<24h) reachable health check, the third only a stale (>24h old) one.
+func TestDashboardConfirmed24hCard(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	recentA, err := store.UpsertConfirmedNode(ctx, "dash-confirmed24h-recentA:1", []byte("dash-confirmed24h-recentA-pubkey"), storage.DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("upsert recentA: %v", err)
+	}
+	if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{NodeID: recentA.ID, Reachable: true, ProbeSource: storage.ProbeSourceGRPC}); err != nil {
+		t.Fatalf("record health check for recentA: %v", err)
+	}
+
+	recentB, err := store.UpsertConfirmedNode(ctx, "dash-confirmed24h-recentB:1", []byte("dash-confirmed24h-recentB-pubkey"), storage.DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("upsert recentB: %v", err)
+	}
+	if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{NodeID: recentB.ID, Reachable: true, ProbeSource: storage.ProbeSourceGRPC}); err != nil {
+		t.Fatalf("record health check for recentB: %v", err)
+	}
+
+	// stale: confirmed, but its only reachable health check is more
+	// than 24h old -- counts toward the lifetime confirmed total but
+	// not Confirmed24h. storage.Store's RecordHealthCheck always
+	// stamps ts = now(), so the >24h-old row must be inserted directly
+	// via a raw connection (same pattern as
+	// TestDashboardReachableWithinWindowFilter above).
+	stale, err := store.UpsertConfirmedNode(ctx, "dash-confirmed24h-stale:1", []byte("dash-confirmed24h-stale-pubkey"), storage.DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("upsert stale: %v", err)
+	}
+	pool, err := pgxpool.New(ctx, testDSN())
+	if err != nil {
+		t.Fatalf("connect to test db: %v", err)
+	}
+	defer pool.Close()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO node_health (node_id, ts, reachable, probe_source)
+		VALUES ($1, now() - interval '48 hours', true, 'grpc')
+	`, stale.ID); err != nil {
+		t.Fatalf("insert stale reachable health check: %v", err)
+	}
+
+	srv := newTestServer(t, store)
+	status, body := getBody(t, srv.URL+"/")
+	if status != http.StatusOK {
+		t.Fatalf("GET / status = %d, want %d", status, http.StatusOK)
+	}
+
+	if !strings.Contains(body, `<div class="card-label">Confirmed (24h active)</div>`) {
+		t.Errorf("GET / body missing the Confirmed (24h active) card label:\n%s", body)
+	}
+	if !strings.Contains(body, `<div class="card-value">2</div>`) {
+		t.Errorf("GET / body's Confirmed card doesn't headline Confirmed24h (2):\n%s", body)
+	}
+	if !strings.Contains(body, "lifetime confirmed: 3") {
+		t.Errorf("GET / body's Confirmed card sub-label doesn't show the lifetime confirmed total (3):\n%s", body)
+	}
+}
+
 // TestNodeDetailLikelyDeadBadge exercises the "likely dead" heuristic
 // (3+ history entries, zero of them Reachable == true) against three
 // cases:

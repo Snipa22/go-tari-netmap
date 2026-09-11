@@ -2591,6 +2591,8 @@ type statsResponseForTest struct {
 	ClearnetCapable    int `json:"clearnet_capable"`
 	ClearnetOnly       int `json:"clearnet_only"`
 
+	Confirmed24h int `json:"confirmed_nodes_24h"`
+
 	NetworkHeight          *int64 `json:"network_height"`
 	NetworkHeightNodeCount int    `json:"network_height_node_count"`
 }
@@ -2740,5 +2742,78 @@ func TestStatsEndpoint(t *testing.T) {
 	}
 	if got.NetworkHeight == nil || *got.NetworkHeight != h500 {
 		t.Errorf("NetworkHeight = %v, want pointer to %d", got.NetworkHeight, h500)
+	}
+}
+
+// TestStatsEndpointConfirmed24h asserts GET /v1/stats' confirmed_nodes_24h
+// genuinely differs from, and is lower than, the lifetime confirmed_nodes
+// total: 3 confirmed nodes are seeded, but only 2 have a reachable=true
+// health check within the last 24h -- the third has only a stale (>24h
+// old) reachable check, so it counts toward confirmed_nodes (lifetime)
+// but not confirmed_nodes_24h.
+func TestStatsEndpointConfirmed24h(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
+
+	// recentA/recentB: confirmed, each with a health check within the
+	// last 24h -- both must count toward confirmed_nodes_24h.
+	recentA, err := store.UpsertConfirmedNode(ctx, "confirmed24h-recentA:1", []byte("confirmed24h-recentA-pubkey"), storage.DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("upsert recentA: %v", err)
+	}
+	if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{NodeID: recentA.ID, Reachable: true, ProbeSource: storage.ProbeSourceGRPC}); err != nil {
+		t.Fatalf("record health check for recentA: %v", err)
+	}
+
+	recentB, err := store.UpsertConfirmedNode(ctx, "confirmed24h-recentB:1", []byte("confirmed24h-recentB-pubkey"), storage.DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("upsert recentB: %v", err)
+	}
+	if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{NodeID: recentB.ID, Reachable: true, ProbeSource: storage.ProbeSourceGRPC}); err != nil {
+		t.Fatalf("record health check for recentB: %v", err)
+	}
+
+	// stale: confirmed, but its only reachable health check is more
+	// than 24h old -- must count toward confirmed_nodes (lifetime) but
+	// NOT confirmed_nodes_24h. storage.Store's RecordHealthCheck always
+	// stamps ts = now(), so the >24h-old row must be inserted directly
+	// via a raw connection to the same test database (same pattern as
+	// TestStatsEndpoint's dual-stack address insert above).
+	stale, err := store.UpsertConfirmedNode(ctx, "confirmed24h-stale:1", []byte("confirmed24h-stale-pubkey"), storage.DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("upsert stale: %v", err)
+	}
+	pool, err := pgxpool.New(ctx, testDSN())
+	if err != nil {
+		t.Fatalf("connect to test db: %v", err)
+	}
+	defer pool.Close()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO node_health (node_id, ts, reachable, probe_source)
+		VALUES ($1, now() - interval '48 hours', true, 'grpc')
+	`, stale.ID); err != nil {
+		t.Fatalf("insert stale reachable health check: %v", err)
+	}
+
+	resp, err := http.Get(srv.URL + "/v1/stats")
+	if err != nil {
+		t.Fatalf("GET /v1/stats: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, http.StatusOK, body)
+	}
+
+	var got statsResponseForTest
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if got.ConfirmedNodes != 3 {
+		t.Errorf("ConfirmedNodes (lifetime) = %d, want 3", got.ConfirmedNodes)
+	}
+	if got.Confirmed24h != 2 {
+		t.Errorf("Confirmed24h = %d, want 2 (must be lower than the lifetime confirmed_nodes total)", got.Confirmed24h)
 	}
 }

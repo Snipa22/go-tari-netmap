@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"net/http"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -25,6 +26,14 @@ type NodeCounts struct {
 	OnionCapable    int
 	ClearnetCapable int
 	ClearnetOnly    int
+
+	// Confirmed24h is the number of confirmed nodes reachable at least
+	// once in the last 24 hours — a DB-backed count computed
+	// separately by FetchConfirmed24h, never by ComputeNodeCounts
+	// (which has no DB access and no reachability data available from
+	// its in-memory nodes/addrsByNode inputs). Only FetchNodeCounts
+	// populates this field; ComputeNodeCounts always leaves it zero.
+	Confirmed24h int
 }
 
 // ComputeNodeCounts computes NodeCounts from an already-fetched slice of
@@ -98,7 +107,30 @@ func FetchNodeCounts(ctx context.Context, store storage.Store) (NodeCounts, erro
 		return NodeCounts{}, err
 	}
 
-	return ComputeNodeCounts(nodes, addrsByNode), nil
+	counts := ComputeNodeCounts(nodes, addrsByNode)
+
+	confirmed24h, err := FetchConfirmed24h(ctx, store)
+	if err != nil {
+		return NodeCounts{}, err
+	}
+	counts.Confirmed24h = confirmed24h
+
+	return counts, nil
+}
+
+// FetchConfirmed24h returns the number of nodes that are BOTH confirmed
+// (non-empty PublicKey) AND reachable at least once in the last 24
+// hours. Unlike Confirmed/Unconfirmed/OnionCapable/etc. above, this
+// can't be derived from an already-fetched nodes/addrsByNode slice (the
+// "reachable in the last 24h" condition depends on node_health rows,
+// which ComputeNodeCounts' callers don't necessarily have loaded) — it
+// always issues its own DB-backed store.CountNodes query, which is
+// cheaper than a ListNodes-then-len() round trip since it never has to
+// materialize the matching rows.
+func FetchConfirmed24h(ctx context.Context, store storage.Store) (int, error) {
+	confirmedTrue := true
+	cutoff := time.Now().Add(-24 * time.Hour)
+	return store.CountNodes(ctx, storage.NodeFilter{Confirmed: &confirmedTrue, ReachableSince: &cutoff})
 }
 
 // statsResponse is the GET /v1/stats response body: the same whole-
@@ -117,6 +149,13 @@ type statsResponse struct {
 	OnionCapable       int `json:"onion_capable"`
 	ClearnetCapable    int `json:"clearnet_capable"`
 	ClearnetOnly       int `json:"clearnet_only"`
+
+	// Confirmed24h is the number of confirmed nodes reachable at
+	// least once in the last 24 hours (see NodeCounts.Confirmed24h /
+	// FetchConfirmed24h). Distinct from, and always <=, ConfirmedNodes
+	// above, which stays the lifetime, unfiltered confirmed count —
+	// adding this field must never change ConfirmedNodes' meaning.
+	Confirmed24h int `json:"confirmed_nodes_24h"`
 
 	NetworkHeight          *int64 `json:"network_height"`
 	NetworkHeightNodeCount int    `json:"network_height_node_count"`
@@ -153,6 +192,8 @@ func handleStats(store storage.Store) http.HandlerFunc {
 			OnionCapable:       counts.OnionCapable,
 			ClearnetCapable:    counts.ClearnetCapable,
 			ClearnetOnly:       counts.ClearnetOnly,
+
+			Confirmed24h: counts.Confirmed24h,
 
 			NetworkHeight:          height,
 			NetworkHeightNodeCount: heightNodeCount,

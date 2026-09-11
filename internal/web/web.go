@@ -106,6 +106,15 @@ type dashboardCounts struct {
 	OnionCapable    int
 	ClearnetCapable int
 	ClearnetOnly    int
+
+	// Confirmed24h is the number of confirmed nodes reachable at
+	// least once in the last 24 hours (see api.NodeCounts.Confirmed24h
+	// / api.FetchConfirmed24h) — a separate DB-backed count from
+	// Confirmed above, which stays the lifetime, unfiltered confirmed
+	// total. Populated by buildNodeTableData via its own
+	// store.CountNodes call, independent of the reachableSince
+	// parameter that filters the paginated table rows.
+	Confirmed24h int
 }
 
 // dashboardNodeRow is one row of a node table (the dashboard's or
@@ -449,6 +458,21 @@ func buildNodeTableData(ctx context.Context, store storage.Store, reachableSince
 		ClearnetCapable: nc.ClearnetCapable,
 		ClearnetOnly:    nc.ClearnetOnly,
 	}
+
+	// Confirmed24h: confirmed nodes reachable at least once in the
+	// last 24 hours. Same DB-backed approach as internal/api/stats.go's
+	// FetchConfirmed24h — a dedicated store.CountNodes call, using its
+	// own cutoff24h local var, deliberately independent of the
+	// reachableSince parameter above (which only ever filters the
+	// paginated table rows, never this whole-population summary
+	// count).
+	confirmedTrue := true
+	cutoff24h := time.Now().Add(-24 * time.Hour)
+	confirmed24h, err := store.CountNodes(ctx, storage.NodeFilter{Confirmed: &confirmedTrue, ReachableSince: &cutoff24h})
+	if err != nil {
+		return counts, nil, pagination, err
+	}
+	counts.Confirmed24h = confirmed24h
 
 	// Paginated: the actual SQL-level LIMIT/OFFSET query backing the
 	// node table rows shown on this page, restricted to reachableSince
