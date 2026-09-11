@@ -1562,7 +1562,7 @@ func TestFullNetworkSummaryCounts(t *testing.T) {
 		t.Errorf("GET /network body's Confirmed card doesn't show 2 confirmed nodes:\n%s", body)
 	}
 	if !strings.Contains(body, "1 unconfirmed") {
-		t.Errorf("GET /network body's Confirmed card sub-label doesn't show 1 unconfirmed node:\n%s", body)
+		t.Errorf("GET /network body's Total nodes card sub-label doesn't show 1 unconfirmed node:\n%s", body)
 	}
 	if !strings.Contains(body, `<div class="card-label">Onion-capable</div>`) {
 		t.Errorf("GET /network body missing the Onion-capable summary card")
