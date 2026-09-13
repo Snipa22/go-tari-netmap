@@ -27,7 +27,7 @@ import (
 // PollIntervalGeneric is the minimum interval between polls of a discovered/generic node.
 // Enforced for politeness — polling more aggressively risks looking like abuse to the
 // wider Tari network.
-const PollIntervalGeneric = 2 * time.Hour
+const PollIntervalGeneric = 1 * time.Hour
 
 // PollIntervalPoolOwned is the poll interval for nodes explicitly tagged as pool-owned.
 // TODO(netmap): placeholder value — needs confirmation from the pool-ops team on the
@@ -48,14 +48,14 @@ const PollIntervalUnconfirmed = 15 * time.Minute
 // nodes (Node.PublicKey == nil) that have failed 3+ consecutive probes
 // with zero successes — "likely dead" per the same heuristic as web.go's
 // computeLikelyDead (see collectorLikelyDead in this file). Such nodes are
-// checked on roughly daily instead of every PollIntervalUnconfirmed,
+// checked on a roughly 2-hour cadence instead of every PollIntervalUnconfirmed,
 // since they are overwhelmingly likely to be permanently-gone gossip
 // ghosts: Tari's gossip protocol has no upstream expiry mechanism, so a
 // peer-walk keeps re-reporting addresses of nodes that will never come
 // back. This is a backoff, not a permanent skip — a genuinely revived
 // node is still polled, just less often, so it will eventually be
 // rediscovered as reachable.
-const PollIntervalLikelyDead = 24 * time.Hour
+const PollIntervalLikelyDead = 2 * time.Hour
 
 // PollIntervalNeverContacted is the poll cadence pollInterval falls back
 // to for an unconfirmed placeholder node that is past all three of the
@@ -108,12 +108,12 @@ const (
 // DiscoveryIntervalGeneric is the minimum interval between discovery-walk
 // dials of an already-known generic node. Enforced for the same
 // politeness reasons as PollIntervalGeneric.
-const DiscoveryIntervalGeneric = 6 * time.Hour
+const DiscoveryIntervalGeneric = 1 * time.Hour
 
 // DiscoveryIntervalPoolOwned is the discovery-walk cooldown for nodes
 // explicitly tagged as pool-owned — our own infra, walked more often
 // since we want fresher topology data for it specifically.
-const DiscoveryIntervalPoolOwned = 30 * time.Minute
+const DiscoveryIntervalPoolOwned = 10 * time.Minute
 
 // defaultTickInterval is how often Run checks which known nodes are due for
 // a poll when Collector.TickInterval is unset. It is independent of
@@ -181,15 +181,16 @@ const ownedDiscoveryWorkers = 16
 // cadences above — see this repo's collector-concurrency-brief for the full rationale.
 // Originally raised to 100 as a deliberate step up from strictly-sequential (1) per Alex's
 // request to "walk the network more aggressively"; raised again to 250 per updated guidance
-// from Alex, for the same reason — still a fixed, bounded worst case (never one goroutine per
-// due node, unbounded), just a bigger deliberate number.
+// from Alex, for the same reason. Cut back down to 50 as a precautionary reduction in this
+// tuning pass (not tied to any observed gRPC-side saturation) — still a fixed, bounded worst
+// case (never one goroutine per due node, unbounded), just a smaller deliberate number.
 //
 // Named maxGRPCPollWorkers (previously maxPollWorkers, before the P2P dial got its own,
 // separate, much smaller concurrency bound -- see maxP2PWorkersPerShard) because a single local
 // Tor SocksPort instance saturates catastrophically anywhere near this many concurrent hidden-
-// service circuit builds, even though 250 is completely fine for gRPC dials -- gRPC and P2P/
+// service circuit builds, even though 50 is completely fine for gRPC dials -- gRPC and P2P/
 // onion dials are no longer dispatched through one shared errgroup, see poll()'s doc comment.
-const maxGRPCPollWorkers = 250
+const maxGRPCPollWorkers = 50
 
 // maxP2PWorkersPerShard bounds the number of concurrent in-flight P2P/onion PollOnce dials
 // against a SINGLE Tor SOCKS-proxy shard (see P2PShardIndex/p2pNodeClient.ShardCount) within a
@@ -197,7 +198,7 @@ const maxGRPCPollWorkers = 250
 // SocksPort instance saturates catastrophically anywhere near 250 concurrent hidden-service
 // circuit builds (confirmed live: journalctl showed "No more HSDir available to query", circuit
 // resets, ~2.4% P2P probe success rate at that concurrency against one Tor instance) even though
-// 250 is completely fine for gRPC dials. 20 is a deliberate, much-lower per-shard default; total
+// 50 is completely fine for gRPC dials. 12 is a deliberate, much-lower per-shard default; total
 // P2P concurrency across ALL shards combined is maxP2PWorkersPerShard * shardCount, which
 // sharding P2P dials across N independent Tor instances (see p2p_client.go's
 // NewP2PClientWithShardedProxies) is what makes a large total P2P concurrency viable at all
@@ -207,7 +208,7 @@ const maxGRPCPollWorkers = 250
 // addresses (see cmd/netmap/main.go's NETMAP_SOCKS_PROXY_ADDRS) -- it is an internal safety
 // valve protecting a single Tor instance from being overwhelmed, not a topology fact about how
 // many Tor instances are deployed, so there is no operational reason to tune it per-deployment.
-const maxP2PWorkersPerShard = 20
+const maxP2PWorkersPerShard = 12
 
 // Sharded is implemented by NodeClient implementations that shard their dials across multiple
 // independent backing resources (see p2pNodeClient's ShardCount/socksProxyAddrs field for the
@@ -406,7 +407,7 @@ type Collector struct {
 	// cooldown enforced WITHIN a single DiscoverOwned/Discover pass,
 	// not how often Run kicks off a fresh pass). Optional: mirroring
 	// NeverContactedTickInterval's optional-field-with-sensible-default
-	// pattern, this defaults to DiscoveryIntervalPoolOwned itself (30
+	// pattern, this defaults to DiscoveryIntervalPoolOwned itself (10
 	// minutes) when left unset/<= 0 — the natural default tick for a
 	// loop whose entire purpose is guaranteeing DiscoveryIntervalPoolOwned's
 	// intended cadence for owned/seed nodes actually gets honored (see
@@ -414,7 +415,7 @@ type Collector struct {
 	// fixes). Set this explicitly only if the owned-discovery loop's
 	// tick cadence needs to differ from DiscoveryIntervalPoolOwned
 	// itself — e.g. in tests, which use a short interval so they don't
-	// need to wait 30 minutes for anything.
+	// need to wait 10 minutes for anything.
 	OwnedDiscoveryTickInterval time.Duration
 
 	// OnPollResult is an OPTIONAL observer invoked once per individual probe attempt made by
@@ -951,7 +952,7 @@ func discoveryCooldownKey(transportLabel, addr string) string {
 // walk finishes, which in production can take hours (see
 // DiscoveryPassDeadline's doc comment for the complementary fix on the
 // general-population side). This defeats DiscoveryIntervalPoolOwned's
-// intended ~30-minute cadence for exactly the nodes production cares
+// intended ~10-minute cadence for exactly the nodes production cares
 // most about having fresh topology data for.
 //
 // Unlike discoverWith, this is deliberately a FLAT, single-level
@@ -1188,12 +1189,12 @@ func (c *Collector) QueueSizes(ctx context.Context) (confirmed, unconfirmed, nev
 // through TWO INDEPENDENT concurrency-bounded dispatchers:
 //
 //   - gRPC dials all share one errgroup.Group bounded to
-//     maxGRPCPollWorkers (250) simultaneous in-flight calls, exactly as
+//     maxGRPCPollWorkers (50) simultaneous in-flight calls, exactly as
 //     the combined pool was bounded before this split.
 //   - P2P/onion dials are spread across shardCount independent
 //     errgroup.Groups (one per Tor-SOCKS-proxy shard — see
 //     P2PShardIndex/Sharded/p2pShardCount), each bounded to
-//     maxP2PWorkersPerShard (20) simultaneous in-flight calls. A given
+//     maxP2PWorkersPerShard (12) simultaneous in-flight calls. A given
 //     node's P2P dial is routed to shardGroups[P2PShardIndex(n.Address,
 //     shardCount)] — the EXACT same shard assignment c.P2PClient itself
 //     uses internally to pick its SOCKS proxy for that address (see
@@ -1204,10 +1205,11 @@ func (c *Collector) QueueSizes(ctx context.Context) (confirmed, unconfirmed, nev
 //     across all shards combined is maxP2PWorkersPerShard * shardCount.
 //
 // This split exists because a single local Tor SocksPort instance
-// saturates catastrophically anywhere near maxGRPCPollWorkers (250)
-// concurrent hidden-service circuit builds, even though that concurrency
-// is completely fine for gRPC dials — see maxP2PWorkersPerShard's doc
-// comment for the confirmed-live failure mode this fixes.
+// saturates catastrophically anywhere near maxGRPCPollWorkers's former
+// value of 250 concurrent hidden-service circuit builds, even though
+// that concurrency is completely fine for gRPC dials — see
+// maxP2PWorkersPerShard's doc comment for the confirmed-live failure
+// mode this fixes.
 //
 // Each transport's health check is still recorded independently exactly
 // as before this split — see pollTransportOnce, shared by this dispatch
