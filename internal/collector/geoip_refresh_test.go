@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -83,7 +84,8 @@ type fakeGeoIPDoer struct {
 }
 
 type geoIPBatchRequestItem struct {
-	Query string `json:"query"`
+	Query  string `json:"query"`
+	Fields string `json:"fields"`
 }
 
 type geoIPBatchResponseItem struct {
@@ -93,6 +95,19 @@ type geoIPBatchResponseItem struct {
 	Lon     float64 `json:"lon"`
 	City    string  `json:"city"`
 	Country string  `json:"country"`
+}
+
+// fieldsRequested reports whether field is present in a comma-separated
+// "fields" request string, matching how ip-api.com itself parses that
+// parameter -- used by fakeGeoIPDoer to only echo back what the real
+// API would for a given request, instead of unconditionally.
+func fieldsRequested(fields, field string) bool {
+	for _, f := range strings.Split(fields, ",") {
+		if f == field {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *fakeGeoIPDoer) Do(req *http.Request) (*http.Response, error) {
@@ -116,11 +131,22 @@ func (f *fakeGeoIPDoer) Do(req *http.Request) (*http.Response, error) {
 		if !ok || fixture.fail {
 			status = "fail"
 		}
-		resp = append(resp, geoIPBatchResponseItem{
+		item := geoIPBatchResponseItem{
 			Query: it.Query, Status: status,
 			Lat: fixture.lat, Lon: fixture.lon,
 			City: fixture.city, Country: fixture.country,
-		})
+		}
+		// Mirror ip-api.com's real batch behavior: a response item
+		// only carries a "query" value if "query" was present in that
+		// request item's "fields" string -- it is NOT echoed back by
+		// default. A fixture that always echoes Query regardless of
+		// the requested fields would hide a regression like
+		// internal/geoip's requestFields dropping "query", since
+		// lookupBatch there keys its result map by Query.
+		if !fieldsRequested(it.Fields, "query") {
+			item.Query = ""
+		}
+		resp = append(resp, item)
 	}
 
 	respBody, err := json.Marshal(resp)
