@@ -95,7 +95,7 @@ func newTestStore(t *testing.T) storage.Store {
 	if err != nil {
 		t.Fatalf("connect for truncate: %v", err)
 	}
-	if _, err := pool.Exec(ctx, "TRUNCATE TABLE node_health, peer_edge_observations, node_addresses, pending_submissions, nodes CASCADE"); err != nil {
+	if _, err := pool.Exec(ctx, "TRUNCATE TABLE node_health, peer_edge_observations, node_addresses, pending_submissions, nodes, geoip_cache CASCADE"); err != nil {
 		pool.Close()
 		t.Fatalf("truncate test tables: %v", err)
 	}
@@ -2815,5 +2815,114 @@ func TestStatsEndpointConfirmed24h(t *testing.T) {
 	}
 	if got.Confirmed24h != 2 {
 		t.Errorf("Confirmed24h = %d, want 2 (must be lower than the lifetime confirmed_nodes total)", got.Confirmed24h)
+	}
+}
+
+// TestNodesMapEndpoint covers GET /nodes/map's full contract:
+//   - an owner-tagged+IPv4 node WITH a geoip_cache entry is included,
+//     with lat/lon/city/country resolved from that cache entry and
+//     has_onion reflecting its own capability;
+//   - an owner-tagged+IPv4 node with NO geoip_cache entry yet is
+//     omitted entirely (never looked up -- the periodic refresh will
+//     pick it up later, see RefreshGeoIP);
+//   - a node with no owner tag at all is excluded regardless of
+//     IPv4/cache status;
+//   - a node with an owner tag but only an onion address (no IPv4) is
+//     excluded.
+func TestNodesMapEndpoint(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
+
+	// In population, has a fresh geoip_cache entry -- must appear.
+	inPop, err := store.UpsertDiscoveredNode(ctx, "203.0.113.10:18189", storage.DiscoverySourceRegistry,
+		map[string]any{"owner": "Alice"}, strPtr("Alice's Node"))
+	if err != nil {
+		t.Fatalf("upsert in-population node: %v", err)
+	}
+	if err := store.UpsertGeoIPCache(ctx, []storage.GeoIPEntry{{
+		IP: "203.0.113.10", Latitude: 40.7128, Longitude: -74.0060, City: "New York", Country: "United States",
+		LookedUpAt: time.Now(),
+	}}); err != nil {
+		t.Fatalf("seed geoip cache: %v", err)
+	}
+
+	// In population by predicate, but never geoip-looked-up yet --
+	// must be omitted (not appear with a zero-value lat/lon).
+	_, err = store.UpsertDiscoveredNode(ctx, "203.0.113.20:18189", storage.DiscoverySourceRegistry,
+		map[string]any{"owner": "Bob"}, nil)
+	if err != nil {
+		t.Fatalf("upsert never-looked-up node: %v", err)
+	}
+
+	// Not owner-tagged at all -- must be excluded regardless of IPv4.
+	_, err = store.UpsertDiscoveredNode(ctx, "203.0.113.30:18189", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert non-owner node: %v", err)
+	}
+
+	// Owner-tagged, but onion-only (no IPv4 at all) -- must be excluded.
+	_, err = store.UpsertDiscoveredNode(ctx, "qwertyuiopasdfgh.onion:18189", storage.DiscoverySourceRegistry,
+		map[string]any{"owner": "Carol"}, nil)
+	if err != nil {
+		t.Fatalf("upsert onion-only owner node: %v", err)
+	}
+
+	resp, err := http.Get(srv.URL + "/nodes/map")
+	if err != nil {
+		t.Fatalf("GET /nodes/map: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, http.StatusOK, body)
+	}
+
+	var got []api.MapNode
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("len(got) = %d, want exactly 1, got %+v", len(got), got)
+	}
+	entry := got[0]
+	if entry.NodeID != inPop.ID {
+		t.Errorf("NodeID = %v, want %v", entry.NodeID, inPop.ID)
+	}
+	if entry.Label != "Alice's Node" {
+		t.Errorf("Label = %q, want %q", entry.Label, "Alice's Node")
+	}
+	if entry.Latitude != 40.7128 || entry.Longitude != -74.0060 {
+		t.Errorf("lat/lon = %v/%v, want 40.7128/-74.0060", entry.Latitude, entry.Longitude)
+	}
+	if entry.City != "New York" || entry.Country != "United States" {
+		t.Errorf("city/country = %q/%q, want New York/United States", entry.City, entry.Country)
+	}
+	if entry.HasOnion {
+		t.Errorf("HasOnion = true, want false (this node has no onion address)")
+	}
+}
+
+// TestNodesMapEndpointEmpty confirms GET /nodes/map returns an empty
+// JSON array (never null, never an error) when nothing in the node
+// population is owner-tagged+IPv4 yet.
+func TestNodesMapEndpointEmpty(t *testing.T) {
+	srv, _ := newTestServer(t, nil)
+
+	resp, err := http.Get(srv.URL + "/nodes/map")
+	if err != nil {
+		t.Fatalf("GET /nodes/map: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if strings.TrimSpace(string(body)) != "[]" {
+		t.Errorf("body = %q, want %q", strings.TrimSpace(string(body)), "[]")
 	}
 }
