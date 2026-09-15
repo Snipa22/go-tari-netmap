@@ -39,6 +39,7 @@ import (
 	"github.com/Snipa22/go-tari-netmap/internal/adminauth"
 	"github.com/Snipa22/go-tari-netmap/internal/api"
 	"github.com/Snipa22/go-tari-netmap/internal/collector"
+	"github.com/Snipa22/go-tari-netmap/internal/geoip"
 	"github.com/Snipa22/go-tari-netmap/internal/storage"
 	"github.com/Snipa22/go-tari-netmap/internal/web"
 )
@@ -157,6 +158,15 @@ func main() {
 	c.Storage = store
 	c.GRPCClient = grpcClient
 	c.P2PClient = p2pClient
+	// GeoIPClient enables the /map feature's spike (see BRIEF.md): the
+	// background loop that opportunistically resolves lat/lon for the
+	// owner-tagged+has_ipv4 node population into storage's geoip_cache
+	// table. Always wired in (never nil) -- ip-api.com's free tier
+	// needs no API key/account, and the loop is cheap when the target
+	// population is empty (see collector.RefreshGeoIP's doc comment:
+	// zero candidate nodes means zero outbound requests, not even a
+	// Storage query beyond the initial ListNodes).
+	c.GeoIPClient = geoip.NewClient()
 	// OnPollResult feeds this process' own scheduled poll loops (PollConfirmed/
 	// PollUnconfirmed/PollNeverContacted) into netmap_<network>_collector_poll_result_total
 	// (see metrics.go's netmapMetrics.onPollResult/PollResultFunc) -- deliberately NOT wired
