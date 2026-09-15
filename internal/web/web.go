@@ -599,6 +599,7 @@ func NewHandler(store storage.Store, adminCreds adminauth.Credentials) (http.Han
 	mux.HandleFunc("GET /nodes/{id}", handleNodeDetail(tmpl, store))
 	mux.HandleFunc("GET /topology", handleTopologyGraph(tmpl))
 	mux.HandleFunc("GET /network", handleFullNetwork(tmpl, store))
+	mux.HandleFunc("GET /map", handleMapPage(tmpl))
 	mux.HandleFunc("GET /static/style.css", handleStaticCSS)
 
 	// The submission review page moved under /admin/* (see this
@@ -769,6 +770,22 @@ func handleFullNetwork(tmpl *template.Template, store storage.Store) http.Handle
 func handleTopologyGraph(tmpl *template.Template) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if err := tmpl.ExecuteTemplate(w, "topology.html.tmpl", nil); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	}
+}
+
+// handleMapPage serves the /map spike page (see BRIEF.md). Like
+// handleTopologyGraph, this is a near-static handler: it renders the
+// page shell only, with no node data passed in as Go template values.
+// All marker data is fetched client-side from the already privacy-aware
+// GET /api/nodes/map JSON endpoint (see map.html.tmpl's inline
+// <script>) — this guarantees the page can never bypass the one place
+// the /map population predicate is enforced, api.isMapEligible (and
+// its handler, api.handleNodesMap).
+func handleMapPage(tmpl *template.Template) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if err := tmpl.ExecuteTemplate(w, "map.html.tmpl", nil); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 	}

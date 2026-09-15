@@ -93,7 +93,7 @@ func newTestStore(t *testing.T) storage.Store {
 	if err != nil {
 		t.Fatalf("connect for truncate: %v", err)
 	}
-	if _, err := pool.Exec(ctx, "TRUNCATE TABLE node_health, peer_edge_observations, node_addresses, pending_submissions, nodes CASCADE"); err != nil {
+	if _, err := pool.Exec(ctx, "TRUNCATE TABLE node_health, peer_edge_observations, node_addresses, pending_submissions, nodes, geoip_cache CASCADE"); err != nil {
 		pool.Close()
 		t.Fatalf("truncate test tables: %v", err)
 	}
@@ -1227,6 +1227,39 @@ func TestTopologyGraphPage(t *testing.T) {
 	}
 	if strings.Contains(body, p2pAddr) {
 		t.Errorf("GET /topology body contains p2p node's raw address %q", p2pAddr)
+	}
+}
+
+// TestMapPage asserts GET /map renders the Leaflet map page shell
+// (never a node's raw address — all marker data is fetched
+// client-side from the already privacy-aware GET /api/nodes/map JSON
+// endpoint, mirroring TestTopologyGraphPage's assertions for
+// /topology's vis-network equivalent).
+func TestMapPage(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	const p2pAddr = "1.2.3.4:18142"
+	if _, err := store.UpsertDiscoveredNode(ctx, p2pAddr, storage.DiscoverySourceP2P, nil, nil); err != nil {
+		t.Fatalf("upsert p2p node: %v", err)
+	}
+
+	srv := newTestServer(t, store)
+	status, body := getBody(t, srv.URL+"/map")
+	if status != http.StatusOK {
+		t.Fatalf("GET /map status = %d, want %d", status, http.StatusOK)
+	}
+	if !strings.Contains(body, "leaflet") {
+		t.Errorf("GET /map body missing leaflet script/stylesheet tag")
+	}
+	if !strings.Contains(body, `id="map"`) {
+		t.Errorf("GET /map body missing map container element")
+	}
+	if !strings.Contains(body, "/api/nodes/map") {
+		t.Errorf("GET /map body missing client-side fetch of /api/nodes/map")
+	}
+	if strings.Contains(body, p2pAddr) {
+		t.Errorf("GET /map body contains p2p node's raw address %q", p2pAddr)
 	}
 }
 
