@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>go-tari-netmap — map</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1/dist/leaflet.css">
+  <script src="https://unpkg.com/leaflet@1/dist/leaflet.js"></script>
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-title"><a href="/">go-tari-netmap</a></div>
+    <nav>
+      <a href="/">Dashboard</a>
+      <a href="/topology">Topology</a>
+      <a href="/network">Full Network</a>
+      <a href="/map">Map</a>
+    </nav>
+  </header>
+
+  <main class="map-main">
+    <p class="tagline">
+      World map of registered nodes with a known owner and IPv4 address
+      — i.e. exactly the population that has opted in to public address
+      disclosure via the registry-submission form (see
+      <code>GET /api/nodes</code>'s existing privacy contract; this page
+      exposes no address beyond what that endpoint already publishes for
+      these same nodes, just projected as an approximate city-level
+      lat/lon instead of a raw IP). This is a feasibility spike: no
+      marker clustering, no filtering UI, no historical view.
+    </p>
+
+    <div id="map-status" class="empty-note"></div>
+    <div id="map"></div>
+  </main>
+
+  <script>
+    (function () {
+      var map = L.map('map', { worldCopyJump: true }).setView([20, 0], 2);
+
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 18,
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+      }).addTo(map);
+
+      var statusEl = document.getElementById('map-status');
+
+      // popupHTML builds a marker's popup content from one GET
+      // /api/nodes/map entry: label (if set) / node id fallback, city,
+      // country, and an onion-capable badge if has_onion. Built with
+      // plain string concatenation + a minimal escape helper rather
+      // than any templating dependency, matching this codebase's
+      // "vanilla JS, no framework" convention (see topology.html.tmpl).
+      function escapeHTML(s) {
+        var div = document.createElement('div');
+        div.appendChild(document.createTextNode(s));
+        return div.innerHTML;
+      }
+
+      function popupHTML(n) {
+        var title = escapeHTML(n.label || n.node_id);
+        var location = [n.city, n.country].filter(Boolean).map(escapeHTML).join(', ');
+        var html = '<strong>' + title + '</strong>';
+        if (location) {
+          html += '<br>' + location;
+        }
+        if (n.has_onion) {
+          html += '<br><span class="badge badge-onion">onion-capable</span>';
+        }
+        return html;
+      }
+
+      statusEl.textContent = 'Loading nodes\u2026';
+
+      fetch('/api/nodes/map')
+        .then(function (resp) {
+          if (!resp.ok) {
+            throw new Error('GET /api/nodes/map: ' + resp.status);
+          }
+          return resp.json();
+        })
+        .then(function (nodes) {
+          nodes = nodes || [];
+
+          if (nodes.length === 0) {
+            statusEl.textContent = 'No owner-tagged, IPv4-capable nodes with a resolved location yet.';
+            return;
+          }
+
+          nodes.forEach(function (n) {
+            L.marker([n.latitude, n.longitude])
+              .addTo(map)
+              .bindPopup(popupHTML(n));
+          });
+
+          statusEl.textContent = '';
+        })
+        .catch(function (err) {
+          statusEl.textContent = 'Failed to load map nodes: ' + err;
+        });
+    })();
+  </script>
+</body>
+</html>

@@ -507,3 +507,21 @@ main.topology-main {
 #graph-status:empty {
   display: none;
 }
+
+/* Map page */
+
+main.map-main {
+  max-width: none;
+}
+
+#map {
+  width: 100%;
+  height: 640px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+#map-status:empty {
+  display: none;
+}
