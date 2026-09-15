@@ -36,7 +36,15 @@ const RateLimit = 45
 
 // requestFields is passed as every batch item's "fields" value, asking
 // ip-api.com to return only what this package actually uses.
-const requestFields = "status,message,lat,lon,city,country"
+//
+// "query" MUST stay in this list even though nothing in Result reads
+// it directly: ip-api.com's batch endpoint only echoes a response
+// item's "query" key back if it was explicitly requested (it is NOT
+// included by default, unlike the singular-lookup endpoint) — and
+// lookupBatch keys its result map by batchResponseItem.Query. Drop
+// "query" from here and every response item's Query decodes as "",
+// collapsing every IP's result onto the same out[""] map key.
+const requestFields = "status,message,lat,lon,city,country,query"
 
 // HTTPDoer is the subset of *http.Client Client needs, letting tests
 // substitute a fake implementation with no real network access (see
