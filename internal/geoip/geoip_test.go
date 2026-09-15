@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -76,9 +77,20 @@ func (f *fakeDoer) Do(req *http.Request) (*http.Response, error) {
 		if r, ok := f.lookupByIP[it.Query]; ok {
 			r.Query = it.Query
 			respItems[i] = r
-			continue
+		} else {
+			respItems[i] = batchResponseItem{Query: it.Query, Status: "fail", Message: "no fixture"}
 		}
-		respItems[i] = batchResponseItem{Query: it.Query, Status: "fail", Message: "no fixture"}
+		// Mirror ip-api.com's real batch behavior: a response item
+		// only carries a "query" value at all if "query" was present
+		// in that request item's "fields" string -- it is NOT echoed
+		// back by default. Fixtures that always echo Query regardless
+		// of the requested fields (as this one used to) would hide a
+		// regression like requestFields dropping "query" (see
+		// geoip.go's requestFields doc comment) instead of catching
+		// it, since lookupBatch keys its result map by Query.
+		if !fieldsRequested(it.Fields, "query") {
+			respItems[i].Query = ""
+		}
 	}
 
 	respBody, err := json.Marshal(respItems)
@@ -90,6 +102,19 @@ func (f *fakeDoer) Do(req *http.Request) (*http.Response, error) {
 		Body:       io.NopCloser(bytes.NewReader(respBody)),
 		Header:     make(http.Header),
 	}, nil
+}
+
+// fieldsRequested reports whether field is present in a comma-separated
+// "fields" request string, matching how ip-api.com itself parses that
+// parameter -- used by fakeDoer to only echo back what the real API
+// would for a given request, instead of unconditionally.
+func fieldsRequested(fields, field string) bool {
+	for _, f := range strings.Split(fields, ",") {
+		if f == field {
+			return true
+		}
+	}
+	return false
 }
 
 // noWaitLimiter returns a rate.Limiter that never actually blocks Wait,
@@ -134,6 +159,55 @@ func TestLookupSingleBatchSuccessAndFailure(t *testing.T) {
 	}
 	if !got2.Failed {
 		t.Errorf("10.0.0.1: Failed = false, want true")
+	}
+}
+
+// TestLookupKeysDistinctIPsSeparately is a regression test for the bug
+// where requestFields omitted "query": ip-api.com's batch endpoint only
+// echoes a response item's "query" key back when it was explicitly
+// requested (see requestFields's doc comment in geoip.go), so every
+// batchResponseItem.Query decoded as "" and lookupBatch's
+// out[item.Query] = ... keying silently merged every IP's result onto
+// the single out[""] map entry -- the last IP processed in the batch
+// "winning" and every other IP simply vanishing from the returned map.
+//
+// With requestFields correctly requesting "query" (and fakeDoer
+// realistically only echoing it back when requested -- see
+// fieldsRequested), this must resolve each IP to its own distinct,
+// correct entry instead of collapsing them all into one.
+func TestLookupKeysDistinctIPsSeparately(t *testing.T) {
+	doer := &fakeDoer{
+		lookupByIP: map[string]batchResponseItem{
+			"1.2.3.4": {Status: "success", City: "London", Country: "United Kingdom"},
+			"5.6.7.8": {Status: "success", City: "Paris", Country: "France"},
+		},
+	}
+	c := &Client{HTTPClient: doer, Limiter: noWaitLimiter()}
+
+	results, err := c.Lookup(context.Background(), []string{"1.2.3.4", "5.6.7.8"})
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+
+	if len(results) != 2 {
+		t.Fatalf("expected 2 distinct results, got %d (results collapsed by an empty Query key?): %+v", len(results), results)
+	}
+	got1, ok := results["1.2.3.4"]
+	if !ok {
+		t.Fatalf("expected a result keyed by 1.2.3.4")
+	}
+	if got1.City != "London" {
+		t.Errorf("1.2.3.4: City = %q, want %q", got1.City, "London")
+	}
+	got2, ok := results["5.6.7.8"]
+	if !ok {
+		t.Fatalf("expected a result keyed by 5.6.7.8")
+	}
+	if got2.City != "Paris" {
+		t.Errorf("5.6.7.8: City = %q, want %q", got2.City, "Paris")
+	}
+	if _, ok := results[""]; ok {
+		t.Errorf("expected no result keyed by an empty Query, got one: %+v", results[""])
 	}
 }
 
