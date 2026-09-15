@@ -262,6 +262,25 @@ type Store interface {
 	// in the 'pending' state, used to enforce a hard cap on unreviewed
 	// queue size (abuse-mitigation: prevents unbounded growth from spam).
 	CountPendingSubmissions(ctx context.Context) (int, error)
+
+	// GetGeoIPCache returns the currently-cached geoip_cache row for
+	// every ip in ips that has one, keyed by ip. An ip with no cache
+	// entry yet is simply absent from the returned map (never a
+	// zero-value GeoIPEntry) -- callers (see
+	// internal/collector.staleGeoIPs) rely on a missing key meaning
+	// "never looked up", distinct from a present-but-LookupFailed
+	// entry. An empty ips returns an empty map without querying at
+	// all.
+	GetGeoIPCache(ctx context.Context, ips []string) (map[string]GeoIPEntry, error)
+
+	// UpsertGeoIPCache inserts or updates one geoip_cache row per entry
+	// in entries (keyed by entry.IP), overwriting
+	// latitude/longitude/city/country/looked_up_at/lookup_failed
+	// unconditionally on conflict -- there is no merge semantics here,
+	// unlike e.g. UpsertDiscoveredNode's tag-merging: a fresh lookup
+	// result (successful or failed) always fully replaces whatever was
+	// cached before for that IP.
+	UpsertGeoIPCache(ctx context.Context, entries []GeoIPEntry) error
 }
 
 // DefaultSeedHealthWindow is the default "currently healthy" recency
@@ -1765,6 +1784,83 @@ func (s *pgStore) RejectPendingSubmission(ctx context.Context, id uuid.UUID, rea
 			return err
 		}
 		return fmt.Errorf("storage: submission %s is not pending", id)
+	}
+	return nil
+}
+
+// GetGeoIPCache returns the currently-cached geoip_cache row for every ip
+// in ips that has one, keyed by ip. See the Store interface's doc
+// comment for the missing-key-means-never-looked-up contract.
+func (s *pgStore) GetGeoIPCache(ctx context.Context, ips []string) (map[string]GeoIPEntry, error) {
+	out := make(map[string]GeoIPEntry, len(ips))
+	if len(ips) == 0 {
+		return out, nil
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT host(ip), latitude, longitude, city, country, looked_up_at, lookup_failed
+		FROM geoip_cache
+		WHERE ip = ANY($1::inet[])
+	`, ips)
+	if err != nil {
+		return nil, fmt.Errorf("storage: get geoip cache: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var e GeoIPEntry
+		var lat, lon *float64
+		var city, country *string
+		if err := rows.Scan(&e.IP, &lat, &lon, &city, &country, &e.LookedUpAt, &e.LookupFailed); err != nil {
+			return nil, fmt.Errorf("storage: scan geoip cache row: %w", err)
+		}
+		if lat != nil {
+			e.Latitude = *lat
+		}
+		if lon != nil {
+			e.Longitude = *lon
+		}
+		if city != nil {
+			e.City = *city
+		}
+		if country != nil {
+			e.Country = *country
+		}
+		out[e.IP] = e
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage: get geoip cache: %w", err)
+	}
+	return out, nil
+}
+
+// UpsertGeoIPCache inserts or updates one geoip_cache row per entry in
+// entries, unconditionally overwriting every column on conflict (see
+// the Store interface's doc comment for why there is no merge
+// semantics here). Each entry is applied as its own statement rather
+// than a single multi-row INSERT -- entries is expected to stay small
+// (bounded by ip-api.com's own 100-IPs-per-batch-call limit, see
+// internal/geoip), so the extra round trips are not a real concern for
+// this spike, and this keeps the SQL simple.
+func (s *pgStore) UpsertGeoIPCache(ctx context.Context, entries []GeoIPEntry) error {
+	for _, e := range entries {
+		if e.IP == "" {
+			return fmt.Errorf("storage: geoip cache entry ip is required")
+		}
+		_, err := s.pool.Exec(ctx, `
+			INSERT INTO geoip_cache (ip, latitude, longitude, city, country, looked_up_at, lookup_failed)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			ON CONFLICT (ip) DO UPDATE SET
+				latitude = $2,
+				longitude = $3,
+				city = $4,
+				country = $5,
+				looked_up_at = $6,
+				lookup_failed = $7
+		`, e.IP, e.Latitude, e.Longitude, e.City, e.Country, e.LookedUpAt, e.LookupFailed)
+		if err != nil {
+			return fmt.Errorf("storage: upsert geoip cache entry %s: %w", e.IP, err)
+		}
 	}
 	return nil
 }

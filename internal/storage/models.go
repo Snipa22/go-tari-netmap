@@ -297,6 +297,26 @@ type PendingSubmission struct {
 	ProbeReachable   *bool      `json:"probe_reachable,omitempty"`
 }
 
+// GeoIPEntry is one cached geoip_cache row: the resolved (or
+// failed-to-resolve) location for a single IP address. See
+// Store.GetGeoIPCache/UpsertGeoIPCache's doc comments for the exact
+// cache-read-through contract this backs (the /map feature's spike --
+// see BRIEF.md). LookupFailed distinguishes a genuine "ip-api.com
+// couldn't geolocate this IP" result (Latitude/Longitude/City/Country
+// left at their zero values) from a successful lookup -- callers must
+// check LookupFailed rather than e.g. treating Latitude == 0 as
+// "unknown", since (0, 0) is itself a valid (if unlikely) real
+// coordinate.
+type GeoIPEntry struct {
+	IP           string    `json:"ip"`
+	Latitude     float64   `json:"latitude"`
+	Longitude    float64   `json:"longitude"`
+	City         string    `json:"city"`
+	Country      string    `json:"country"`
+	LookedUpAt   time.Time `json:"looked_up_at"`
+	LookupFailed bool      `json:"lookup_failed"`
+}
+
 // Pending submission status values. Kept as plain string constants
 // (rather than a distinct named type like DiscoverySource/ProbeSource)
 // since the CHECK constraint in 0007_submission_queue.sql is the real
