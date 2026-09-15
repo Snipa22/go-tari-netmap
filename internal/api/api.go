@@ -75,6 +75,14 @@ func NewRouter(store storage.Store, grpcClient, p2pClient collector.NodeClient, 
 	mux.HandleFunc("GET /topology", handleTopology(store))
 	mux.HandleFunc("GET /topology/top-peered", handleTopPeeredNodes(store))
 
+	// GET /nodes/map backs the /map dashboard page's spike (see
+	// BRIEF.md): the owner-tagged+has_ipv4 node population, geo-resolved
+	// to lat/lon via storage's geoip_cache table. Same trust level as
+	// the other read routes above (GET /nodes, GET /topology) --
+	// deliberately NOT under /admin. See handleNodesMap's doc comment
+	// for the "not a new privacy exposure" argument in full.
+	mux.HandleFunc("GET /nodes/map", handleNodesMap(store))
+
 	// Whole-population node counts + network-height snapshot (see
 	// internal/api/stats.go). Same trust level as the other read
 	// routes above — deliberately NOT under /admin. Versioned
