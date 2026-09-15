@@ -20,6 +20,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/Snipa22/go-tari-netmap/internal/geoip"
 	"github.com/Snipa22/go-tari-netmap/internal/netaddr"
 	"github.com/Snipa22/go-tari-netmap/internal/storage"
 )
@@ -173,6 +174,32 @@ const DiscoveryPassDeadline = 4 * time.Minute
 // genuinely in flight at once every pass, with no queueing at all in
 // the common case.
 const ownedDiscoveryWorkers = 16
+
+// defaultGeoIPRefreshTickInterval is how often Run checks the /map
+// feature's owner-tagged+has_ipv4 population for stale/missing
+// geoip_cache entries when Config.GeoIPRefreshTickInterval is left
+// unset/<= 0. 10 minutes mirrors DiscoveryIntervalPoolOwned's own
+// default cadence — frequent enough that a newly owner-tagged node
+// (see handleApproveSubmission) gets plotted on /map within one cycle
+// of being approved, without hammering ip-api.com's free-tier rate
+// limit (RefreshGeoIP only ever looks up IPs actually due per
+// GeoIPSuccessTTL/GeoIPFailedTTL, so most ticks do zero outbound
+// lookups once the cache is warm).
+const defaultGeoIPRefreshTickInterval = 10 * time.Minute
+
+// GeoIPSuccessTTL is how long a successful geoip_cache lookup stays
+// fresh before RefreshGeoIP considers it due for re-lookup — see
+// BRIEF.md's "30 days (successful)" cache policy.
+const GeoIPSuccessTTL = 30 * 24 * time.Hour
+
+// GeoIPFailedTTL is how long a FAILED geoip_cache lookup stays cached
+// before RefreshGeoIP retries it — deliberately much shorter than
+// GeoIPSuccessTTL (BRIEF.md's "1 day (failed lookups)" policy): a
+// transient rate-limit reject or ip-api.com hiccup shouldn't be cached
+// as "unresolvable" for a full month, but a genuinely-unresolvable IP
+// (e.g. one ip-api.com will simply never have data for) also shouldn't
+// be retried on every single refresh tick.
+const GeoIPFailedTTL = 24 * time.Hour
 
 // maxGRPCPollWorkers bounds the number of concurrent in-flight gRPC PollOnce dials within a
 // single poll() pass (shared by PollConfirmed, PollUnconfirmed, and PollNeverContacted). Each
@@ -350,6 +377,19 @@ type Collector struct {
 	// data from the other transport.
 	P2PClient NodeClient
 
+	// GeoIPClient, if non-nil, enables the periodic geoip-cache top-up
+	// loop (see RefreshGeoIP/runGeoIPRefreshLoop) that opportunistically
+	// resolves lat/lon for the /map feature's owner-tagged+has_ipv4
+	// population (see BRIEF.md) into storage's geoip_cache table, so
+	// GET /nodes/map's HTTP handler never needs to perform a live
+	// outbound geoip lookup itself. Nil (the default, and the default
+	// for every existing test in this package) disables the loop
+	// entirely -- runGeoIPRefreshLoop's goroutine still starts (see
+	// Run) but RefreshGeoIP no-ops immediately, mirroring how a nil
+	// GRPCClient/P2PClient disables their respective probes without
+	// erroring.
+	GeoIPClient *geoip.Client
+
 	// TickInterval governs how often Run checks which known confirmed
 	// nodes are due for a poll, and how often Run kicks off a fresh
 	// discovery pass. These run on independent tickers/goroutines (see
@@ -417,6 +457,19 @@ type Collector struct {
 	// itself — e.g. in tests, which use a short interval so they don't
 	// need to wait 10 minutes for anything.
 	OwnedDiscoveryTickInterval time.Duration
+
+	// GeoIPRefreshTickInterval governs how often Run checks the /map
+	// feature's owner-tagged+has_ipv4 population for geoip_cache
+	// entries that are missing or stale, via the independent
+	// RefreshGeoIP loop (see runGeoIPRefreshLoop). Optional: defaults
+	// to defaultGeoIPRefreshTickInterval when left unset/<= 0. Kept
+	// short and independent of the other tick intervals, same
+	// rationale as OwnedDiscoveryTickInterval/
+	// NeverContactedTickInterval above -- this loop is a no-op anyway
+	// when GeoIPClient is nil (see GeoIPClient's doc comment), so an
+	// aggressive default tick costs nothing for a Collector that
+	// hasn't opted into the /map feature at all.
+	GeoIPRefreshTickInterval time.Duration
 
 	// OnPollResult is an OPTIONAL observer invoked once per individual probe attempt made by
 	// this Collector's own scheduled poll loops (PollConfirmed/PollUnconfirmed/
@@ -494,9 +547,17 @@ func New(cfg Config) *Collector {
 //     finish before being revisited, defeating
 //     DiscoveryIntervalPoolOwned's intended cadence. See DiscoverOwned's
 //     doc comment for the full rationale.
+//   - the geoip-cache refresh loop (RefreshGeoIP) cannot be starved by,
+//     or starve, any of the other five — it runs on its own
+//     goroutine/ticker (see GeoIPRefreshTickInterval/
+//     runGeoIPRefreshLoop), and is a pure no-op (not even a Storage
+//     query) when GeoIPClient is nil. This is the loop GET
+//     /nodes/map's HTTP handler depends on to never need a live
+//     outbound geoip lookup of its own — see RefreshGeoIP's doc
+//     comment.
 //
-// All five goroutines share Storage and the NodeClients, and all
-// observe ctx cancellation independently. Run blocks until all five have
+// All six goroutines share Storage and the NodeClients, and all
+// observe ctx cancellation independently. Run blocks until all six have
 // exited (via a sync.WaitGroup) and returns nil on clean shutdown.
 //
 // Discover() and DiscoverOwned() only ever touch Storage and the
@@ -513,7 +574,9 @@ func New(cfg Config) *Collector {
 // guarded by c.mu — a shared owned/seed address being discovery-walked
 // concurrently by both loops is a race on WHICH of the two happens to
 // perform that particular dial, never a data race, and either outcome
-// is a correct, complete discovery-walk of that address.
+// is a correct, complete discovery-walk of that address. RefreshGeoIP
+// touches neither map — it only reads Storage and, when a lookup is
+// actually due, calls GeoIPClient.
 func (c *Collector) Run(ctx context.Context) error {
 	tick := c.TickInterval
 	if tick <= 0 {
@@ -535,8 +598,13 @@ func (c *Collector) Run(ctx context.Context) error {
 		ownedDiscoveryTick = DiscoveryIntervalPoolOwned
 	}
 
+	geoIPRefreshTick := c.GeoIPRefreshTickInterval
+	if geoIPRefreshTick <= 0 {
+		geoIPRefreshTick = defaultGeoIPRefreshTickInterval
+	}
+
 	var wg sync.WaitGroup
-	wg.Add(5)
+	wg.Add(6)
 
 	go func() {
 		defer wg.Done()
@@ -561,6 +629,11 @@ func (c *Collector) Run(ctx context.Context) error {
 	go func() {
 		defer wg.Done()
 		c.runOwnedDiscoverLoop(ctx, ownedDiscoveryTick)
+	}()
+
+	go func() {
+		defer wg.Done()
+		c.runGeoIPRefreshLoop(ctx, geoIPRefreshTick)
 	}()
 
 	wg.Wait()
@@ -700,6 +773,32 @@ func (c *Collector) runOwnedDiscoverLoop(ctx context.Context, tick time.Duration
 		case <-ticker.C:
 			if err := c.DiscoverOwned(ctx); err != nil {
 				log.Printf("collector: owned discovery pass error: %v", err)
+			}
+		}
+	}
+}
+
+// runGeoIPRefreshLoop runs RefreshGeoIP once immediately, then on every
+// tick, until ctx is cancelled. It runs entirely independently of every
+// other loop above, on its own ticker (see Run's geoIPRefreshTick) — see
+// RefreshGeoIP's doc comment for what it actually does, and GeoIPClient's
+// doc comment for why this loop is a cheap no-op when the /map feature
+// hasn't been opted into (GeoIPClient == nil).
+func (c *Collector) runGeoIPRefreshLoop(ctx context.Context, tick time.Duration) {
+	ticker := time.NewTicker(tick)
+	defer ticker.Stop()
+
+	if err := c.RefreshGeoIP(ctx); err != nil {
+		log.Printf("collector: geoip refresh pass error: %v", err)
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := c.RefreshGeoIP(ctx); err != nil {
+				log.Printf("collector: geoip refresh pass error: %v", err)
 			}
 		}
 	}
@@ -1594,12 +1693,30 @@ func isPoolOwned(n storage.Node) bool {
 			return true
 		}
 	}
-	if v, ok := n.Tags["owner"]; ok {
-		if s, ok := v.(string); ok && s != "" {
-			return true
-		}
+	return HasOwnerTag(n)
+}
+
+// HasOwnerTag reports whether n.Tags["owner"] is set to a non-empty
+// string -- the real-world "someone registered/claimed this IP" signal
+// (see isPoolOwned's doc comment for the full history/rationale; this is
+// exactly that function's second, actually-used-in-production check,
+// factored out and exported). An empty-string owner tag does NOT count.
+//
+// Exported (unlike isPoolOwned itself) specifically so internal/api's
+// /map feature (see BRIEF.md) can reuse this exact predicate for its
+// owner-tagged+has_ipv4 population gate without reimplementing it --
+// internal/api already imports internal/collector, so this is the
+// correct direction for that dependency, and internal/collector's own
+// geoip-cache refresh loop (see RefreshGeoIP) reuses it identically for
+// its candidate-node selection, guaranteeing the two can never drift
+// apart on what counts as "owner-tagged".
+func HasOwnerTag(n storage.Node) bool {
+	v, ok := n.Tags["owner"]
+	if !ok {
+		return false
 	}
-	return false
+	s, ok := v.(string)
+	return ok && s != ""
 }
 
 func (c *Collector) due(addr string, now time.Time) bool {
