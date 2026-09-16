@@ -14,6 +14,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/google/uuid"
+
 	"github.com/Snipa22/go-tari-netmap/internal/api"
 	"github.com/Snipa22/go-tari-netmap/internal/collector"
 	"github.com/Snipa22/go-tari-netmap/internal/storage"
@@ -42,13 +44,20 @@ import (
 //     (grpc|p2p) poll outcome counts, fed from collector.Collector.OnPollResult (see
 //     internal/collector/collector.go's PollResultFunc).
 //   - netmap_<network>_collector_poll_queue_backlog{queue} -- current size of each of the
-//     collector's four poll queues (confirmed_owned|confirmed_generic|unconfirmed|
-//     never_contacted), mirroring PollOwnedConfirmed/PollGenericConfirmed/PollUnconfirmed/
-//     PollNeverContacted's own NodeFilter split exactly. The previous single "confirmed" label
-//     (pre-owned/generic split) was checked against every known Grafana dashboard/docs/
+//     collector's five poll queues (confirmed_owned|confirmed_generic|unconfirmed_active|
+//     unconfirmed_likely_dead|never_contacted), mirroring PollOwnedConfirmed/
+//     PollGenericConfirmed/PollUnconfirmed/PollNeverContacted's own NodeFilter split, with the
+//     unconfirmed queue further split into unconfirmed_active vs unconfirmed_likely_dead (see
+//     queueBacklog's own doc comment below for why: at real network scale the single old
+//     "unconfirmed" number was ~99.4% likely-dead nodes already backed off to a weekly poll
+//     cadence, wildly overstating near-term collector workload). The previous single
+//     "confirmed" label (pre-owned/generic split) and the previous single "unconfirmed" label
+//     (pre-active/likely-dead split) were checked against every known Grafana dashboard/docs/
 //     internal/web consumer before being replaced outright here -- nothing in this repo
-//     referenced it, so there was no additive-compat requirement to preserve it alongside the
-//     two new labels.
+//     referenced either, so there was no additive-compat requirement to preserve them alongside
+//     their respective new labels. BREAKING CHANGE for any existing Grafana panel keyed on
+//     queue="confirmed" or queue="unconfirmed" -- those label values no longer exist; see
+//     queueBacklog's doc comment.
 //   - netmap_<network>_collector_known_nodes{discovery_source} -- whole-population known-node
 //     counts by discovery_source (p2p|registry|both), reusing api.FetchNodeCounts -- the exact
 //     same query/computation GET /api/v1/stats and the HTML dashboard's summary cards already
@@ -110,12 +119,37 @@ type netmapMetrics struct {
 	// of any subsequent storage write outcome.
 	pollResult *prometheus.CounterVec
 
-	// queueBacklog is the current size of each of the collector's four disjoint poll queues
+	// queueBacklog is the current size of each of the collector's five disjoint poll queues
 	// (see internal/collector/collector.go's PollOwnedConfirmed/PollGenericConfirmed/
 	// PollUnconfirmed/PollNeverContacted doc comments for the exact NodeFilter each
-	// corresponds to), labeled by queue (confirmed_owned|confirmed_generic|unconfirmed|
-	// never_contacted). Updated periodically by refresh, not
-	// live per-scrape -- see metricsRefreshInterval's doc comment.
+	// corresponds to), labeled by queue (confirmed_owned|confirmed_generic|unconfirmed_active|
+	// unconfirmed_likely_dead|never_contacted). Updated periodically by refresh, not live
+	// per-scrape -- see metricsRefreshInterval's doc comment.
+	//
+	// BREAKING CHANGE (semver/dashboard-relevant, flag to Alex): this used to be two single
+	// values -- queue="confirmed" (now split into confirmed_owned/confirmed_generic, mirroring
+	// PollOwnedConfirmed/PollGenericConfirmed's own NodeFilter split) and queue="unconfirmed"
+	// (every node with public_key IS NULL that has at least one health-check row
+	// (storage.NodeFilter{Confirmed: &unconfirmed, HasHealthChecks: &hasHistory}), matching
+	// internal/collector's PollUnconfirmed filter exactly). A live production check found that
+	// the unconfirmed number wildly overstates near-term collector workload: of 50,420 nodes in
+	// that bucket, 50,115 (~99.4%) were already "likely dead" per collectorLikelyDead's
+	// heuristic (3+ of their most recent 3 probes failed, zero successes) -- i.e. already
+	// backed off to the weekly PollIntervalLikelyDead cadence, not nodes under active
+	// near-term dial pressure. Only ~305 were genuinely "active unconfirmed" (still on the
+	// normal PollIntervalUnconfirmed/checkpoint cadence). This splits that one label into two
+	// so the metric distinguishes cadence tiers instead of conflating them:
+	//   - queue="unconfirmed_active": unconfirmed nodes NOT currently classified likely-dead
+	//     (storage.IsLikelyDead on their most recent 3 health checks returns false) -- still
+	//     on the normal/checkpoint cadence.
+	//   - queue="unconfirmed_likely_dead": unconfirmed nodes that ARE currently classified
+	//     likely-dead by that exact same storage.IsLikelyDead heuristic internal/collector's
+	//     own pollInterval uses to back a node off to PollIntervalLikelyDead -- reused here
+	//     rather than reimplemented, via GetNodeHistoryForNodes' batch classification (see
+	//     refresh below).
+	// The old queue="confirmed" and queue="unconfirmed" label values no longer exist at all --
+	// any existing Grafana panel keyed on either will show no data and needs updating to
+	// sum/select the respective new label values instead. never_contacted is unchanged.
 	queueBacklog *prometheus.GaugeVec
 
 	// knownNodes is the whole-population known-node count by discovery_source
@@ -160,7 +194,7 @@ func newNetmapMetrics(network string) (*netmapMetrics, error) {
 
 	m.queueBacklog = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: prefix + "collector_poll_queue_backlog",
-		Help: "Current size of each of the collector's four poll queues, labeled by queue (confirmed_owned|confirmed_generic|unconfirmed|never_contacted). Updated periodically, not live per-scrape.",
+		Help: "Current size of each of the collector's five poll queues, labeled by queue (confirmed_owned|confirmed_generic|unconfirmed_active|unconfirmed_likely_dead|never_contacted). Updated periodically, not live per-scrape.",
 	}, []string{"queue"})
 
 	m.knownNodes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -242,9 +276,12 @@ func (m *netmapMetrics) refresh(ctx context.Context, store storage.Store) {
 	defer cancel2()
 
 	// The CountNodes filters below are deliberately identical to
-	// collector.PollOwnedConfirmed/PollGenericConfirmed/PollUnconfirmed/PollNeverContacted's
-	// own NodeFilter construction (see internal/collector/collector.go) -- these ARE the
-	// collector's four poll queues, just counted rather than listed-and-dialed.
+	// collector.PollOwnedConfirmed/PollGenericConfirmed's own NodeFilter construction (see
+	// internal/collector/collector.go) -- these ARE the collector's owned/generic confirmed
+	// poll queues, just counted rather than listed-and-dialed. unconfirmed's backlog (split
+	// into unconfirmed_active/unconfirmed_likely_dead below) and never_contacted's CountNodes
+	// are likewise deliberately identical to collector.PollUnconfirmed/PollNeverContacted's own
+	// NodeFilter construction.
 	confirmed := true
 	owned := true
 	if n, err := store.CountNodes(queryCtx, storage.NodeFilter{Confirmed: &confirmed, Owned: &owned}); err != nil {
@@ -260,12 +297,13 @@ func (m *netmapMetrics) refresh(ctx context.Context, store storage.Store) {
 		m.queueBacklog.WithLabelValues("confirmed_generic").Set(float64(n))
 	}
 
+	// The two blocks below (unconfirmed's backlog split + never_contacted's CountNodes) are
+	// deliberately identical to collector.PollUnconfirmed/PollNeverContacted's own NodeFilter
+	// construction (see internal/collector/collector.go) -- these ARE the collector's poll
+	// queues, just counted/classified rather than listed-and-dialed.
 	unconfirmed := false
-	hasHistory := true
-	if n, err := store.CountNodes(queryCtx, storage.NodeFilter{Confirmed: &unconfirmed, HasHealthChecks: &hasHistory}); err != nil {
-		log.Printf("netmap: metrics refresh: count unconfirmed nodes: %v", err)
-	} else {
-		m.queueBacklog.WithLabelValues("unconfirmed").Set(float64(n))
+	if err := m.refreshUnconfirmedQueueBacklog(queryCtx, store); err != nil {
+		log.Printf("netmap: metrics refresh: unconfirmed queue backlog: %v", err)
 	}
 
 	noHistory := false
@@ -283,6 +321,57 @@ func (m *netmapMetrics) refresh(ctx context.Context, store storage.Store) {
 	m.knownNodes.WithLabelValues("p2p").Set(float64(counts.P2P))
 	m.knownNodes.WithLabelValues("registry").Set(float64(counts.Registry))
 	m.knownNodes.WithLabelValues("both").Set(float64(counts.Both))
+}
+
+// likelyDeadHistoryLimit is the number of most-recent health-check rows fetched per
+// unconfirmed node in refreshUnconfirmedQueueBacklog to classify it via storage.IsLikelyDead --
+// exactly 3, matching that heuristic's own "most recent 3, all failed" windowing requirement
+// (see internal/collector/collector.go's identical GetNodeHistory(ctx, n.ID, 3) call in
+// pollInterval).
+const likelyDeadHistoryLimit = 3
+
+// refreshUnconfirmedQueueBacklog is queueBacklog's unconfirmed_active/unconfirmed_likely_dead
+// half of refresh (see queueBacklog's own doc comment for the full "why split it" rationale
+// and the breaking-change note). It lists every unconfirmed node with at least one
+// health-check row (Confirmed: false, HasHealthChecks: true -- the exact same NodeFilter the
+// old, single "unconfirmed" gauge used, and the same filter internal/collector's
+// PollUnconfirmed uses for its own poll queue), then classifies each one into
+// unconfirmed_active vs unconfirmed_likely_dead via storage.IsLikelyDead applied to that
+// node's most recent likelyDeadHistoryLimit health checks -- fetched in one batched
+// GetNodeHistoryForNodes call, not one GetNodeHistory call per node, since production scale
+// here is tens of thousands of nodes. This reuses the EXACT same heuristic
+// internal/collector's own pollInterval/collectorLikelyDead consults to decide a node's poll
+// cadence (both now call storage.IsLikelyDead), rather than a second, possibly-drifting
+// reimplementation.
+func (m *netmapMetrics) refreshUnconfirmedQueueBacklog(ctx context.Context, store storage.Store) error {
+	unconfirmed := false
+	hasHistory := true
+	nodes, err := store.ListNodes(ctx, storage.NodeFilter{Confirmed: &unconfirmed, HasHealthChecks: &hasHistory})
+	if err != nil {
+		return fmt.Errorf("list unconfirmed nodes with history: %w", err)
+	}
+
+	nodeIDs := make([]uuid.UUID, len(nodes))
+	for i, n := range nodes {
+		nodeIDs[i] = n.ID
+	}
+	historyByNode, err := store.GetNodeHistoryForNodes(ctx, nodeIDs, likelyDeadHistoryLimit)
+	if err != nil {
+		return fmt.Errorf("get node history for unconfirmed nodes: %w", err)
+	}
+
+	var active, likelyDead int
+	for _, id := range nodeIDs {
+		if storage.IsLikelyDead(historyByNode[id]) {
+			likelyDead++
+		} else {
+			active++
+		}
+	}
+
+	m.queueBacklog.WithLabelValues("unconfirmed_active").Set(float64(active))
+	m.queueBacklog.WithLabelValues("unconfirmed_likely_dead").Set(float64(likelyDead))
+	return nil
 }
 
 // runMetricsRefreshLoop calls refresh once immediately, then every metricsRefreshInterval,

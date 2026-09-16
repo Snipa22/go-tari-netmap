@@ -356,9 +356,11 @@ func TestOnPollResultIncrementsMetric(t *testing.T) {
 	}
 }
 
-// TestRefreshPopulatesGauges exercises refresh end-to-end against a real test database with
-// seeded nodes, asserting dbUp, queueBacklog, and knownNodes all end up populated with the
-// expected values.
+// TestRefreshPopulatesGauges exercises refresh end-to-end against a real test database,
+// seeding a mix of confirmed / active-unconfirmed / likely-dead / never-contacted nodes and
+// asserting each of the four resulting queue_backlog gauge values (queue="confirmed",
+// queue="unconfirmed_active", queue="unconfirmed_likely_dead", queue="never_contacted")
+// matches expectation exactly, plus dbUp and knownNodes.
 func TestRefreshPopulatesGauges(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -376,6 +378,29 @@ func TestRefreshPopulatesGauges(t *testing.T) {
 		t.Fatalf("seed never-contacted node: %v", err)
 	}
 
+	// activeUnconfirmed: unconfirmed, has history, but fewer than 3 recorded health checks
+	// (storage.IsLikelyDead's own "fewer than 3 is never enough to conclude anything" floor)
+	// -- must land in unconfirmed_active, not unconfirmed_likely_dead.
+	activeUnconfirmed, err := store.UpsertDiscoveredNode(ctx, "active-unconfirmed:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("seed active-unconfirmed node: %v", err)
+	}
+	if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{NodeID: activeUnconfirmed.ID, Reachable: false, ProbeSource: storage.ProbeSourceGRPC}); err != nil {
+		t.Fatalf("record active-unconfirmed health check: %v", err)
+	}
+
+	// likelyDead: unconfirmed, 3 most-recent health checks, zero successes among them --
+	// must land in unconfirmed_likely_dead per storage.IsLikelyDead's exact heuristic.
+	likelyDead, err := store.UpsertDiscoveredNode(ctx, "likely-dead:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("seed likely-dead node: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{NodeID: likelyDead.ID, Reachable: false, ProbeSource: storage.ProbeSourceGRPC}); err != nil {
+			t.Fatalf("record likely-dead health check %d: %v", i, err)
+		}
+	}
+
 	m := mustTestNetmapMetrics(t)
 	m.refresh(ctx, store)
 
@@ -390,14 +415,75 @@ func TestRefreshPopulatesGauges(t *testing.T) {
 	if !strings.Contains(body, `netmap_mainnet_collector_poll_queue_backlog{queue="confirmed_generic"} 1`) {
 		t.Errorf("scrape output missing confirmed_generic queue_backlog=1, got:\n%s", body)
 	}
+	if !strings.Contains(body, `netmap_mainnet_collector_poll_queue_backlog{queue="unconfirmed_active"} 1`) {
+		t.Errorf("scrape output missing unconfirmed_active queue_backlog=1, got:\n%s", body)
+	}
+	if !strings.Contains(body, `netmap_mainnet_collector_poll_queue_backlog{queue="unconfirmed_likely_dead"} 1`) {
+		t.Errorf("scrape output missing unconfirmed_likely_dead queue_backlog=1, got:\n%s", body)
+	}
 	if !strings.Contains(body, `netmap_mainnet_collector_poll_queue_backlog{queue="never_contacted"} 1`) {
 		t.Errorf("scrape output missing never_contacted queue_backlog=1, got:\n%s", body)
 	}
-	if !strings.Contains(body, `netmap_mainnet_collector_known_nodes{discovery_source="p2p"} 2`) {
-		t.Errorf("scrape output missing p2p known_nodes=2 (owned:1 + confirmed:1, both seeded via DiscoverySourceP2P), got:\n%s", body)
+	// The old, single "unconfirmed" label value must no longer appear at all -- see
+	// queueBacklog's doc comment on the breaking dashboard change this split is.
+	if strings.Contains(body, `queue="unconfirmed"}`) {
+		t.Errorf("scrape output unexpectedly still contains the old queue=\"unconfirmed\" label value, got:\n%s", body)
+	}
+	// p2p known_nodes=4: owned:1, confirmed:1, activeUnconfirmed, and likelyDead are all
+	// seeded via DiscoverySourceP2P above -- FetchNodeCounts counts the WHOLE population by
+	// discovery_source regardless of confirmed/unconfirmed/owned status.
+	if !strings.Contains(body, `netmap_mainnet_collector_known_nodes{discovery_source="p2p"} 4`) {
+		t.Errorf("scrape output missing p2p known_nodes=4, got:\n%s", body)
 	}
 	if !strings.Contains(body, `netmap_mainnet_collector_known_nodes{discovery_source="registry"} 1`) {
 		t.Errorf("scrape output missing registry known_nodes=1, got:\n%s", body)
+	}
+}
+
+// TestRefreshUnconfirmedQueueBacklogMatchesCollectorLikelyDeadHeuristic asserts
+// refreshUnconfirmedQueueBacklog's classification tracks storage.IsLikelyDead exactly, even
+// when a node's most recent 3 checks include a mix (never satisfies the heuristic) versus all
+// 4+ most-recent checks all failing including one older than the 3-check window (still
+// satisfies it, since only the most recent 3 matter) -- both edge cases collector.go's own
+// pollInterval doc comment calls out, exercised here via the metrics-refresh path instead.
+func TestRefreshUnconfirmedQueueBacklogMatchesCollectorLikelyDeadHeuristic(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	// mixedRecent: 3 most-recent checks are fail, fail, success (oldest to newest) -- one
+	// success among the most recent 3 rules out likely-dead regardless of history length.
+	mixedRecent, err := store.UpsertDiscoveredNode(ctx, "mixed-recent:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("seed mixed-recent node: %v", err)
+	}
+	for _, reachable := range []bool{false, false, true} {
+		if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{NodeID: mixedRecent.ID, Reachable: reachable, ProbeSource: storage.ProbeSourceGRPC}); err != nil {
+			t.Fatalf("record mixed-recent health check: %v", err)
+		}
+	}
+
+	// oldSuccessOnly: 4 checks total, oldest is a success, the 3 most recent are all
+	// failures -- must still classify as likely-dead, since only the most recent 3 are
+	// consulted (the older success outside that window doesn't save it).
+	oldSuccessOnly, err := store.UpsertDiscoveredNode(ctx, "old-success-only:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("seed old-success-only node: %v", err)
+	}
+	for _, reachable := range []bool{true, false, false, false} {
+		if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{NodeID: oldSuccessOnly.ID, Reachable: reachable, ProbeSource: storage.ProbeSourceGRPC}); err != nil {
+			t.Fatalf("record old-success-only health check: %v", err)
+		}
+	}
+
+	m := mustTestNetmapMetrics(t)
+	m.refresh(ctx, store)
+
+	body := scrapeNetmapMetrics(t, m)
+	if !strings.Contains(body, `netmap_mainnet_collector_poll_queue_backlog{queue="unconfirmed_active"} 1`) {
+		t.Errorf("scrape output missing unconfirmed_active queue_backlog=1 (mixedRecent), got:\n%s", body)
+	}
+	if !strings.Contains(body, `netmap_mainnet_collector_poll_queue_backlog{queue="unconfirmed_likely_dead"} 1`) {
+		t.Errorf("scrape output missing unconfirmed_likely_dead queue_backlog=1 (oldSuccessOnly), got:\n%s", body)
 	}
 }
 
