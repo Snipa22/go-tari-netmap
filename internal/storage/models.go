@@ -252,6 +252,41 @@ type HealthCheck struct {
 	PeerIdentityUpdatedAt *time.Time `json:"peer_identity_updated_at,omitempty"`
 }
 
+// IsLikelyDead applies the "3+ probes, zero successes" heuristic: a node
+// with at least 3 recorded health checks in history and not a single
+// Reachable == true among them is overwhelmingly likely to be
+// permanently gone rather than just having a bad day — in production,
+// 83% of nodes probed 3+ times never once succeed, so this is a
+// deliberately simple, well-grounded proxy for "persistently dead", not
+// a guess. Fewer than 3 history entries is never enough to conclude
+// anything, so it always returns false in that case.
+//
+// This is the single canonical implementation of that heuristic, shared
+// by internal/web's computeLikelyDead, internal/collector's
+// collectorLikelyDead, and cmd/netmap's metrics-refresh poll-queue-
+// backlog split (see that package's metrics.go) — it used to be
+// duplicated once already (collector.go's collectorLikelyDead mirroring
+// this package's web.go equivalent, kept in sync by doc-comment
+// cross-reference only, since internal/collector must not import
+// internal/web); moving it here (a package both already depend on)
+// lets every caller share the exact same "most recent 3, all failed"
+// windowing logic instead of drifting apart across a third copy.
+// history is assumed to already be truncated/ordered the way callers
+// need (e.g. GetNodeHistory's newest-first, limit-3 result) — this
+// function itself doesn't care about order, only whether every entry in
+// the given slice is unreachable.
+func IsLikelyDead(history []HealthCheck) bool {
+	if len(history) < 3 {
+		return false
+	}
+	for _, h := range history {
+		if h.Reachable {
+			return false
+		}
+	}
+	return true
+}
+
 // HealthCheckInput is the input to RecordHealthCheck.
 type HealthCheckInput struct {
 	NodeID         uuid.UUID

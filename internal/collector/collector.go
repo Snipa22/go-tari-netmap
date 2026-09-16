@@ -1686,23 +1686,18 @@ func pollOnceWithSource(ctx context.Context, client NodeClient, store storage.St
 	})
 }
 
-// collectorLikelyDead mirrors web.go's computeLikelyDead (see
-// internal/web/web.go) -- same "3+ probes, zero successes" heuristic --
-// duplicated here rather than imported because internal/collector must
-// not import internal/web (wrong direction in the package dependency
-// graph: web depends on collector's types/behavior, not vice versa).
-// Keep this in sync with computeLikelyDead if that heuristic ever
-// changes.
+// collectorLikelyDead delegates to storage.IsLikelyDead (see that
+// function's doc comment for the full "3+ probes, zero successes"
+// heuristic and rationale) -- kept as a thin wrapper, rather than calling
+// storage.IsLikelyDead directly at every call site below, purely so this
+// file's existing doc comments/call sites didn't need to change name.
+// Previously this duplicated web.go's computeLikelyDead's logic inline
+// (internal/collector must not import internal/web, wrong direction in
+// the package dependency graph); both now share storage.IsLikelyDead
+// instead of two independently-maintained copies of the same "most
+// recent 3, all failed" windowing logic.
 func collectorLikelyDead(history []storage.HealthCheck) bool {
-	if len(history) < 3 {
-		return false
-	}
-	for _, h := range history {
-		if h.Reachable {
-			return false
-		}
-	}
-	return true
+	return storage.IsLikelyDead(history)
 }
 
 // pollInterval returns the poll cadence for n based on whether it is an

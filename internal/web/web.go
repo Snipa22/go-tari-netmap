@@ -377,26 +377,19 @@ func formatDuration(d time.Duration) string {
 	return out
 }
 
-// computeLikelyDead applies the "3+ probes, zero successes" heuristic
-// shared by handleNodeDetail's nodeDetailData.LikelyDead and
-// buildNodeTableData's per-row dashboardNodeRow.LikelyDead: a node with
-// at least 3 recorded health checks in history and not a single
-// Reachable == true among them is overwhelmingly likely to be
-// permanently gone rather than just having a bad day — in production,
-// 83% of nodes probed 3+ times never once succeed, so this is a
-// deliberately simple, well-grounded proxy for "persistently dead", not
-// a guess. Fewer than 3 history entries is never enough to conclude
-// anything, so it always returns false in that case.
+// computeLikelyDead delegates to storage.IsLikelyDead (see that
+// function's doc comment for the full "3+ probes, zero successes"
+// heuristic and rationale) — kept as a thin wrapper, rather than calling
+// storage.IsLikelyDead directly at every call site below, purely so this
+// file's existing doc comments/call sites (handleNodeDetail's
+// nodeDetailData.LikelyDead, buildNodeTableData's per-row
+// dashboardNodeRow.LikelyDead) didn't need to change name. Previously
+// this and internal/collector's collectorLikelyDead were two
+// independently-maintained copies of the same logic, kept in sync only
+// by doc-comment cross-reference; both now share storage.IsLikelyDead
+// instead.
 func computeLikelyDead(history []storage.HealthCheck) bool {
-	if len(history) < 3 {
-		return false
-	}
-	for _, h := range history {
-		if h.Reachable {
-			return false
-		}
-	}
-	return true
+	return storage.IsLikelyDead(history)
 }
 
 // DefaultDashboardCountsCacheTTL is the default TTL dashboardCountsCache

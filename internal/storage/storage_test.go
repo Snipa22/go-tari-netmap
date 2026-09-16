@@ -903,6 +903,109 @@ func TestRecordHealthCheckAndHistory(t *testing.T) {
 	}
 }
 
+// TestGetNodeHistoryForNodes exercises the batch form of GetNodeHistory:
+// each of three nodes (one with 5 health checks, one with a single
+// check, one with zero) must get back exactly what a per-node
+// GetNodeHistory(nodeID, 3) call would have returned, newest first, in
+// one batched call — including a non-nil empty slice for the
+// zero-history node, and a correct empty-map result for a wholly empty
+// input.
+func TestGetNodeHistoryForNodes(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	busy, err := store.UpsertDiscoveredNode(ctx, "busy:1", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert busy: %v", err)
+	}
+	quiet, err := store.UpsertDiscoveredNode(ctx, "quiet:1", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert quiet: %v", err)
+	}
+	silent, err := store.UpsertDiscoveredNode(ctx, "silent:1", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert silent: %v", err)
+	}
+
+	// busy: 5 health checks, alternating reachable, oldest to newest.
+	for i := 0; i < 5; i++ {
+		if err := store.RecordHealthCheck(ctx, HealthCheckInput{
+			NodeID:      busy.ID,
+			Reachable:   i%2 == 0,
+			ProbeSource: ProbeSourceGRPC,
+		}); err != nil {
+			t.Fatalf("record busy health check %d: %v", i, err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// quiet: exactly 1 health check.
+	if err := store.RecordHealthCheck(ctx, HealthCheckInput{
+		NodeID:      quiet.ID,
+		Reachable:   true,
+		ProbeSource: ProbeSourceP2P,
+	}); err != nil {
+		t.Fatalf("record quiet health check: %v", err)
+	}
+
+	// silent: zero health checks (nothing recorded).
+
+	got, err := store.GetNodeHistoryForNodes(ctx, []uuid.UUID{busy.ID, quiet.ID, silent.ID}, 3)
+	if err != nil {
+		t.Fatalf("get node history for nodes: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("len(got) = %d, want 3 (one entry per input node id)", len(got))
+	}
+
+	busyHistory := got[busy.ID]
+	if len(busyHistory) != 3 {
+		t.Fatalf("len(busyHistory) = %d, want 3 (limit applied per node)", len(busyHistory))
+	}
+	// Cross-check against the single-node GetNodeHistory call with the
+	// same limit, rather than hand-deriving the expected newest-3
+	// ordering/reachable values here.
+	want, err := store.GetNodeHistory(ctx, busy.ID, 3)
+	if err != nil {
+		t.Fatalf("get node history (single): %v", err)
+	}
+	if len(want) != len(busyHistory) {
+		t.Fatalf("len(want) = %d, len(busyHistory) = %d, want equal", len(want), len(busyHistory))
+	}
+	for i := range want {
+		if want[i].ID != busyHistory[i].ID {
+			t.Errorf("busyHistory[%d].ID = %v, want %v (must match single-node GetNodeHistory result exactly)", i, busyHistory[i].ID, want[i].ID)
+		}
+		if want[i].Reachable != busyHistory[i].Reachable {
+			t.Errorf("busyHistory[%d].Reachable = %v, want %v", i, busyHistory[i].Reachable, want[i].Reachable)
+		}
+	}
+
+	quietHistory := got[quiet.ID]
+	if len(quietHistory) != 1 {
+		t.Fatalf("len(quietHistory) = %d, want 1", len(quietHistory))
+	}
+	if quietHistory[0].ProbeSource != ProbeSourceP2P {
+		t.Errorf("quietHistory[0].ProbeSource = %q, want %q", quietHistory[0].ProbeSource, ProbeSourceP2P)
+	}
+
+	silentHistory, ok := got[silent.ID]
+	if !ok {
+		t.Fatalf("got missing an entry for silent (zero-history) node id")
+	}
+	if len(silentHistory) != 0 {
+		t.Errorf("len(silentHistory) = %d, want 0", len(silentHistory))
+	}
+
+	empty, err := store.GetNodeHistoryForNodes(ctx, nil, 3)
+	if err != nil {
+		t.Fatalf("get node history for nodes (empty input): %v", err)
+	}
+	if len(empty) != 0 {
+		t.Errorf("len(empty) = %d, want 0 for a nil/empty input", len(empty))
+	}
+}
+
 // TestRecordHealthCheckProbeSourceRoundTrip verifies that both
 // ProbeSourceGRPC and ProbeSourceP2P round-trip correctly through
 // RecordHealthCheck + GetNodeHistory, and that a node can accrue history

@@ -149,6 +149,22 @@ type Store interface {
 	// node, newest first.
 	GetNodeHistory(ctx context.Context, nodeID uuid.UUID, limit int) ([]HealthCheck, error)
 
+	// GetNodeHistoryForNodes is the batch form of GetNodeHistory: for
+	// each of nodeIDs, it returns that node's most recent limit health
+	// checks (newest first), in a single query, avoiding an N+1 round
+	// trip per node — the same "batch instead of per-ID loop" shape as
+	// ListNodeAddressesForNodes above. The returned map always has one
+	// entry per input nodeID, even if that node has zero recorded
+	// health checks (an empty, non-nil slice, never a missing key). An
+	// empty nodeIDs returns an empty map without querying at all. This
+	// exists specifically to let a caller classify many nodes against
+	// IsLikelyDead's "most recent 3, all failed" heuristic without
+	// issuing one GetNodeHistory call per node (e.g.
+	// cmd/netmap/metrics.go's poll-queue-backlog gauge refresh, which
+	// classifies the entire unconfirmed-with-history node population on
+	// every refresh tick).
+	GetNodeHistoryForNodes(ctx context.Context, nodeIDs []uuid.UUID, limit int) (map[uuid.UUID][]HealthCheck, error)
+
 	// GetRecentSuccessfulHealthChecks returns the most recent limit
 	// health checks for a node that were reachable (reachable = true),
 	// newest first — unlike GetNodeHistory, unreachable rows are
@@ -1056,6 +1072,55 @@ func (s *pgStore) GetNodeHistory(ctx context.Context, nodeID uuid.UUID, limit in
 		return nil, fmt.Errorf("storage: get node history: %w", err)
 	}
 	return checks, nil
+}
+
+// GetNodeHistoryForNodes is the batch form of GetNodeHistory. It
+// initializes an empty-slice map entry for every input nodeID up front
+// (so a node with zero health checks still gets an empty-slice entry,
+// never a missing key), then fills in rows from a single query: a
+// ROW_NUMBER() OVER (PARTITION BY node_id ORDER BY ts DESC) window,
+// restricted to `node_id = ANY($1)`, capped to the first `limit` rows
+// per partition — the same "one query, not one per ID" shape as
+// ListNodeAddressesForNodes, generalized to a per-group LIMIT via a
+// window function rather than a plain WHERE clause. An empty nodeIDs
+// returns an empty map without querying at all.
+func (s *pgStore) GetNodeHistoryForNodes(ctx context.Context, nodeIDs []uuid.UUID, limit int) (map[uuid.UUID][]HealthCheck, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+
+	out := make(map[uuid.UUID][]HealthCheck, len(nodeIDs))
+	for _, id := range nodeIDs {
+		out[id] = []HealthCheck{}
+	}
+	if len(nodeIDs) == 0 {
+		return out, nil
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+healthCheckSelectColumns+`
+		FROM (
+			SELECT `+healthCheckSelectColumns+`,
+				ROW_NUMBER() OVER (PARTITION BY node_id ORDER BY ts DESC) AS rn
+			FROM node_health
+			WHERE node_id = ANY($1)
+		) ranked
+		WHERE rn <= $2
+		ORDER BY node_id, ts DESC
+	`, nodeIDs, limit)
+	if err != nil {
+		return nil, fmt.Errorf("storage: get node history for nodes: %w", err)
+	}
+	defer rows.Close()
+
+	checks, err := scanHealthCheckRows(rows)
+	if err != nil {
+		return nil, fmt.Errorf("storage: get node history for nodes: %w", err)
+	}
+	for _, h := range checks {
+		out[h.NodeID] = append(out[h.NodeID], h)
+	}
+	return out, nil
 }
 
 func (s *pgStore) GetRecentSuccessfulHealthChecks(ctx context.Context, nodeID uuid.UUID, limit int) ([]HealthCheck, error) {
