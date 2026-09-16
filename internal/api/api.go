@@ -53,8 +53,11 @@ var MaxPendingSubmissions = 100
 // configures the HTTP Basic Auth gate in front of every /admin/* route
 // (the submission review queue and the poll-now admin tool) — see
 // internal/adminauth.Wrap's doc comment for the fail-closed-503 behavior
-// when adminCreds isn't fully configured.
-func NewRouter(store storage.Store, grpcClient, p2pClient collector.NodeClient, adminCreds adminauth.Credentials) http.Handler {
+// when adminCreds isn't fully configured. statsCacheTTL configures GET
+// /v1/stats' in-process response cache (see stats.go's statsCache/
+// handleStats/DefaultStatsCacheTTL) — callers that don't care can pass
+// DefaultStatsCacheTTL.
+func NewRouter(store storage.Store, grpcClient, p2pClient collector.NodeClient, adminCreds adminauth.Credentials, statsCacheTTL time.Duration) http.Handler {
 	mux := http.NewServeMux()
 
 	// Created once and shared across every POST /nodes call (NewRouter
@@ -91,7 +94,7 @@ func NewRouter(store storage.Store, grpcClient, p2pClient collector.NodeClient, 
 	// is the API's first versioned route; future breaking changes to
 	// its response shape get their own /v2/ route instead of breaking
 	// existing callers in place.
-	mux.HandleFunc("GET /v1/stats", handleStats(store))
+	mux.HandleFunc("GET /v1/stats", handleStats(store, statsCacheTTL))
 
 	// Seed-node suggestion + Tari config.toml peer_seeds generator. Same
 	// trust level as the other read routes above (GET /nodes, GET
