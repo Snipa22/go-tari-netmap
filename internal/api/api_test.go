@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -152,7 +153,11 @@ func newTestServer(t *testing.T, client collector.NodeClient) (*httptest.Server,
 // particular, passing a zero-value adminauth.Credentials{} simulates
 // NETMAP_ADMIN_USER/NETMAP_ADMIN_PASSWORD being unset, which must fail
 // closed (503) on every /admin/* route regardless of what's supplied on
-// the request.
+// the request. Always builds with api.DefaultStatsCacheTTL — every
+// existing test hitting GET /v1/stats issues exactly one request per
+// fresh server/store, so the cache's TTL has no observable effect here;
+// see newTestServerWithStatsCacheTTL below for tests that specifically
+// exercise the cache's own timing behavior.
 func newTestServerWithCreds(t *testing.T, client collector.NodeClient, creds adminauth.Credentials) (*httptest.Server, storage.Store) {
 	t.Helper()
 	store := newTestStore(t)
@@ -162,7 +167,7 @@ func newTestServerWithCreds(t *testing.T, client collector.NodeClient, creds adm
 	// p2pClient is nil here: these tests only exercise the gRPC-labeled
 	// async health-check kickoff path; dual-probe behavior is covered by
 	// internal/collector's own tests.
-	srv := httptest.NewServer(api.NewRouter(store, client, nil, creds))
+	srv := httptest.NewServer(api.NewRouter(store, client, nil, creds, api.DefaultStatsCacheTTL))
 	t.Cleanup(srv.Close)
 	return srv, store
 }
@@ -2924,5 +2929,156 @@ func TestNodesMapEndpointEmpty(t *testing.T) {
 	}
 	if strings.TrimSpace(string(body)) != "[]" {
 		t.Errorf("body = %q, want %q", strings.TrimSpace(string(body)), "[]")
+	}
+}
+
+// countingStatsStore wraps a real storage.Store (from newTestStore),
+// counting every call to the methods handleStats' underlying
+// FetchNodeCounts/NetworkHeight work actually issues against the DB —
+// mirroring cmd/netmap/metrics_test.go's unreachableStore fake-store
+// pattern (embed the real storage.Store, override only the methods a
+// test cares about, delegate everything else) rather than inventing a
+// new mock style. queries is incremented once per call to ListNodes,
+// ListNodeAddressesForNodes, CountNodes (FetchConfirmed24h's query), or
+// NetworkHeight — a cache hit in handleStats must never call any of
+// these, so asserting the query count stays unchanged across a second
+// request within the TTL window proves the DB was only ever touched by
+// the first (cache-miss) request.
+type countingStatsStore struct {
+	storage.Store
+	queries atomic.Int32
+}
+
+func (c *countingStatsStore) ListNodes(ctx context.Context, filter storage.NodeFilter) ([]storage.Node, error) {
+	c.queries.Add(1)
+	return c.Store.ListNodes(ctx, filter)
+}
+
+func (c *countingStatsStore) ListNodeAddressesForNodes(ctx context.Context, nodeIDs []uuid.UUID) (map[uuid.UUID][]storage.NodeAddress, error) {
+	c.queries.Add(1)
+	return c.Store.ListNodeAddressesForNodes(ctx, nodeIDs)
+}
+
+func (c *countingStatsStore) CountNodes(ctx context.Context, filter storage.NodeFilter) (int, error) {
+	c.queries.Add(1)
+	return c.Store.CountNodes(ctx, filter)
+}
+
+func (c *countingStatsStore) NetworkHeight(ctx context.Context) (*int64, int, error) {
+	c.queries.Add(1)
+	return c.Store.NetworkHeight(ctx)
+}
+
+// newTestServerWithStatsCacheTTL builds a test server around store
+// (expected to be a *countingStatsStore in the cache tests below) with
+// an explicit GET /v1/stats cache TTL, bypassing newTestServerWithCreds'
+// hardcoded api.DefaultStatsCacheTTL — used only by tests that
+// specifically exercise the cache's own timing behavior.
+func newTestServerWithStatsCacheTTL(t *testing.T, store storage.Store, ttl time.Duration) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(api.NewRouter(store, collector.NewStubClient(), nil, adminauth.Credentials{Username: testAdminUser, Password: testAdminPassword}, ttl))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// getStats issues GET /v1/stats against srv and returns the decoded
+// body, failing the test on any transport/decode error or non-200
+// status.
+func getStats(t *testing.T, srv *httptest.Server) statsResponseForTest {
+	t.Helper()
+	resp, err := http.Get(srv.URL + "/v1/stats")
+	if err != nil {
+		t.Fatalf("GET /v1/stats: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, http.StatusOK, body)
+	}
+	var got statsResponseForTest
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return got
+}
+
+// TestStatsEndpointCacheHitWithinTTL asserts two GET /v1/stats calls
+// within the cache's TTL window return identical JSON AND the
+// underlying store is queried the exact same number of times after the
+// second call as after the first — the whole point of the cache: a
+// second request inside the TTL window must serve the cached response
+// with zero additional DB calls (handleStats' single computation issues
+// several underlying store method calls -- ListNodes,
+// ListNodeAddressesForNodes, CountNodes, NetworkHeight -- so "queried
+// once" here means once per request, not literally one call in total).
+func TestStatsEndpointCacheHitWithinTTL(t *testing.T) {
+	realStore := newTestStore(t)
+	ctx := context.Background()
+	if _, err := realStore.UpsertConfirmedNode(ctx, "stats-cache-1:1", []byte("stats-cache-pubkey-1"), storage.DiscoverySourceP2P); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	counting := &countingStatsStore{Store: realStore}
+	// A generous TTL (well beyond this test's runtime) so both requests
+	// land inside the same cache window regardless of test execution
+	// speed.
+	srv := newTestServerWithStatsCacheTTL(t, counting, time.Minute)
+
+	first := getStats(t, srv)
+	afterFirst := counting.queries.Load()
+	if afterFirst == 0 {
+		t.Fatalf("underlying store was never queried for the first (cache-miss) request")
+	}
+
+	second := getStats(t, srv)
+	afterSecond := counting.queries.Load()
+
+	if first != second {
+		t.Errorf("first = %+v, second = %+v, want identical (both should be served from cache)", first, second)
+	}
+	if afterSecond != afterFirst {
+		t.Errorf("underlying store query count changed from %d to %d after a second request within the TTL window, want unchanged (cache hit, zero additional DB calls)", afterFirst, afterSecond)
+	}
+}
+
+// TestStatsEndpointCacheExpiresAfterTTL asserts a call issued after the
+// cache's TTL has elapsed triggers a fresh query rather than continuing
+// to serve the stale cached response — uses a short (10ms) TTL plus
+// time.Sleep, per the brief's documented fallback (no existing fake-
+// clock/injectable-time-source pattern was found elsewhere in this
+// package to prefer over it).
+func TestStatsEndpointCacheExpiresAfterTTL(t *testing.T) {
+	realStore := newTestStore(t)
+	ctx := context.Background()
+	if _, err := realStore.UpsertConfirmedNode(ctx, "stats-cache-2:1", []byte("stats-cache-pubkey-2"), storage.DiscoverySourceP2P); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	counting := &countingStatsStore{Store: realStore}
+	const ttl = 10 * time.Millisecond
+	srv := newTestServerWithStatsCacheTTL(t, counting, ttl)
+
+	first := getStats(t, srv)
+	afterFirst := counting.queries.Load()
+	if afterFirst == 0 {
+		t.Fatalf("underlying store was never queried for the first (cache-miss) request")
+	}
+
+	// Add a second confirmed node so the post-expiry response is
+	// genuinely different from the cached one -- proving the second
+	// call actually recomputed rather than coincidentally matching.
+	if _, err := realStore.UpsertConfirmedNode(ctx, "stats-cache-3:1", []byte("stats-cache-pubkey-3"), storage.DiscoverySourceP2P); err != nil {
+		t.Fatalf("seed second node: %v", err)
+	}
+
+	time.Sleep(5 * ttl)
+
+	second := getStats(t, srv)
+	afterSecond := counting.queries.Load()
+	if afterSecond <= afterFirst {
+		t.Errorf("underlying store query count unchanged (%d) after TTL expiry, want > %d (a fresh query must have been issued)", afterSecond, afterFirst)
+	}
+	if second.TotalNodes != first.TotalNodes+1 {
+		t.Errorf("second.TotalNodes = %d, want %d (%d + the newly-seeded node, proving the post-expiry response was recomputed)", second.TotalNodes, first.TotalNodes+1, first.TotalNodes)
 	}
 }
