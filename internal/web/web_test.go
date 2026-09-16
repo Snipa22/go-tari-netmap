@@ -10,9 +10,11 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -122,10 +124,30 @@ func newTestServer(t *testing.T, store storage.Store) *httptest.Server {
 // particular, passing a zero-value adminauth.Credentials{} simulates
 // NETMAP_ADMIN_USER/NETMAP_ADMIN_PASSWORD being unset, which must fail
 // closed (503) on every /admin/* route regardless of what's supplied on
-// the request.
+// the request. Always builds with web.DefaultDashboardCountsCacheTTL —
+// every existing test hitting GET / or GET /network issues exactly one
+// request per fresh server/store, so the cache's TTL has no observable
+// effect here; see newTestServerWithCountsCacheTTL below for tests that
+// specifically exercise the cache's own timing/sharing behavior.
 func newTestServerWithCreds(t *testing.T, store storage.Store, creds adminauth.Credentials) *httptest.Server {
 	t.Helper()
-	handler, err := web.NewHandler(store, creds)
+	handler, err := web.NewHandler(store, creds, web.DefaultDashboardCountsCacheTTL)
+	if err != nil {
+		t.Fatalf("build web handler: %v", err)
+	}
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// newTestServerWithCountsCacheTTL is like newTestServerWithCreds but
+// lets the caller control the dashboard/network whole-population
+// counts cache's TTL directly, bypassing the hardcoded
+// web.DefaultDashboardCountsCacheTTL above — used only by tests that
+// specifically exercise the cache's own timing/sharing behavior.
+func newTestServerWithCountsCacheTTL(t *testing.T, store storage.Store, ttl time.Duration) *httptest.Server {
+	t.Helper()
+	handler, err := web.NewHandler(store, adminauth.Credentials{Username: testAdminUser, Password: testAdminPassword}, ttl)
 	if err != nil {
 		t.Fatalf("build web handler: %v", err)
 	}
@@ -1605,5 +1627,191 @@ func TestFullNetworkSummaryCounts(t *testing.T) {
 	}
 	if !strings.Contains(body, `<div class="card-label">Clearnet-only</div>`) {
 		t.Errorf("GET /network body missing the Clearnet-only summary card")
+	}
+}
+
+// countingWebStore wraps a real storage.Store (from newTestStore),
+// counting every call to ListNodes made with a bare, zero-value
+// storage.NodeFilter{} (wholePopulationListNodes) — the exact,
+// distinctively-shaped query buildNodeTableData's
+// computeWholePopulationCounts issues, and never the paginated
+// LIMIT/OFFSET/ReachableSince-filtered ListNodes call GET / and
+// GET /network also both issue on every request regardless of cache
+// state — plus every call to ListNodeAddressesForNodes
+// (addrsForNodesCalls), which after this change is ONLY ever called
+// from computeWholePopulationCounts (a cache hit reuses the cached
+// addrsByNode map for row rendering instead of a second, page-scoped
+// call), so counting it unconditionally is equivalent to counting only
+// the whole-population one. A cache hit in buildNodeTableData must
+// never call either, so asserting these counts stay unchanged across a
+// second request within the TTL window proves the DB was only ever
+// touched by the first (cache-miss) request — mirrors
+// internal/api/api_test.go's countingStatsStore fake-store pattern
+// (embed the real storage.Store, override only the methods a test
+// cares about, delegate everything else).
+type countingWebStore struct {
+	storage.Store
+	wholePopulationListNodes atomic.Int32
+	addrsForNodesCalls       atomic.Int32
+}
+
+func (c *countingWebStore) ListNodes(ctx context.Context, filter storage.NodeFilter) ([]storage.Node, error) {
+	if filter == (storage.NodeFilter{}) {
+		c.wholePopulationListNodes.Add(1)
+	}
+	return c.Store.ListNodes(ctx, filter)
+}
+
+func (c *countingWebStore) ListNodeAddressesForNodes(ctx context.Context, nodeIDs []uuid.UUID) (map[uuid.UUID][]storage.NodeAddress, error) {
+	c.addrsForNodesCalls.Add(1)
+	return c.Store.ListNodeAddressesForNodes(ctx, nodeIDs)
+}
+
+// seedCountedNode inserts one confirmed node so the counts/rows
+// rendered by GET / and GET /network are non-trivial, returning
+// nothing — tests below only care about card-value totals and query
+// counts, not this node's identity.
+func seedCountedNode(t *testing.T, store storage.Store, addrSuffix string) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := store.UpsertConfirmedNode(ctx, "counts-cache-"+addrSuffix+":1", []byte("counts-cache-pubkey-"+addrSuffix), storage.DiscoverySourceP2P); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+}
+
+// TestDashboardCountsCacheHitWithinTTL asserts two GET / requests
+// within the cache's TTL window return byte-identical whole-population
+// summary counts AND the underlying store's whole-population
+// ListNodes/ListNodeAddressesForNodes calls are NOT reissued on the
+// second request — the whole point of the cache: a second request
+// inside the TTL window must serve the cached counts (and addrsByNode)
+// with zero additional whole-population DB calls, while the paginated
+// row fetch itself still runs every time (untouched by this cache).
+func TestDashboardCountsCacheHitWithinTTL(t *testing.T) {
+	realStore := newTestStore(t)
+	seedCountedNode(t, realStore, "1")
+
+	counting := &countingWebStore{Store: realStore}
+	// A generous TTL (well beyond this test's runtime) so both requests
+	// land inside the same cache window regardless of test execution
+	// speed.
+	srv := newTestServerWithCountsCacheTTL(t, counting, time.Minute)
+
+	status, first := getBody(t, srv.URL+"/")
+	if status != http.StatusOK {
+		t.Fatalf("GET / status = %d, want %d", status, http.StatusOK)
+	}
+	afterFirstListNodes := counting.wholePopulationListNodes.Load()
+	afterFirstAddrs := counting.addrsForNodesCalls.Load()
+	if afterFirstListNodes == 0 {
+		t.Fatalf("underlying store's whole-population ListNodes was never called for the first (cache-miss) request")
+	}
+	if afterFirstAddrs == 0 {
+		t.Fatalf("underlying store's ListNodeAddressesForNodes was never called for the first (cache-miss) request")
+	}
+
+	status, second := getBody(t, srv.URL+"/")
+	if status != http.StatusOK {
+		t.Fatalf("GET / (second) status = %d, want %d", status, http.StatusOK)
+	}
+
+	if first != second {
+		t.Errorf("first body != second body, want identical (both should render from the same cached counts)")
+	}
+	if got := counting.wholePopulationListNodes.Load(); got != afterFirstListNodes {
+		t.Errorf("whole-population ListNodes call count changed from %d to %d after a second request within the TTL window, want unchanged (cache hit)", afterFirstListNodes, got)
+	}
+	if got := counting.addrsForNodesCalls.Load(); got != afterFirstAddrs {
+		t.Errorf("ListNodeAddressesForNodes call count changed from %d to %d after a second request within the TTL window, want unchanged (cache hit)", afterFirstAddrs, got)
+	}
+}
+
+// TestDashboardCountsCacheExpiresAfterTTL asserts a request issued
+// after the cache's TTL has elapsed triggers a fresh whole-population
+// fetch (and reflects newly-written data) rather than continuing to
+// serve the stale cached counts — uses a short (10ms) TTL plus
+// time.Sleep, per this package's existing convention (no
+// fake-clock/injectable-time-source pattern found here to prefer over
+// it — see internal/api/api_test.go's TestStatsEndpointCacheExpiresAfterTTL
+// for the identical approach in the sibling /v1/stats cache).
+func TestDashboardCountsCacheExpiresAfterTTL(t *testing.T) {
+	realStore := newTestStore(t)
+	seedCountedNode(t, realStore, "2")
+
+	counting := &countingWebStore{Store: realStore}
+	const ttl = 10 * time.Millisecond
+	srv := newTestServerWithCountsCacheTTL(t, counting, ttl)
+
+	status, first := getBody(t, srv.URL+"/network")
+	if status != http.StatusOK {
+		t.Fatalf("GET /network status = %d, want %d", status, http.StatusOK)
+	}
+	afterFirst := counting.wholePopulationListNodes.Load()
+	if afterFirst == 0 {
+		t.Fatalf("underlying store's whole-population ListNodes was never called for the first (cache-miss) request")
+	}
+
+	// Seed a second confirmed node so the post-expiry response is
+	// genuinely different from the cached one -- proving the second
+	// call actually recomputed rather than coincidentally matching.
+	seedCountedNode(t, realStore, "3")
+
+	time.Sleep(5 * ttl)
+
+	status, second := getBody(t, srv.URL+"/network")
+	if status != http.StatusOK {
+		t.Fatalf("GET /network (second) status = %d, want %d", status, http.StatusOK)
+	}
+	afterSecond := counting.wholePopulationListNodes.Load()
+	if afterSecond <= afterFirst {
+		t.Errorf("whole-population ListNodes call count unchanged (%d) after TTL expiry, want > %d (a fresh query must have been issued)", afterSecond, afterFirst)
+	}
+	if strings.Contains(second, `<div class="card-value">1</div>`) {
+		t.Errorf("second GET /network body still shows the stale 1-node total, want the recomputed 2-node total:\n%s", second)
+	}
+	if !strings.Contains(second, `<div class="card-value">2</div>`) {
+		t.Errorf("second GET /network body doesn't show the recomputed whole-population total (2):\n%s", second)
+	}
+	if first == second {
+		t.Errorf("first body == second body, want different (the post-expiry response must reflect the newly-seeded node)")
+	}
+}
+
+// TestDashboardAndNetworkShareCountsCache asserts GET / and GET
+// /network share the SAME cache entry: a first request to one route
+// populates the cache, and a subsequent request to the OTHER route
+// within the TTL window reuses it (zero additional whole-population
+// DB calls) rather than each route maintaining its own independent
+// cache.
+func TestDashboardAndNetworkShareCountsCache(t *testing.T) {
+	realStore := newTestStore(t)
+	seedCountedNode(t, realStore, "4")
+
+	counting := &countingWebStore{Store: realStore}
+	srv := newTestServerWithCountsCacheTTL(t, counting, time.Minute)
+
+	status, dashboardBody := getBody(t, srv.URL+"/")
+	if status != http.StatusOK {
+		t.Fatalf("GET / status = %d, want %d", status, http.StatusOK)
+	}
+	afterDashboard := counting.wholePopulationListNodes.Load()
+	if afterDashboard == 0 {
+		t.Fatalf("underlying store's whole-population ListNodes was never called for GET / (cache-miss)")
+	}
+
+	status, networkBody := getBody(t, srv.URL+"/network")
+	if status != http.StatusOK {
+		t.Fatalf("GET /network status = %d, want %d", status, http.StatusOK)
+	}
+	afterNetwork := counting.wholePopulationListNodes.Load()
+
+	if afterNetwork != afterDashboard {
+		t.Errorf("whole-population ListNodes call count changed from %d to %d after GET /network within the TTL window, want unchanged (shared cache entry populated by GET /)", afterDashboard, afterNetwork)
+	}
+	if !strings.Contains(dashboardBody, `<div class="card-value">1</div>`) {
+		t.Errorf("GET / body doesn't show the whole-population total (1):\n%s", dashboardBody)
+	}
+	if !strings.Contains(networkBody, `<div class="card-value">1</div>`) {
+		t.Errorf("GET /network body doesn't show the same whole-population total (1) served from the shared cache:\n%s", networkBody)
 	}
 }

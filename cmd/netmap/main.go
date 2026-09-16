@@ -52,6 +52,9 @@ func main() {
 	metricsAddr := flag.String("metrics-addr", "", "address to serve Prometheus /metrics + /healthz on (default empty = disabled, opt-in). "+
 		"CRITICAL: bind to an INTERNAL-ONLY address, e.g. 192.168.40.x:PORT or 127.0.0.1:PORT -- NEVER the address Caddy proxies -addr from. "+
 		"This is a SEPARATE listener from -addr (which is proxied) -- if you set this at all, prefer a loopback-only address such as 127.0.0.1:9472; do NOT use a bare :PORT form (binds ALL interfaces).")
+	dashboardCacheTTL := flag.Duration("dashboard-cache-ttl", web.DefaultDashboardCountsCacheTTL, "TTL for GET /'s and GET /network's shared in-process whole-population node-counts cache (e.g. \"20s\"). "+
+		"Both of these public, unauthenticated, dashboard routes compute the exact same unfiltered whole-population ListNodes/ListNodeAddressesForNodes query on every request -- this bounds how often "+
+		"that query actually runs under repeated polling, at the cost of up to this much staleness. 0 disables caching entirely (every request recomputes).")
 	flag.Parse()
 
 	metrics, err := newNetmapMetrics(*network)
@@ -195,7 +198,7 @@ func main() {
 		log.Printf("NETMAP_ADMIN_USER/NETMAP_ADMIN_PASSWORD not both set — /admin routes are disabled (503)")
 	}
 
-	webHandler, err := web.NewHandler(store, adminCreds)
+	webHandler, err := web.NewHandler(store, adminCreds, *dashboardCacheTTL)
 	if err != nil {
 		log.Fatalf("failed to build web handler: %v", err)
 	}
