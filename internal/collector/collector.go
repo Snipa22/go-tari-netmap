@@ -49,14 +49,21 @@ const PollIntervalUnconfirmed = 15 * time.Minute
 // nodes (Node.PublicKey == nil) that have failed 3+ consecutive probes
 // with zero successes — "likely dead" per the same heuristic as web.go's
 // computeLikelyDead (see collectorLikelyDead in this file). Such nodes are
-// checked on a roughly 2-hour cadence instead of every PollIntervalUnconfirmed,
+// checked on a weekly cadence instead of every PollIntervalUnconfirmed,
 // since they are overwhelmingly likely to be permanently-gone gossip
 // ghosts: Tari's gossip protocol has no upstream expiry mechanism, so a
 // peer-walk keeps re-reporting addresses of nodes that will never come
-// back. This is a backoff, not a permanent skip — a genuinely revived
-// node is still polled, just less often, so it will eventually be
-// rediscovered as reachable.
-const PollIntervalLikelyDead = 2 * time.Hour
+// back. Live production data confirmed the scale of this: of ~56k
+// tracked mainnet nodes, ~42k unconfirmed nodes have had no successful
+// probe AND no gossip re-sighting in over 7 days — overwhelmingly onion
+// peers whose Tor hidden-service descriptors can no longer be fetched
+// ("No more HSDir available to query" in Tor logs). At that scale, a
+// 2-hour cadence spends the bulk of the collector's polling budget
+// re-dialing addresses that will never answer again. This is still a
+// backoff, not a permanent skip — a genuinely revived node is still
+// polled, just less often (at most once a week), so it will eventually
+// be rediscovered as reachable.
+const PollIntervalLikelyDead = 7 * 24 * time.Hour
 
 // PollIntervalNeverContacted is the poll cadence pollInterval falls back
 // to for an unconfirmed placeholder node that is past all three of the

@@ -940,7 +940,10 @@ func recordHistory(t *testing.T, ctx context.Context, store storage.Store, nodeI
 
 // TestPollIntervalBacksOffLikelyDeadUnconfirmedNode covers scenario (a):
 // an unconfirmed node with 3+ consecutive failed probes and zero
-// successes is backed off to PollIntervalLikelyDead.
+// successes is backed off to PollIntervalLikelyDead -- a full week, per
+// the live-production scale (~42k of ~56k tracked mainnet nodes dark for
+// 7+ days, overwhelmingly permanently-gone onion gossip ghosts) that
+// justified widening this from its earlier 2-hour cadence.
 //
 // node's FirstSeen is explicitly backdated past NewNodeCheckpoint3 so
 // this test exercises the likely-dead logic in isolation from the new
@@ -963,6 +966,9 @@ func TestPollIntervalBacksOffLikelyDeadUnconfirmedNode(t *testing.T) {
 
 	if got := c.pollInterval(ctx, node); got != PollIntervalLikelyDead {
 		t.Errorf("pollInterval(likely-dead unconfirmed) = %v, want %v", got, PollIntervalLikelyDead)
+	}
+	if PollIntervalLikelyDead != 7*24*time.Hour {
+		t.Errorf("PollIntervalLikelyDead = %v, want the 1-week backoff (7*24h)", PollIntervalLikelyDead)
 	}
 }
 
@@ -1163,8 +1169,9 @@ func TestPollIntervalPastAllCheckpointsFallsBackToFlatUnconfirmed(t *testing.T) 
 // TestPollIntervalPastAllCheckpointsFallsBackToLikelyDead covers scenario
 // (d): a node aged past all 3 checkpoints (>= 60min since FirstSeen) with
 // 3+ failed history entries and zero successes returns
-// PollIntervalLikelyDead -- confirming the prior commit's behavior still
-// works correctly once gated behind "past all 3 checkpoints".
+// PollIntervalLikelyDead (the 1-week backoff) -- confirming the prior
+// commit's behavior still works correctly once gated behind "past all 3
+// checkpoints".
 func TestPollIntervalPastAllCheckpointsFallsBackToLikelyDead(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -1181,6 +1188,67 @@ func TestPollIntervalPastAllCheckpointsFallsBackToLikelyDead(t *testing.T) {
 
 	if got := c.pollInterval(ctx, node); got != PollIntervalLikelyDead {
 		t.Errorf("pollInterval(past checkpoints, 3+ failures) = %v, want %v", got, PollIntervalLikelyDead)
+	}
+	if PollIntervalLikelyDead != 7*24*time.Hour {
+		t.Errorf("PollIntervalLikelyDead = %v, want the 1-week backoff (7*24h)", PollIntervalLikelyDead)
+	}
+}
+
+// TestPollIntervalLikelyDeadNodeSelfPromotesAfterFreshSuccessfulProbe is
+// the regression test for the self-promotion path described in the
+// weekly-likely-dead-backoff brief: an unconfirmed node that has already
+// been backed off to PollIntervalLikelyDead (3+ consecutive failed
+// probes, zero successes) self-heals the instant a fresh probe succeeds
+// and is recorded -- no separate "promotion" code path is needed, since
+// collectorLikelyDead(history) is recomputed fresh from
+// GetNodeHistory(ctx, n.ID, 3) on every pollInterval call, and that
+// GetNodeHistory(..., 3) call only ever sees the most recent 3 rows
+// (newest-first). So the very next call after a successful probe is
+// recorded sees [true, false, false] (the new success plus the two
+// next-most-recent old failures, NOT all three original failures) --
+// still 3 entries, but no longer "zero successes" -- and
+// collectorLikelyDead returns false, so pollInterval falls through to
+// PollIntervalUnconfirmed.
+func TestPollIntervalLikelyDeadNodeSelfPromotesAfterFreshSuccessfulProbe(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	node, err := store.UpsertDiscoveredNode(ctx, "self-promotes:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+	node.FirstSeen = time.Now().Add(-90 * time.Minute)
+
+	c := New(Config{})
+	c.Storage = store
+
+	// 3+ consecutive failed probes, zero successes: establishes
+	// likely-dead status exactly like TestPollIntervalBacksOffLikelyDeadUnconfirmedNode.
+	recordHistory(t, ctx, store, node.ID, false, false, false, false)
+	if got := c.pollInterval(ctx, node); got != PollIntervalLikelyDead {
+		t.Fatalf("pollInterval(before fresh success) = %v, want %v (likely-dead precondition)", got, PollIntervalLikelyDead)
+	}
+
+	// Sleep so the fresh success below gets a strictly later ts than
+	// every one of the 4 failures above -- GetNodeHistory orders by ts
+	// DESC, so this guarantees it lands in (and at the front of) the
+	// most-recent-3 window regardless of Postgres timestamp resolution.
+	time.Sleep(10 * time.Millisecond)
+
+	// The node is eventually dialed again -- per pollOnceWithSource, a
+	// successful client.GetInfo call always records a fresh health
+	// check, even when it doesn't confirm a pubkey (node.PublicKey
+	// stays nil, so this pollInterval call still takes the unconfirmed
+	// branch) -- and this time the probe succeeds.
+	recordHistory(t, ctx, store, node.ID, true)
+
+	// GetNodeHistory(ctx, n.ID, 3) returns only the most recent 3 rows,
+	// newest-first: [true (fresh), false, false] -- the oldest of the
+	// original 4 failures has fallen out of the window entirely. Either
+	// way, one Reachable: true entry is present, so collectorLikelyDead
+	// must return false.
+	if got := c.pollInterval(ctx, node); got != PollIntervalUnconfirmed {
+		t.Errorf("pollInterval(after fresh success) = %v, want %v -- likely-dead node must self-promote on its very next pollInterval call once a probe succeeds", got, PollIntervalUnconfirmed)
 	}
 }
 
