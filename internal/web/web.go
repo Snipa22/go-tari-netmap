@@ -14,6 +14,7 @@ import (
 	"html/template"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -398,47 +399,109 @@ func computeLikelyDead(history []storage.HealthCheck) bool {
 	return true
 }
 
-// buildNodeTableData fetches the whole-population dashboardCounts
-// (Total/P2P/Registry/Both/Confirmed/Unconfirmed/OnionCapable/
-// ClearnetCapable/ClearnetOnly — always unfiltered, regardless of
-// reachableSince) plus a paginated page of dashboardNodeRow for a node
-// table. reachableSince nil means no filter (the full node population,
-// for /network); non-nil applies that cutoff (the main dashboard's
-// dashboardReachableWindow liveness view). page/limit/offset drive the
-// SQL-level LIMIT/OFFSET of the paginated page; historyLimit controls
-// how many HealthCheck rows are fetched per row (see
-// dashboardRowHistoryLimit/networkRowHistoryLimit) — LatestHealth only
-// ever needs the most recent one, but computeLikelyDead needs at least
-// 3 to ever return true.
+// DefaultDashboardCountsCacheTTL is the default TTL dashboardCountsCache
+// is built with when the caller doesn't override it — 20s, matching
+// internal/api's DefaultStatsCacheTTL (see PR #48's GET /v1/stats
+// cache) for consistency: both caches bound the exact same underlying
+// whole-population ListNodes/ListNodeAddressesForNodes query cost, just
+// for different consumers (the JSON GET /v1/stats endpoint there, the
+// HTML GET / and GET /network dashboard routes here).
+// cmd/netmap's -dashboard-cache-ttl flag defaults to this exact value.
+const DefaultDashboardCountsCacheTTL = 20 * time.Second
+
+// dashboardCountsCache is a small in-process TTL cache for the
+// whole-population dashboardCounts plus the addrsByNode map that feeds
+// both it and every node table row's privacy-scrubbed capability
+// fields (see buildNodeTableData) — the single unfiltered
+// store.ListNodes(ctx, storage.NodeFilter{}) + ListNodeAddressesForNodes
+// round trip that GET / (handleDashboard) and GET /network
+// (handleFullNetwork) both compute today, unpaginated and identical
+// regardless of which route triggered it.
 //
-// This is shared, extract-don't-change logic behind both
-// handleDashboard and handleFullNetwork: same whole-population counts
-// query, same per-row scrub+history+pagination-math shape, differing
-// only in the ReachableSince filter and historyLimit each passes in.
-func buildNodeTableData(ctx context.Context, store storage.Store, reachableSince *time.Time, page, limit, offset, historyLimit int) (dashboardCounts, []dashboardNodeRow, nodeTablePagination, error) {
+// One instance is created per NewHandler call (i.e. once per process,
+// at router construction time) and passed to BOTH handleDashboard and
+// handleFullNetwork — this is deliberately ONE shared cache entry, not
+// two: a cache hit on GET / populates it for a subsequent GET /network
+// within the same TTL window, and vice versa, since both routes would
+// otherwise recompute the exact same query.
+//
+// Guarded by a sync.RWMutex, mirroring internal/api/stats.go's
+// statsCache (see PR #48) for consistency rather than inventing a
+// second in-process caching pattern in this codebase.
+//
+// Accepted tradeoff (deliberately NOT implemented), same as
+// statsCache: concurrent cache-miss requests are not deduplicated
+// ("singleflight"-style) — two requests that both miss at the same
+// moment will both recompute and both re-store the result. Acceptable
+// given this query's low cost relative to request volume and
+// read-mostly access pattern; see statsCache's doc comment for the
+// full reasoning, which applies identically here.
+type dashboardCountsCache struct {
+	ttl time.Duration
+
+	mu          sync.RWMutex
+	counts      dashboardCounts
+	addrsByNode map[uuid.UUID][]storage.NodeAddress
+	computedAt  time.Time
+	valid       bool
+}
+
+// get returns the cached whole-population counts and addrsByNode map,
+// and true, if the cache holds a value computed within the last ttl;
+// otherwise it returns the zero value and false (cache miss/expiry —
+// the caller must recompute and call set).
+func (c *dashboardCountsCache) get() (dashboardCounts, map[uuid.UUID][]storage.NodeAddress, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if !c.valid || time.Since(c.computedAt) >= c.ttl {
+		return dashboardCounts{}, nil, false
+	}
+	return c.counts, c.addrsByNode, true
+}
+
+// set stores counts/addrsByNode as the new cached value, stamped with
+// the current time — the starting point for the next get's TTL check.
+func (c *dashboardCountsCache) set(counts dashboardCounts, addrsByNode map[uuid.UUID][]storage.NodeAddress) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.counts = counts
+	c.addrsByNode = addrsByNode
+	c.computedAt = time.Now()
+	c.valid = true
+}
+
+// computeWholePopulationCounts performs the actual whole-population
+// ListNodes/ListNodeAddressesForNodes/CountNodes round trip that
+// dashboardCountsCache wraps — called only on a cache miss/expiry (see
+// buildNodeTableData below). Unchanged from what this package always
+// did inline before the cache was added: same queries, same
+// ComputeNodeCounts computation, same Confirmed24h CountNodes call.
+// Returns addrsByNode too since buildNodeTableData's per-row rendering
+// needs it for whichever nodes end up in the current page — its keys
+// are a superset of every possible page's node IDs, so it's cached and
+// reused across both the whole-population counts pass and every
+// paginated request within the TTL window, never reintroducing a
+// per-node ListNodeAddresses N+1.
+func computeWholePopulationCounts(ctx context.Context, store storage.Store) (dashboardCounts, map[uuid.UUID][]storage.NodeAddress, error) {
 	var counts dashboardCounts
-	var pagination nodeTablePagination
 
 	// Unpaginated: dashboardCounts must reflect the WHOLE population,
 	// never just the current page or any ReachableSince filter. This is
-	// a separate query from the paginated one used for the rows below,
-	// deliberately NOT reusing its LIMIT/OFFSET/ReachableSince.
+	// a separate query from the paginated one used for the rows in
+	// buildNodeTableData, deliberately NOT reusing its
+	// LIMIT/OFFSET/ReachableSince.
 	allNodes, err := store.ListNodes(ctx, storage.NodeFilter{})
 	if err != nil {
-		return counts, nil, pagination, err
+		return counts, nil, err
 	}
 
 	allNodeIDs := make([]uuid.UUID, len(allNodes))
 	for i, n := range allNodes {
 		allNodeIDs[i] = n.ID
 	}
-	// ONE batch call for the whole node set — covers both this counts
-	// pass and the paginated table rows below (its keys are a superset
-	// of the paginated page's node IDs), so neither reintroduces the
-	// old per-node ListNodeAddresses N+1.
 	addrsByNode, err := store.ListNodeAddressesForNodes(ctx, allNodeIDs)
 	if err != nil {
-		return counts, nil, pagination, err
+		return counts, nil, err
 	}
 
 	// Shared with the JSON GET /api/v1/stats endpoint (internal/api's
@@ -462,17 +525,57 @@ func buildNodeTableData(ctx context.Context, store storage.Store, reachableSince
 	// Confirmed24h: confirmed nodes reachable at least once in the
 	// last 24 hours. Same DB-backed approach as internal/api/stats.go's
 	// FetchConfirmed24h — a dedicated store.CountNodes call, using its
-	// own cutoff24h local var, deliberately independent of the
-	// reachableSince parameter above (which only ever filters the
+	// own cutoff24h local var, deliberately independent of any
+	// per-request ReachableSince filter (which only ever filters the
 	// paginated table rows, never this whole-population summary
 	// count).
 	confirmedTrue := true
 	cutoff24h := time.Now().Add(-24 * time.Hour)
 	confirmed24h, err := store.CountNodes(ctx, storage.NodeFilter{Confirmed: &confirmedTrue, ReachableSince: &cutoff24h})
 	if err != nil {
-		return counts, nil, pagination, err
+		return counts, nil, err
 	}
 	counts.Confirmed24h = confirmed24h
+
+	return counts, addrsByNode, nil
+}
+
+// buildNodeTableData fetches the whole-population dashboardCounts
+// (Total/P2P/Registry/Both/Confirmed/Unconfirmed/OnionCapable/
+// ClearnetCapable/ClearnetOnly — always unfiltered, regardless of
+// reachableSince) plus a paginated page of dashboardNodeRow for a node
+// table. reachableSince nil means no filter (the full node population,
+// for /network); non-nil applies that cutoff (the main dashboard's
+// dashboardReachableWindow liveness view). page/limit/offset drive the
+// SQL-level LIMIT/OFFSET of the paginated page; historyLimit controls
+// how many HealthCheck rows are fetched per row (see
+// dashboardRowHistoryLimit/networkRowHistoryLimit) — LatestHealth only
+// ever needs the most recent one, but computeLikelyDead needs at least
+// 3 to ever return true.
+//
+// This is shared, extract-don't-change logic behind both
+// handleDashboard and handleFullNetwork: same whole-population counts
+// query, same per-row scrub+history+pagination-math shape, differing
+// only in the ReachableSince filter and historyLimit each passes in.
+//
+// The whole-population counts/addrsByNode fetch (computeWholePopulationCounts)
+// is served from cache when possible — see dashboardCountsCache's doc
+// comment — falling back to a fresh fetch (which populates the cache
+// for subsequent callers, including the OTHER route sharing this same
+// cache instance) on a miss/expiry. The paginated LIMIT/OFFSET row
+// fetch below is completely untouched by this cache either way.
+func buildNodeTableData(ctx context.Context, store storage.Store, cache *dashboardCountsCache, reachableSince *time.Time, page, limit, offset, historyLimit int) (dashboardCounts, []dashboardNodeRow, nodeTablePagination, error) {
+	var pagination nodeTablePagination
+
+	counts, addrsByNode, ok := cache.get()
+	if !ok {
+		var err error
+		counts, addrsByNode, err = computeWholePopulationCounts(ctx, store)
+		if err != nil {
+			return counts, nil, pagination, err
+		}
+		cache.set(counts, addrsByNode)
+	}
 
 	// Paginated: the actual SQL-level LIMIT/OFFSET query backing the
 	// node table rows shown on this page, restricted to reachableSince
@@ -578,8 +681,12 @@ func truncateAddress(addr string, maxLen int) string {
 // the static CSS stylesheet backing both, and the HTTP Basic Auth-gated
 // /admin/submissions review page. adminCreds configures that gate — see
 // internal/adminauth.Wrap's doc comment for the fail-closed-503 behavior
-// when adminCreds isn't fully configured.
-func NewHandler(store storage.Store, adminCreds adminauth.Credentials) (http.Handler, error) {
+// when adminCreds isn't fully configured. dashboardCountsCacheTTL
+// configures GET /'s and GET /network's shared in-process
+// whole-population counts cache (see dashboardCountsCache/
+// buildNodeTableData/DefaultDashboardCountsCacheTTL) — callers that
+// don't care can pass DefaultDashboardCountsCacheTTL.
+func NewHandler(store storage.Store, adminCreds adminauth.Credentials, dashboardCountsCacheTTL time.Duration) (http.Handler, error) {
 	// derefBool is registered as a template func because Go's
 	// text/template `{{if}}` truth test on a pointer only checks
 	// non-nil-ness, not the pointed-to value — a *bool pointing at
@@ -594,11 +701,16 @@ func NewHandler(store storage.Store, adminCreds adminauth.Credentials) (http.Han
 		return nil, err
 	}
 
+	// Shared by handleDashboard and handleFullNetwork — see
+	// dashboardCountsCache's doc comment for why this must be ONE
+	// instance, not one per handler.
+	countsCache := &dashboardCountsCache{ttl: dashboardCountsCacheTTL}
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", handleDashboard(tmpl, store))
+	mux.HandleFunc("GET /{$}", handleDashboard(tmpl, store, countsCache))
 	mux.HandleFunc("GET /nodes/{id}", handleNodeDetail(tmpl, store))
 	mux.HandleFunc("GET /topology", handleTopologyGraph(tmpl))
-	mux.HandleFunc("GET /network", handleFullNetwork(tmpl, store))
+	mux.HandleFunc("GET /network", handleFullNetwork(tmpl, store, countsCache))
 	mux.HandleFunc("GET /map", handleMapPage(tmpl))
 	mux.HandleFunc("GET /static/style.css", handleStaticCSS)
 
@@ -625,7 +737,7 @@ func handleStaticCSS(w http.ResponseWriter, r *http.Request) {
 	w.Write(data)
 }
 
-func handleDashboard(tmpl *template.Template, store storage.Store) http.HandlerFunc {
+func handleDashboard(tmpl *template.Template, store storage.Store, countsCache *dashboardCountsCache) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 
@@ -637,7 +749,7 @@ func handleDashboard(tmpl *template.Template, store storage.Store) http.HandlerF
 		// buildNodeTableData returns are deliberately built from an
 		// unfiltered query and don't use this cutoff at all.
 		cutoff := time.Now().Add(-dashboardReachableWindow)
-		counts, rows, pagination, err := buildNodeTableData(ctx, store, &cutoff, page, limit, offset, dashboardRowHistoryLimit)
+		counts, rows, pagination, err := buildNodeTableData(ctx, store, countsCache, &cutoff, page, limit, offset, dashboardRowHistoryLimit)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -718,7 +830,7 @@ func handleDashboard(tmpl *template.Template, store storage.Store) http.HandlerF
 // the main dashboard (see networkData's doc comment) — but does reuse
 // the exact same whole-population summary counts and NetworkHeight
 // fetch shown there.
-func handleFullNetwork(tmpl *template.Template, store storage.Store) http.HandlerFunc {
+func handleFullNetwork(tmpl *template.Template, store storage.Store, countsCache *dashboardCountsCache) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 
@@ -726,7 +838,7 @@ func handleFullNetwork(tmpl *template.Template, store storage.Store) http.Handle
 
 		// reachableSince is nil here — /network's table has no
 		// liveness filter at all, unlike handleDashboard's.
-		counts, rows, pagination, err := buildNodeTableData(ctx, store, nil, page, limit, offset, networkRowHistoryLimit)
+		counts, rows, pagination, err := buildNodeTableData(ctx, store, countsCache, nil, page, limit, offset, networkRowHistoryLimit)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
