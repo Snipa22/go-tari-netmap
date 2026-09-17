@@ -427,9 +427,9 @@ func insertConfirmedNode(ctx context.Context, tx pgx.Tx, address string, publicK
 }
 
 // mergeNodeInto retires placeholderID into confirmedID: every
-// node_addresses/peer_edge_observations/node_health row referencing
-// placeholderID is repointed at confirmedID (deleting any node_addresses
-// row that would otherwise collide with confirmedID's own
+// node_addresses/peer_edge_observations/node_health/pending_submissions.promoted_node_id
+// row referencing placeholderID is repointed at confirmedID (deleting any
+// node_addresses row that would otherwise collide with confirmedID's own
 // UNIQUE(node_id, address) constraint), placeholderID's nodes row is
 // deleted, and confirmedID's last_seen is bumped. Called from within an
 // existing transaction (tx) — the caller is responsible for
@@ -457,6 +457,9 @@ func mergeNodeInto(ctx context.Context, tx pgx.Tx, placeholderID, confirmedID uu
 	}
 	if _, err := tx.Exec(ctx, `UPDATE node_health SET node_id = $2 WHERE node_id = $1`, placeholderID, confirmedID); err != nil {
 		return fmt.Errorf("storage: merge: repoint node_health: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE pending_submissions SET promoted_node_id = $2 WHERE promoted_node_id = $1`, placeholderID, confirmedID); err != nil {
+		return fmt.Errorf("storage: merge: repoint pending_submissions.promoted_node_id: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM nodes WHERE id = $1`, placeholderID); err != nil {
 		return fmt.Errorf("storage: merge: delete placeholder node: %w", err)
