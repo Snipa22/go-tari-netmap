@@ -1704,12 +1704,15 @@ func TestListNodeEdges(t *testing.T) {
 }
 
 // TestNetworkHeight verifies that NetworkHeight returns the mode of the
-// latest-per-node heights, along with how many nodes contributed to that
-// mode, and that it returns (nil, 0, nil) when no health checks with a
-// non-nil height exist.
+// latest-per-node heights within the last 24h, along with how many nodes
+// contributed to that mode, and that it returns (nil, 0, nil) when no
+// health checks with a non-nil height exist within that window (whether
+// because none exist at all, or because the only ones that exist are
+// older than 24h).
 func TestNetworkHeight(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
+	ps := store.(*pgStore)
 
 	height, count, err := store.NetworkHeight(ctx)
 	if err != nil {
@@ -1750,6 +1753,33 @@ func TestNetworkHeight(t *testing.T) {
 		t.Fatalf("record c height 101: %v", err)
 	}
 
+	// d and e both reported height 200, but 30h ago — outside the 24h
+	// window — so they must NOT count toward the mode, even though
+	// together they'd otherwise outnumber a/b's in-window pair at 100.
+	// This is the core regression case for the time bound: without it,
+	// 200 (d+e, count 2) would tie 100 (a+b, count 2) or, with a third
+	// stale reporter, could even outright win.
+	d, err := store.UpsertDiscoveredNode(ctx, "d:4", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert d: %v", err)
+	}
+	if _, err := ps.pool.Exec(ctx, `
+		INSERT INTO node_health (node_id, ts, reachable, probe_source, height)
+		VALUES ($1, now() - interval '30 hours', true, 'grpc', 200)
+	`, d.ID); err != nil {
+		t.Fatalf("insert stale height d: %v", err)
+	}
+	e, err := store.UpsertDiscoveredNode(ctx, "e:5", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert e: %v", err)
+	}
+	if _, err := ps.pool.Exec(ctx, `
+		INSERT INTO node_health (node_id, ts, reachable, probe_source, height)
+		VALUES ($1, now() - interval '30 hours', true, 'grpc', 200)
+	`, e.ID); err != nil {
+		t.Fatalf("insert stale height e: %v", err)
+	}
+
 	height, count, err = store.NetworkHeight(ctx)
 	if err != nil {
 		t.Fatalf("network height: %v", err)
@@ -1758,10 +1788,27 @@ func TestNetworkHeight(t *testing.T) {
 		t.Fatal("height = nil, want non-nil")
 	}
 	if *height != 100 {
-		t.Errorf("height = %d, want 100", *height)
+		t.Errorf("height = %d, want 100 (d/e's 200 is outside the 24h window and must be excluded)", *height)
 	}
 	if count != 2 {
 		t.Errorf("count = %d, want 2 (a and b)", count)
+	}
+
+	// Now prove the all-stale case: if every in-window row disappears
+	// (simulating a collector outage where the only rows left are older
+	// than 24h), NetworkHeight must fall back to (nil, 0, nil) — the
+	// same "unavailable" signal as the fully-empty-table case above —
+	// rather than reaching past the window to return the stale 200.
+	if _, err := ps.pool.Exec(ctx, `DELETE FROM node_health WHERE node_id IN ($1, $2, $3)`, a.ID, b.ID, c.ID); err != nil {
+		t.Fatalf("delete in-window health rows: %v", err)
+	}
+
+	height, count, err = store.NetworkHeight(ctx)
+	if err != nil {
+		t.Fatalf("network height (all stale): %v", err)
+	}
+	if height != nil || count != 0 {
+		t.Fatalf("network height (all stale) = (%v, %d), want (nil, 0)", height, count)
 	}
 }
 
