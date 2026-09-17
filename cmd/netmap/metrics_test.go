@@ -363,6 +363,12 @@ func TestRefreshPopulatesGauges(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
+	if _, err := store.UpsertDiscoveredNode(ctx, "owned:1", storage.DiscoverySourceP2P, map[string]any{"owner": "Jagtech"}, nil); err != nil {
+		t.Fatalf("seed owned placeholder: %v", err)
+	}
+	if _, err := store.UpsertConfirmedNode(ctx, "owned:1", []byte{0x02}, storage.DiscoverySourceP2P); err != nil {
+		t.Fatalf("promote owned node: %v", err)
+	}
 	if _, err := store.UpsertConfirmedNode(ctx, "confirmed:1", []byte{0x01}, storage.DiscoverySourceP2P); err != nil {
 		t.Fatalf("seed confirmed node: %v", err)
 	}
@@ -378,14 +384,17 @@ func TestRefreshPopulatesGauges(t *testing.T) {
 	if !strings.Contains(body, `netmap_mainnet_collector_db_up 1`) {
 		t.Errorf("scrape output missing db_up=1 (DB is reachable), got:\n%s", body)
 	}
-	if !strings.Contains(body, `netmap_mainnet_collector_poll_queue_backlog{queue="confirmed"} 1`) {
-		t.Errorf("scrape output missing confirmed queue_backlog=1, got:\n%s", body)
+	if !strings.Contains(body, `netmap_mainnet_collector_poll_queue_backlog{queue="confirmed_owned"} 1`) {
+		t.Errorf("scrape output missing confirmed_owned queue_backlog=1, got:\n%s", body)
+	}
+	if !strings.Contains(body, `netmap_mainnet_collector_poll_queue_backlog{queue="confirmed_generic"} 1`) {
+		t.Errorf("scrape output missing confirmed_generic queue_backlog=1, got:\n%s", body)
 	}
 	if !strings.Contains(body, `netmap_mainnet_collector_poll_queue_backlog{queue="never_contacted"} 1`) {
 		t.Errorf("scrape output missing never_contacted queue_backlog=1, got:\n%s", body)
 	}
-	if !strings.Contains(body, `netmap_mainnet_collector_known_nodes{discovery_source="p2p"} 1`) {
-		t.Errorf("scrape output missing p2p known_nodes=1, got:\n%s", body)
+	if !strings.Contains(body, `netmap_mainnet_collector_known_nodes{discovery_source="p2p"} 2`) {
+		t.Errorf("scrape output missing p2p known_nodes=2 (owned:1 + confirmed:1, both seeded via DiscoverySourceP2P), got:\n%s", body)
 	}
 	if !strings.Contains(body, `netmap_mainnet_collector_known_nodes{discovery_source="registry"} 1`) {
 		t.Errorf("scrape output missing registry known_nodes=1, got:\n%s", body)

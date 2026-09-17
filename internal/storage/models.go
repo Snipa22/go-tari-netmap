@@ -111,10 +111,10 @@ type NodeFilter struct {
 	// filtering" convention as ReachableSince above — a zero-value
 	// NodeFilter{} must remain completely unaffected by this field's
 	// mere existence. This backs the collector's split confirmed/
-	// unconfirmed poll queues (see collector.PollConfirmed/
-	// PollUnconfirmed): confirmed nodes must be pollable independently
-	// of however many unconfirmed placeholder nodes exist, and vice
-	// versa.
+	// unconfirmed poll queues (see collector.PollOwnedConfirmed/
+	// PollGenericConfirmed/PollUnconfirmed): confirmed nodes must be
+	// pollable independently of however many unconfirmed placeholder
+	// nodes exist, and vice versa.
 	Confirmed *bool
 
 	// HasHealthChecks, if non-nil, restricts results by whether a node

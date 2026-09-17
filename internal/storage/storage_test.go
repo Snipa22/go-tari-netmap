@@ -252,8 +252,9 @@ func TestListNodesReachableSinceFilter(t *testing.T) {
 // a false value restricts to nodes with a nil PublicKey (unconfirmed
 // placeholders), and a nil value (the zero-value default) applies no
 // filtering at all -- the same critical invariant already established
-// for ReachableSince above, since the collector's PollConfirmed/
-// PollUnconfirmed split (see internal/collector/collector.go) relies on
+// for ReachableSince above, since the collector's PollOwnedConfirmed/
+// PollGenericConfirmed/PollUnconfirmed split (see
+// internal/collector/collector.go) relies on
 // this filter to divide the node set without otherwise changing
 // ListNodes' behavior for any other caller that leaves it unset.
 func TestListNodesConfirmedFilter(t *testing.T) {
@@ -558,8 +559,9 @@ func TestCountNodes(t *testing.T) {
 // filter.DiscoverySource, silently ignoring filter.Confirmed/filter.HasHealthChecks entirely
 // (always returning the WHOLE population's count regardless of those two fields) -- this is
 // exactly the filter combination cmd/netmap's Prometheus poll-queue-backlog gauges rely on
-// (see cmd/netmap/metrics.go's refresh, which mirrors collector.PollConfirmed/PollUnconfirmed/
-// PollNeverContacted's own NodeFilter construction). Both ListNodes and CountNodes now share
+// (see cmd/netmap/metrics.go's refresh, which mirrors
+// collector.PollOwnedConfirmed/PollGenericConfirmed/PollUnconfirmed/PollNeverContacted's own
+// NodeFilter construction). Both ListNodes and CountNodes now share
 // nodeFilterClauses, so this asserts they agree: len(ListNodes(filter)) == CountNodes(filter)
 // for each of the three disjoint poll-queue filters.
 func TestCountNodesRespectsConfirmedAndHasHealthChecks(t *testing.T) {

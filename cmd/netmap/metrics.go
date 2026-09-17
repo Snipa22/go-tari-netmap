@@ -42,8 +42,13 @@ import (
 //     (grpc|p2p) poll outcome counts, fed from collector.Collector.OnPollResult (see
 //     internal/collector/collector.go's PollResultFunc).
 //   - netmap_<network>_collector_poll_queue_backlog{queue} -- current size of each of the
-//     collector's three poll queues (confirmed|unconfirmed|never_contacted), mirroring
-//     PollConfirmed/PollUnconfirmed/PollNeverContacted's own NodeFilter split exactly.
+//     collector's four poll queues (confirmed_owned|confirmed_generic|unconfirmed|
+//     never_contacted), mirroring PollOwnedConfirmed/PollGenericConfirmed/PollUnconfirmed/
+//     PollNeverContacted's own NodeFilter split exactly. The previous single "confirmed" label
+//     (pre-owned/generic split) was checked against every known Grafana dashboard/docs/
+//     internal/web consumer before being replaced outright here -- nothing in this repo
+//     referenced it, so there was no additive-compat requirement to preserve it alongside the
+//     two new labels.
 //   - netmap_<network>_collector_known_nodes{discovery_source} -- whole-population known-node
 //     counts by discovery_source (p2p|registry|both), reusing api.FetchNodeCounts -- the exact
 //     same query/computation GET /api/v1/stats and the HTML dashboard's summary cards already
@@ -105,10 +110,11 @@ type netmapMetrics struct {
 	// of any subsequent storage write outcome.
 	pollResult *prometheus.CounterVec
 
-	// queueBacklog is the current size of each of the collector's three disjoint poll queues
-	// (see internal/collector/collector.go's PollConfirmed/PollUnconfirmed/
-	// PollNeverContacted doc comments for the exact NodeFilter each corresponds to), labeled
-	// by queue (confirmed|unconfirmed|never_contacted). Updated periodically by refresh, not
+	// queueBacklog is the current size of each of the collector's four disjoint poll queues
+	// (see internal/collector/collector.go's PollOwnedConfirmed/PollGenericConfirmed/
+	// PollUnconfirmed/PollNeverContacted doc comments for the exact NodeFilter each
+	// corresponds to), labeled by queue (confirmed_owned|confirmed_generic|unconfirmed|
+	// never_contacted). Updated periodically by refresh, not
 	// live per-scrape -- see metricsRefreshInterval's doc comment.
 	queueBacklog *prometheus.GaugeVec
 
@@ -154,7 +160,7 @@ func newNetmapMetrics(network string) (*netmapMetrics, error) {
 
 	m.queueBacklog = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: prefix + "collector_poll_queue_backlog",
-		Help: "Current size of each of the collector's three poll queues, labeled by queue (confirmed|unconfirmed|never_contacted). Updated periodically, not live per-scrape.",
+		Help: "Current size of each of the collector's four poll queues, labeled by queue (confirmed_owned|confirmed_generic|unconfirmed|never_contacted). Updated periodically, not live per-scrape.",
 	}, []string{"queue"})
 
 	m.knownNodes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -235,15 +241,23 @@ func (m *netmapMetrics) refresh(ctx context.Context, store storage.Store) {
 	queryCtx, cancel2 := context.WithTimeout(ctx, metricsQueryTimeout)
 	defer cancel2()
 
-	// The three CountNodes filters below are deliberately identical to
-	// collector.PollConfirmed/PollUnconfirmed/PollNeverContacted's own NodeFilter
-	// construction (see internal/collector/collector.go) -- these ARE the collector's three
-	// poll queues, just counted rather than listed-and-dialed.
+	// The CountNodes filters below are deliberately identical to
+	// collector.PollOwnedConfirmed/PollGenericConfirmed/PollUnconfirmed/PollNeverContacted's
+	// own NodeFilter construction (see internal/collector/collector.go) -- these ARE the
+	// collector's four poll queues, just counted rather than listed-and-dialed.
 	confirmed := true
-	if n, err := store.CountNodes(queryCtx, storage.NodeFilter{Confirmed: &confirmed}); err != nil {
-		log.Printf("netmap: metrics refresh: count confirmed nodes: %v", err)
+	owned := true
+	if n, err := store.CountNodes(queryCtx, storage.NodeFilter{Confirmed: &confirmed, Owned: &owned}); err != nil {
+		log.Printf("netmap: metrics refresh: count owned-confirmed nodes: %v", err)
 	} else {
-		m.queueBacklog.WithLabelValues("confirmed").Set(float64(n))
+		m.queueBacklog.WithLabelValues("confirmed_owned").Set(float64(n))
+	}
+
+	notOwned := false
+	if n, err := store.CountNodes(queryCtx, storage.NodeFilter{Confirmed: &confirmed, Owned: &notOwned}); err != nil {
+		log.Printf("netmap: metrics refresh: count generic-confirmed nodes: %v", err)
+	} else {
+		m.queueBacklog.WithLabelValues("confirmed_generic").Set(float64(n))
 	}
 
 	unconfirmed := false

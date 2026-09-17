@@ -1464,19 +1464,21 @@ func TestRunDoesNotStarvePollOnSlowDiscover(t *testing.T) {
 	}
 }
 
-// TestPollConfirmedOnlyTouchesConfirmedNodes verifies the core
-// confirmed/unconfirmed priority-queue split: PollConfirmed only ever
-// dials/records confirmed nodes (Node.PublicKey != nil), and
-// PollUnconfirmed only ever dials/records unconfirmed placeholder nodes
-// (Node.PublicKey == nil) -- neither function's node set ever includes
-// the other's.
+// TestPollGenericConfirmedOnlyTouchesConfirmedNodes verifies the core
+// confirmed/unconfirmed priority-queue split: PollGenericConfirmed only
+// ever dials/records confirmed nodes (Node.PublicKey != nil) that are
+// NOT pool-owned, and PollUnconfirmed only ever dials/records
+// unconfirmed placeholder nodes (Node.PublicKey == nil) -- neither
+// function's node set ever includes the other's. (The owned/generic
+// half of the confirmed-population split is covered separately by
+// TestPollOwnedConfirmedAndGenericConfirmedPartitionConfirmedNodes.)
 //
 // unconfirmedNode is seeded with one pre-existing (failed) health check
 // so it qualifies for PollUnconfirmed's HasHealthChecks: true half of
 // its filter (see PollUnconfirmed's doc comment) -- a zero-history
 // unconfirmed node belongs to PollNeverContacted instead, covered
 // separately by TestPollNeverContactedOnlyTouchesNeverContactedNodes.
-func TestPollConfirmedOnlyTouchesConfirmedNodes(t *testing.T) {
+func TestPollGenericConfirmedOnlyTouchesConfirmedNodes(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
@@ -1501,8 +1503,8 @@ func TestPollConfirmedOnlyTouchesConfirmedNodes(t *testing.T) {
 	c.Storage = store
 	c.GRPCClient = client
 
-	if err := c.PollConfirmed(ctx); err != nil {
-		t.Fatalf("poll confirmed: %v", err)
+	if err := c.PollGenericConfirmed(ctx); err != nil {
+		t.Fatalf("poll generic-confirmed: %v", err)
 	}
 
 	confirmedHistory, err := store.GetNodeHistory(ctx, confirmedNode.ID, 10)
@@ -1510,7 +1512,7 @@ func TestPollConfirmedOnlyTouchesConfirmedNodes(t *testing.T) {
 		t.Fatalf("get confirmed history: %v", err)
 	}
 	if len(confirmedHistory) != 1 {
-		t.Fatalf("len(confirmed history) after PollConfirmed = %d, want 1", len(confirmedHistory))
+		t.Fatalf("len(confirmed history) after PollGenericConfirmed = %d, want 1", len(confirmedHistory))
 	}
 
 	unconfirmedHistory, err := store.GetNodeHistory(ctx, unconfirmedNode.ID, 10)
@@ -1518,11 +1520,11 @@ func TestPollConfirmedOnlyTouchesConfirmedNodes(t *testing.T) {
 		t.Fatalf("get unconfirmed history: %v", err)
 	}
 	if len(unconfirmedHistory) != 1 {
-		t.Fatalf("len(unconfirmed history) after PollConfirmed = %d, want still 1 (PollConfirmed must never touch unconfirmed nodes)", len(unconfirmedHistory))
+		t.Fatalf("len(unconfirmed history) after PollGenericConfirmed = %d, want still 1 (PollGenericConfirmed must never touch unconfirmed nodes)", len(unconfirmedHistory))
 	}
 
 	// PollUnconfirmed must now touch only the unconfirmed node, leaving
-	// the confirmed node's history exactly as PollConfirmed left it.
+	// the confirmed node's history exactly as PollGenericConfirmed left it.
 	if err := c.PollUnconfirmed(ctx); err != nil {
 		t.Fatalf("poll unconfirmed: %v", err)
 	}
@@ -1541,6 +1543,91 @@ func TestPollConfirmedOnlyTouchesConfirmedNodes(t *testing.T) {
 	}
 	if len(unconfirmedHistory) != 2 {
 		t.Fatalf("len(unconfirmed history) after PollUnconfirmed = %d, want 2 (1 pre-seeded + 1 new)", len(unconfirmedHistory))
+	}
+}
+
+// TestPollOwnedConfirmedAndGenericConfirmedPartitionConfirmedNodes is the
+// owned/generic-confirmed analogue of
+// TestPollNeverContactedOnlyTouchesNeverContactedNodes: it proves
+// PollOwnedConfirmed and PollGenericConfirmed are a true partition of
+// the confirmed population -- every confirmed node belongs to EXACTLY
+// one of the two (see PollOwnedConfirmed's doc comment for the
+// production bug this split fixes), with no double-poll and no gap.
+// ownedNode is seeded via UpsertDiscoveredNode (tags: {"owner":
+// "Jagtech"}) then promoted via UpsertConfirmedNode, mirroring
+// production's real approve-submission path exactly (see
+// TestPollIntervalUsesPoolOwnedCadenceForOwnerTag's doc comment) --
+// promotion preserves the placeholder's tags, so the resulting confirmed
+// node is both Confirmed: true and Owned: true. genericNode is a plain
+// confirmed node with no owner/pool_owned tag at all.
+func TestPollOwnedConfirmedAndGenericConfirmedPartitionConfirmedNodes(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	client := &fakeClient{info: map[string]NodeInfo{
+		"owned:1":   {Reachable: true},
+		"generic:1": {Reachable: true},
+	}}
+
+	if _, err := store.UpsertDiscoveredNode(ctx, "owned:1", storage.DiscoverySourceP2P, map[string]any{"owner": "Jagtech"}, nil); err != nil {
+		t.Fatalf("seed owned placeholder: %v", err)
+	}
+	ownedNode, err := store.UpsertConfirmedNode(ctx, "owned:1", []byte{0x01, 0x02}, storage.DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("promote owned node: %v", err)
+	}
+
+	genericNode, err := store.UpsertConfirmedNode(ctx, "generic:1", []byte{0x03, 0x04}, storage.DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("seed generic confirmed node: %v", err)
+	}
+
+	c := New(Config{})
+	c.Storage = store
+	c.GRPCClient = client
+
+	if err := c.PollOwnedConfirmed(ctx); err != nil {
+		t.Fatalf("poll owned-confirmed: %v", err)
+	}
+
+	ownedHistory, err := store.GetNodeHistory(ctx, ownedNode.ID, 10)
+	if err != nil {
+		t.Fatalf("get owned history: %v", err)
+	}
+	if len(ownedHistory) != 1 {
+		t.Fatalf("len(owned history) after PollOwnedConfirmed = %d, want 1", len(ownedHistory))
+	}
+
+	genericHistory, err := store.GetNodeHistory(ctx, genericNode.ID, 10)
+	if err != nil {
+		t.Fatalf("get generic history: %v", err)
+	}
+	if len(genericHistory) != 0 {
+		t.Fatalf("len(generic history) after PollOwnedConfirmed = %d, want still 0 (PollOwnedConfirmed must never touch generic-confirmed nodes)", len(genericHistory))
+	}
+
+	// PollGenericConfirmed must now touch only the generic node, leaving
+	// the owned node's history exactly as PollOwnedConfirmed left it --
+	// proving the reverse direction of the partition (and that this is
+	// a true partition: no node is touched by both).
+	if err := c.PollGenericConfirmed(ctx); err != nil {
+		t.Fatalf("poll generic-confirmed: %v", err)
+	}
+
+	ownedHistory, err = store.GetNodeHistory(ctx, ownedNode.ID, 10)
+	if err != nil {
+		t.Fatalf("get owned history after PollGenericConfirmed: %v", err)
+	}
+	if len(ownedHistory) != 1 {
+		t.Fatalf("len(owned history) after PollGenericConfirmed = %d, want still 1 (PollGenericConfirmed must never touch owned-confirmed nodes)", len(ownedHistory))
+	}
+
+	genericHistory, err = store.GetNodeHistory(ctx, genericNode.ID, 10)
+	if err != nil {
+		t.Fatalf("get generic history after PollGenericConfirmed: %v", err)
+	}
+	if len(genericHistory) != 1 {
+		t.Fatalf("len(generic history) after PollGenericConfirmed = %d, want 1", len(genericHistory))
 	}
 }
 
@@ -1700,17 +1787,21 @@ func (s *slowInfoClient) GetInfo(ctx context.Context, addr string) (NodeInfo, er
 	return info, nil
 }
 
-// TestPollConfirmedNotStarvedBySlowUnconfirmedPoll is the poll-loop
-// analogue of TestRunDoesNotStarvePollOnSlowDiscover: it proves that a
-// slow (simulating a large/backlogged) unconfirmed-node poll cannot
-// delay or starve the confirmed loop's poll attempts, since the two run
-// on fully independent tickers/goroutines (see Run). A slow-blocking
-// GetInfo is used for the unconfirmed node; the confirmed node's GetInfo
-// returns immediately from an in-memory fixture. Both loops run
-// concurrently via c.Run, and the test asserts a health check is
-// recorded for the confirmed node while the unconfirmed node's GetInfo
-// call is still (verifiably) in flight.
-func TestPollConfirmedNotStarvedBySlowUnconfirmedPoll(t *testing.T) {
+// TestPollGenericConfirmedNotStarvedBySlowUnconfirmedPoll is the
+// poll-loop analogue of TestRunDoesNotStarvePollOnSlowDiscover: it
+// proves that a slow (simulating a large/backlogged) unconfirmed-node
+// poll cannot delay or starve the generic-confirmed loop's poll
+// attempts, since the two run on fully independent tickers/goroutines
+// (see Run). A slow-blocking GetInfo is used for the unconfirmed node;
+// the confirmed node's GetInfo returns immediately from an in-memory
+// fixture. Both loops run concurrently via c.Run, and the test asserts
+// a health check is recorded for the confirmed node while the
+// unconfirmed node's GetInfo call is still (verifiably) in flight.
+// (The confirmed node here has no owner tag, so it is
+// generic-confirmed; TestOwnedConfirmedPollNotStarvedBySlowGenericConfirmedPoll
+// covers the owned-confirmed loop's independence, including from a slow
+// generic-confirmed pass specifically.)
+func TestPollGenericConfirmedNotStarvedBySlowUnconfirmedPoll(t *testing.T) {
 	store := newTestStore(t)
 	seedCtx := context.Background()
 
@@ -1738,10 +1829,11 @@ func TestPollConfirmedNotStarvedBySlowUnconfirmedPoll(t *testing.T) {
 	// Pre-seed one health check so this node is picked up by
 	// PollUnconfirmed specifically (HasHealthChecks: true) rather than
 	// PollNeverContacted (HasHealthChecks: false) -- this test's whole
-	// point is proving PollConfirmed's independence from a slow
-	// PollUnconfirmed pass specifically; TestPollNeverContactedNotStarvedBySlowUnconfirmedPoll
-	// and TestRunDoesNotStarvePollOnSlowDiscover cover the other two
-	// loops' independence.
+	// point is proving PollGenericConfirmed's independence from a slow
+	// PollUnconfirmed pass specifically; TestPollNeverContactedNotStarvedBySlowUnconfirmedPoll,
+	// TestOwnedConfirmedPollNotStarvedBySlowGenericConfirmedPoll, and
+	// TestRunDoesNotStarvePollOnSlowDiscover cover the other loops'
+	// independence.
 	recordHistory(t, seedCtx, store, unconfirmedNode.ID, false)
 
 	c := New(Config{})
@@ -1764,9 +1856,10 @@ func TestPollConfirmedNotStarvedBySlowUnconfirmedPoll(t *testing.T) {
 		t.Fatal("unconfirmed node's GetInfo was never called")
 	}
 
-	// The confirmed loop ticks independently of the hung unconfirmed
-	// loop; poll for a recorded health check on the confirmed node
-	// within a deadline that comfortably exceeds several TickIntervals.
+	// The generic-confirmed loop ticks independently of the hung
+	// unconfirmed loop; poll for a recorded health check on the
+	// confirmed node within a deadline that comfortably exceeds several
+	// TickIntervals.
 	deadline := time.Now().Add(3 * time.Second)
 	var history []storage.HealthCheck
 	for {
@@ -1778,15 +1871,15 @@ func TestPollConfirmedNotStarvedBySlowUnconfirmedPoll(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("no health check recorded for the confirmed node while the unconfirmed node's GetInfo was still hung -- PollConfirmed appears starved by PollUnconfirmed")
+			t.Fatal("no health check recorded for the confirmed node while the unconfirmed node's GetInfo was still hung -- PollGenericConfirmed appears starved by PollUnconfirmed")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 
 	// The whole point: confirm the slow GetInfo call genuinely had not
-	// returned yet when PollConfirmed's result showed up above.
+	// returned yet when PollGenericConfirmed's result showed up above.
 	if client.infoDone.Load() {
-		t.Fatal("unconfirmed GetInfo had already returned by the time PollConfirmed recorded a health check -- test doesn't prove independence")
+		t.Fatal("unconfirmed GetInfo had already returned by the time PollGenericConfirmed recorded a health check -- test doesn't prove independence")
 	}
 
 	if !history[0].Reachable {
@@ -1808,12 +1901,137 @@ func TestPollConfirmedNotStarvedBySlowUnconfirmedPoll(t *testing.T) {
 	}
 }
 
-// TestConcurrentPollLoopsNoDataRace runs PollConfirmed, PollUnconfirmed,
-// and PollNeverContacted concurrently and repeatedly against the same
+// TestOwnedConfirmedPollNotStarvedBySlowGenericConfirmedPoll is the
+// core regression test for this fix's entire reason for existing (see
+// PollOwnedConfirmed's doc comment for the production timestamp-gap bug
+// this proves is fixed): it proves that a slow (simulating a
+// large/backlogged, onion-dominated) generic-confirmed poll cannot
+// delay or starve the owned-confirmed loop's poll attempts, since
+// runOwnedConfirmedPollLoop and runGenericConfirmedPollLoop run on
+// fully independent tickers/goroutines (see Run), each honoring its own
+// configured interval (OwnedPollTickInterval vs TickInterval) rather
+// than sharing one. TickInterval is deliberately set MUCH LONGER than
+// OwnedPollTickInterval here (3s vs 20ms): since runGenericConfirmedPollLoop
+// runs its first pass immediately on Run() (see its doc comment) before
+// ever consulting TickInterval, this doesn't stop the slow generic:1
+// dial from being reached almost immediately -- but it does mean that,
+// if the owned loop's cadence were (bug-for-bug) actually driven by
+// TickInterval instead of its own OwnedPollTickInterval, the owned
+// node's health check couldn't possibly show up within this test's
+// short deadline. Observing it show up quickly anyway is direct proof
+// that OwnedPollTickInterval, not TickInterval, is what's actually
+// governing the owned loop's ticker.
+func TestOwnedConfirmedPollNotStarvedBySlowGenericConfirmedPoll(t *testing.T) {
+	store := newTestStore(t)
+	seedCtx := context.Background()
+
+	client := &slowInfoClient{
+		slowAddr:   "generic:1",
+		unblock:    make(chan struct{}),
+		infoCalled: make(chan struct{}),
+		info: map[string]NodeInfo{
+			"owned:1": {Reachable: true},
+		},
+	}
+	// Ensures the slow GetInfo call actually unblocks/returns at the end
+	// of the test, even on failure, rather than leaking a goroutine
+	// blocked forever on a channel nothing else will ever close.
+	t.Cleanup(func() { close(client.unblock) })
+
+	if _, err := store.UpsertDiscoveredNode(seedCtx, "owned:1", storage.DiscoverySourceP2P, map[string]any{"owner": "Jagtech"}, nil); err != nil {
+		t.Fatalf("seed owned placeholder: %v", err)
+	}
+	ownedNode, err := store.UpsertConfirmedNode(seedCtx, "owned:1", []byte{0x01, 0x02}, storage.DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("promote owned node: %v", err)
+	}
+	if _, err := store.UpsertConfirmedNode(seedCtx, "generic:1", []byte{0x03, 0x04}, storage.DiscoverySourceP2P); err != nil {
+		t.Fatalf("seed generic confirmed node: %v", err)
+	}
+
+	c := New(Config{})
+	c.Storage = store
+	c.GRPCClient = client
+	// TickInterval governs the generic-confirmed loop (see Run's doc
+	// comment). Deliberately set much longer than OwnedPollTickInterval
+	// below -- see this test's doc comment for why.
+	c.TickInterval = 3 * time.Second
+	// OwnedPollTickInterval governs the independent owned-confirmed
+	// loop -- this is the field under test.
+	c.OwnedPollTickInterval = 20 * time.Millisecond
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- c.Run(runCtx) }()
+
+	// Wait for the generic-confirmed loop's poll to actually reach (and
+	// hang in) GetInfo, so we know it's genuinely in flight for the
+	// rest of the test rather than, say, not having started yet.
+	select {
+	case <-client.infoCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("generic-confirmed node's GetInfo was never called")
+	}
+
+	// The owned-confirmed loop ticks independently of the hung
+	// generic-confirmed loop; poll for a recorded health check on the
+	// owned node within a deadline that comfortably exceeds several
+	// OwnedPollTickIntervals but is comfortably SHORTER than
+	// TickInterval (3s) -- so this can only succeed if the owned loop's
+	// cadence is genuinely governed by OwnedPollTickInterval, not
+	// TickInterval.
+	deadline := time.Now().Add(1 * time.Second)
+	var history []storage.HealthCheck
+	for {
+		history, err = store.GetNodeHistory(seedCtx, ownedNode.ID, 10)
+		if err != nil {
+			t.Fatalf("get history: %v", err)
+		}
+		if len(history) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no health check recorded for the owned node while the generic-confirmed node's GetInfo was still hung -- owned-confirmed loop appears starved by (or coupled to) PollGenericConfirmed/TickInterval")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// The whole point: confirm the slow generic-confirmed GetInfo call
+	// genuinely had not returned yet when the owned loop's result
+	// showed up above.
+	if client.infoDone.Load() {
+		t.Fatal("generic-confirmed GetInfo had already returned by the time the owned loop recorded a health check -- test doesn't prove independence")
+	}
+
+	if !history[0].Reachable {
+		t.Errorf("expected reachable = true")
+	}
+
+	// Cancel ctx so all loops exit -- the hung GetInfo call observes
+	// ctx.Done() and returns rather than staying hung forever -- and
+	// confirm Run actually returns promptly and without error.
+	cancel()
+
+	select {
+	case err := <-runDone:
+		if err != nil {
+
+			t.Errorf("Run returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after ctx cancellation")
+	}
+}
+
+// TestConcurrentPollLoopsNoDataRace runs PollOwnedConfirmed,
+// PollGenericConfirmed, PollUnconfirmed, and PollNeverContacted
+// concurrently and repeatedly against the same
 // Collector's shared nextPoll/mu state and the same underlying Storage.
 // It makes no assertion beyond "no error" -- its entire purpose is to
 // give `go test -race` real concurrent access to c.nextPoll (guarded by
-// c.mu) from all three poll loops at once, proving that running them
+// c.mu) from all four poll loops at once, proving that running them
 // concurrently (as Run does) introduces no data race -- including the
 // worker-pool concurrency WITHIN each individual poll() call (see
 // TestPollBoundedConcurrency for that dimension in isolation).
@@ -1822,6 +2040,16 @@ func TestConcurrentPollLoopsNoDataRace(t *testing.T) {
 	ctx := context.Background()
 
 	client := &fakeClient{info: map[string]NodeInfo{}}
+	for i := 0; i < 20; i++ {
+		addr := fmt.Sprintf("owned:%d", i)
+		client.info[addr] = NodeInfo{Reachable: true}
+		if _, err := store.UpsertDiscoveredNode(ctx, addr, storage.DiscoverySourceP2P, map[string]any{"owner": "Jagtech"}, nil); err != nil {
+			t.Fatalf("seed owned placeholder %d: %v", i, err)
+		}
+		if _, err := store.UpsertConfirmedNode(ctx, addr, []byte{byte(i), byte(i + 1), 0xAA}, storage.DiscoverySourceP2P); err != nil {
+			t.Fatalf("promote owned node %d: %v", i, err)
+		}
+	}
 	for i := 0; i < 20; i++ {
 		addr := fmt.Sprintf("confirmed:%d", i)
 		client.info[addr] = NodeInfo{Reachable: true}
@@ -1855,13 +2083,22 @@ func TestConcurrentPollLoopsNoDataRace(t *testing.T) {
 	c.GRPCClient = client
 
 	var wg sync.WaitGroup
-	wg.Add(3)
-	errCh := make(chan error, 3)
+	wg.Add(4)
+	errCh := make(chan error, 4)
 
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 10; i++ {
-			if err := c.PollConfirmed(ctx); err != nil {
+			if err := c.PollOwnedConfirmed(ctx); err != nil {
+				errCh <- err
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 10; i++ {
+			if err := c.PollGenericConfirmed(ctx); err != nil {
 				errCh <- err
 				return
 			}
@@ -1938,8 +2175,9 @@ func (c *concurrencyTrackingClient) GetInfo(ctx context.Context, addr string) (N
 }
 
 // TestPollBoundedConcurrency is the core regression/proof test for Part
-// 1 of the collector-concurrency-brief: poll() (shared by PollConfirmed/
-// PollUnconfirmed/PollNeverContacted) must never have more than
+// 1 of the collector-concurrency-brief: poll() (shared by
+// PollOwnedConfirmed/PollGenericConfirmed/PollUnconfirmed/
+// PollNeverContacted) must never have more than
 // maxGRPCPollWorkers (250) PollOnce calls in flight at once, no matter how
 // many more nodes than that are simultaneously due. It seeds
 // numNodesDue (600, comfortably more than double maxGRPCPollWorkers) never-
@@ -2512,16 +2750,28 @@ func TestDiscoverWithRespectsContextDeadline(t *testing.T) {
 }
 
 // TestQueueSizesPartitionsNodePopulation exercises QueueSizes (see cmd/netmap's Prometheus
-// metrics wiring) against a seeded mix of confirmed, unconfirmed-with-history, and
-// never-contacted nodes: it must report each of the three counts correctly, and the three
-// counts together must equal the total node population (a true partition, no
-// double-counting/gap), mirroring TestPollNeverContactedOnlyTouchesNeverContactedNodes/
-// TestListNodesHasHealthChecksFilter's proof that these three filters are disjoint.
+// metrics wiring) against a seeded mix of owned-confirmed, generic-confirmed,
+// unconfirmed-with-history, and never-contacted nodes: it must report each of the four counts
+// correctly, and the four counts together must equal the total node population (a true
+// partition, no double-counting/gap), mirroring
+// TestPollOwnedConfirmedAndGenericConfirmedPartitionConfirmedNodes/
+// TestPollNeverContactedOnlyTouchesNeverContactedNodes/TestListNodesHasHealthChecksFilter's
+// proof that these four filters are disjoint.
 func TestQueueSizesPartitionsNodePopulation(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	// Two confirmed nodes.
+	// One owned-confirmed node, promoted from a tagged placeholder --
+	// mirrors production's real approve-submission path (see
+	// TestPollOwnedConfirmedAndGenericConfirmedPartitionConfirmedNodes).
+	if _, err := store.UpsertDiscoveredNode(ctx, "owned:1", storage.DiscoverySourceP2P, map[string]any{"owner": "Jagtech"}, nil); err != nil {
+		t.Fatalf("seed owned placeholder: %v", err)
+	}
+	if _, err := store.UpsertConfirmedNode(ctx, "owned:1", []byte{0xAA}, storage.DiscoverySourceP2P); err != nil {
+		t.Fatalf("promote owned node: %v", err)
+	}
+
+	// Two generic-confirmed nodes (no owner/pool_owned tag).
 	if _, err := store.UpsertConfirmedNode(ctx, "confirmed:1", []byte{0x01}, storage.DiscoverySourceP2P); err != nil {
 		t.Fatalf("seed confirmed node 1: %v", err)
 	}
@@ -2546,13 +2796,16 @@ func TestQueueSizesPartitionsNodePopulation(t *testing.T) {
 	c := New(Config{})
 	c.Storage = store
 
-	confirmed, unconfirmed, neverContacted, err := c.QueueSizes(ctx)
+	ownedConfirmed, genericConfirmed, unconfirmed, neverContacted, err := c.QueueSizes(ctx)
 	if err != nil {
 		t.Fatalf("QueueSizes: %v", err)
 	}
 
-	if confirmed != 2 {
-		t.Errorf("confirmed = %d, want 2", confirmed)
+	if ownedConfirmed != 1 {
+		t.Errorf("ownedConfirmed = %d, want 1", ownedConfirmed)
+	}
+	if genericConfirmed != 2 {
+		t.Errorf("genericConfirmed = %d, want 2", genericConfirmed)
 	}
 	if unconfirmed != 1 {
 		t.Errorf("unconfirmed = %d, want 1", unconfirmed)
@@ -2565,8 +2818,8 @@ func TestQueueSizesPartitionsNodePopulation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list all nodes: %v", err)
 	}
-	if total := confirmed + unconfirmed + neverContacted; total != len(allNodes) {
-		t.Errorf("confirmed+unconfirmed+neverContacted = %d, want %d (total node count) -- these three queues must be a true partition of the whole population", total, len(allNodes))
+	if total := ownedConfirmed + genericConfirmed + unconfirmed + neverContacted; total != len(allNodes) {
+		t.Errorf("ownedConfirmed+genericConfirmed+unconfirmed+neverContacted = %d, want %d (total node count) -- these four queues must be a true partition of the whole population", total, len(allNodes))
 	}
 }
 
@@ -2574,7 +2827,7 @@ func TestQueueSizesPartitionsNodePopulation(t *testing.T) {
 // mirroring Discover/poll's own "collector: Storage is not configured" error.
 func TestQueueSizesRequiresStorage(t *testing.T) {
 	c := New(Config{})
-	if _, _, _, err := c.QueueSizes(context.Background()); err == nil {
+	if _, _, _, _, err := c.QueueSizes(context.Background()); err == nil {
 		t.Error("QueueSizes with no Storage configured = nil error, want an error")
 	}
 }
