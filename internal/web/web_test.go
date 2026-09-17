@@ -1642,17 +1642,21 @@ func TestFullNetworkSummaryCounts(t *testing.T) {
 // from computeWholePopulationCounts (a cache hit reuses the cached
 // addrsByNode map for row rendering instead of a second, page-scoped
 // call), so counting it unconditionally is equivalent to counting only
-// the whole-population one. A cache hit in buildNodeTableData must
-// never call either, so asserting these counts stay unchanged across a
-// second request within the TTL window proves the DB was only ever
-// touched by the first (cache-miss) request — mirrors
-// internal/api/api_test.go's countingStatsStore fake-store pattern
-// (embed the real storage.Store, override only the methods a test
-// cares about, delegate everything else).
+// the whole-population one. It also counts every call to NetworkHeight
+// (networkHeightCalls) — after extending dashboardCountsCache to cover
+// NetworkHeight too, this is ONLY ever called from buildNodeTableData
+// on a cache miss/expiry, same as the two above. A cache hit in
+// buildNodeTableData must never call any of these three, so asserting
+// these counts stay unchanged across a second request within the TTL
+// window proves the DB was only ever touched by the first (cache-miss)
+// request — mirrors internal/api/api_test.go's countingStatsStore
+// fake-store pattern (embed the real storage.Store, override only the
+// methods a test cares about, delegate everything else).
 type countingWebStore struct {
 	storage.Store
 	wholePopulationListNodes atomic.Int32
 	addrsForNodesCalls       atomic.Int32
+	networkHeightCalls       atomic.Int32
 }
 
 func (c *countingWebStore) ListNodes(ctx context.Context, filter storage.NodeFilter) ([]storage.Node, error) {
@@ -1665,6 +1669,11 @@ func (c *countingWebStore) ListNodes(ctx context.Context, filter storage.NodeFil
 func (c *countingWebStore) ListNodeAddressesForNodes(ctx context.Context, nodeIDs []uuid.UUID) (map[uuid.UUID][]storage.NodeAddress, error) {
 	c.addrsForNodesCalls.Add(1)
 	return c.Store.ListNodeAddressesForNodes(ctx, nodeIDs)
+}
+
+func (c *countingWebStore) NetworkHeight(ctx context.Context) (*int64, int, error) {
+	c.networkHeightCalls.Add(1)
+	return c.Store.NetworkHeight(ctx)
 }
 
 // seedCountedNode inserts one confirmed node so the counts/rows
@@ -1682,11 +1691,12 @@ func seedCountedNode(t *testing.T, store storage.Store, addrSuffix string) {
 // TestDashboardCountsCacheHitWithinTTL asserts two GET / requests
 // within the cache's TTL window return byte-identical whole-population
 // summary counts AND the underlying store's whole-population
-// ListNodes/ListNodeAddressesForNodes calls are NOT reissued on the
-// second request — the whole point of the cache: a second request
-// inside the TTL window must serve the cached counts (and addrsByNode)
-// with zero additional whole-population DB calls, while the paginated
-// row fetch itself still runs every time (untouched by this cache).
+// ListNodes/ListNodeAddressesForNodes/NetworkHeight calls are NOT
+// reissued on the second request — the whole point of the cache: a
+// second request inside the TTL window must serve the cached counts
+// (addrsByNode, and NetworkHeight result) with zero additional
+// whole-population DB calls, while the paginated row fetch itself
+// still runs every time (untouched by this cache).
 func TestDashboardCountsCacheHitWithinTTL(t *testing.T) {
 	realStore := newTestStore(t)
 	seedCountedNode(t, realStore, "1")
@@ -1703,11 +1713,15 @@ func TestDashboardCountsCacheHitWithinTTL(t *testing.T) {
 	}
 	afterFirstListNodes := counting.wholePopulationListNodes.Load()
 	afterFirstAddrs := counting.addrsForNodesCalls.Load()
+	afterFirstNetworkHeight := counting.networkHeightCalls.Load()
 	if afterFirstListNodes == 0 {
 		t.Fatalf("underlying store's whole-population ListNodes was never called for the first (cache-miss) request")
 	}
 	if afterFirstAddrs == 0 {
 		t.Fatalf("underlying store's ListNodeAddressesForNodes was never called for the first (cache-miss) request")
+	}
+	if afterFirstNetworkHeight == 0 {
+		t.Fatalf("underlying store's NetworkHeight was never called for the first (cache-miss) request")
 	}
 
 	status, second := getBody(t, srv.URL+"/")
@@ -1724,12 +1738,17 @@ func TestDashboardCountsCacheHitWithinTTL(t *testing.T) {
 	if got := counting.addrsForNodesCalls.Load(); got != afterFirstAddrs {
 		t.Errorf("ListNodeAddressesForNodes call count changed from %d to %d after a second request within the TTL window, want unchanged (cache hit)", afterFirstAddrs, got)
 	}
+	if got := counting.networkHeightCalls.Load(); got != afterFirstNetworkHeight {
+		t.Errorf("NetworkHeight call count changed from %d to %d after a second request within the TTL window, want unchanged (cache hit) — exactly once per TTL window, not once per request", afterFirstNetworkHeight, got)
+	}
 }
 
 // TestDashboardCountsCacheExpiresAfterTTL asserts a request issued
 // after the cache's TTL has elapsed triggers a fresh whole-population
 // fetch (and reflects newly-written data) rather than continuing to
-// serve the stale cached counts — uses a short (10ms) TTL plus
+// serve the stale cached counts — and that this also applies to
+// NetworkHeight, which shares this same cache entry (see
+// dashboardCountsCache's doc comment). Uses a short (10ms) TTL plus
 // time.Sleep, per this package's existing convention (no
 // fake-clock/injectable-time-source pattern found here to prefer over
 // it — see internal/api/api_test.go's TestStatsEndpointCacheExpiresAfterTTL
@@ -1747,8 +1766,12 @@ func TestDashboardCountsCacheExpiresAfterTTL(t *testing.T) {
 		t.Fatalf("GET /network status = %d, want %d", status, http.StatusOK)
 	}
 	afterFirst := counting.wholePopulationListNodes.Load()
+	afterFirstNetworkHeight := counting.networkHeightCalls.Load()
 	if afterFirst == 0 {
 		t.Fatalf("underlying store's whole-population ListNodes was never called for the first (cache-miss) request")
+	}
+	if afterFirstNetworkHeight == 0 {
+		t.Fatalf("underlying store's NetworkHeight was never called for the first (cache-miss) request")
 	}
 
 	// Seed a second confirmed node so the post-expiry response is
@@ -1766,6 +1789,9 @@ func TestDashboardCountsCacheExpiresAfterTTL(t *testing.T) {
 	if afterSecond <= afterFirst {
 		t.Errorf("whole-population ListNodes call count unchanged (%d) after TTL expiry, want > %d (a fresh query must have been issued)", afterSecond, afterFirst)
 	}
+	if got := counting.networkHeightCalls.Load(); got <= afterFirstNetworkHeight {
+		t.Errorf("NetworkHeight call count unchanged (%d) after TTL expiry, want > %d (a fresh query must have been issued)", got, afterFirstNetworkHeight)
+	}
 	if strings.Contains(second, `<div class="card-value">1</div>`) {
 		t.Errorf("second GET /network body still shows the stale 1-node total, want the recomputed 2-node total:\n%s", second)
 	}
@@ -1781,8 +1807,8 @@ func TestDashboardCountsCacheExpiresAfterTTL(t *testing.T) {
 // /network share the SAME cache entry: a first request to one route
 // populates the cache, and a subsequent request to the OTHER route
 // within the TTL window reuses it (zero additional whole-population
-// DB calls) rather than each route maintaining its own independent
-// cache.
+// DB calls, including NetworkHeight) rather than each route
+// maintaining its own independent cache.
 func TestDashboardAndNetworkShareCountsCache(t *testing.T) {
 	realStore := newTestStore(t)
 	seedCountedNode(t, realStore, "4")
@@ -1795,8 +1821,12 @@ func TestDashboardAndNetworkShareCountsCache(t *testing.T) {
 		t.Fatalf("GET / status = %d, want %d", status, http.StatusOK)
 	}
 	afterDashboard := counting.wholePopulationListNodes.Load()
+	afterDashboardNetworkHeight := counting.networkHeightCalls.Load()
 	if afterDashboard == 0 {
 		t.Fatalf("underlying store's whole-population ListNodes was never called for GET / (cache-miss)")
+	}
+	if afterDashboardNetworkHeight == 0 {
+		t.Fatalf("underlying store's NetworkHeight was never called for GET / (cache-miss)")
 	}
 
 	status, networkBody := getBody(t, srv.URL+"/network")
@@ -1807,6 +1837,9 @@ func TestDashboardAndNetworkShareCountsCache(t *testing.T) {
 
 	if afterNetwork != afterDashboard {
 		t.Errorf("whole-population ListNodes call count changed from %d to %d after GET /network within the TTL window, want unchanged (shared cache entry populated by GET /)", afterDashboard, afterNetwork)
+	}
+	if got := counting.networkHeightCalls.Load(); got != afterDashboardNetworkHeight {
+		t.Errorf("NetworkHeight call count changed from %d to %d after GET /network within the TTL window, want unchanged (shared cache entry populated by GET /)", afterDashboardNetworkHeight, got)
 	}
 	if !strings.Contains(dashboardBody, `<div class="card-value">1</div>`) {
 		t.Errorf("GET / body doesn't show the whole-population total (1):\n%s", dashboardBody)

@@ -213,9 +213,10 @@ type Store interface {
 	ListNodeEdges(ctx context.Context, nodeID uuid.UUID, limit int) ([]PeerEdge, error)
 
 	// NetworkHeight returns the most common height value across the most
-	// recent health check per node (mode of the latest-per-node heights),
-	// and the number of nodes that value was derived from. Returns
-	// (nil, 0, nil) if no health checks with a non-nil height exist yet.
+	// recent health check per node within the last 24h (mode of the
+	// latest-per-node heights), and the number of nodes that value was
+	// derived from. Returns (nil, 0, nil) if no health checks with a
+	// non-nil height exist within that window.
 	NetworkHeight(ctx context.Context) (*int64, int, error)
 
 	// ListSeedCandidates returns nodes that are BOTH opted-in
@@ -1572,12 +1573,27 @@ func (s *pgStore) ListNodeEdges(ctx context.Context, nodeID uuid.UUID, limit int
 }
 
 // NetworkHeight returns the most common height value across the most
-// recent health check per node (mode of the latest-per-node heights), and
-// the number of nodes that value was derived from. It first picks each
-// node's latest node_health row via DISTINCT ON (node_id) ... ORDER BY
-// node_id, ts DESC, filters out rows with a NULL height, then groups the
-// remaining heights and returns the one with the highest count. Returns
-// (nil, 0, nil) if no health checks with a non-nil height exist yet.
+// recent health check per node within the last 24h (mode of the
+// latest-per-node heights), and the number of nodes that value was
+// derived from. It first picks each node's latest node_health row —
+// restricted to rows with ts > now() - interval '24 hours', the same
+// window as dashboardReachableWindow in internal/web/web.go, kept in
+// sync for consistency rather than inventing a second window — via
+// DISTINCT ON (node_id) ... ORDER BY node_id, ts DESC, filters out rows
+// with a NULL height, then groups the remaining heights and returns the
+// one with the highest count. The time bound also lets Postgres/
+// TimescaleDB exclude chunks/rows outside the window instead of
+// deduplicating across the entire table history (node_health is a
+// hypertable; without a ts filter here, DISTINCT ON forces a full
+// Merge-Append-and-dedupe across every chunk, since chunk exclusion is
+// impossible without one). Returns (nil, 0, nil) if no health checks
+// with a non-nil height exist within that window — deliberately not
+// falling back to an unbounded query if the window is empty (e.g. during
+// a collector outage), since that would reintroduce the slow full-table
+// scan exactly when it's least expected, and "unavailable" is the
+// correct signal to give callers in that case anyway (a height last
+// reported weeks/months ago shouldn't count as the current network
+// height).
 func (s *pgStore) NetworkHeight(ctx context.Context) (*int64, int, error) {
 	var height int64
 	var count int
@@ -1585,6 +1601,7 @@ func (s *pgStore) NetworkHeight(ctx context.Context) (*int64, int, error) {
 		WITH latest AS (
 			SELECT DISTINCT ON (node_id) node_id, height
 			FROM node_health
+			WHERE ts > now() - interval '24 hours'
 			ORDER BY node_id, ts DESC
 		)
 		SELECT height, count(*) AS node_count

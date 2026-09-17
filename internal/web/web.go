@@ -409,14 +409,24 @@ const DefaultDashboardCountsCacheTTL = 20 * time.Second
 // store.ListNodes(ctx, storage.NodeFilter{}) + ListNodeAddressesForNodes
 // round trip that GET / (handleDashboard) and GET /network
 // (handleFullNetwork) both compute today, unpaginated and identical
-// regardless of which route triggered it.
+// regardless of which route triggered it. It also caches
+// store.NetworkHeight's result (height + node count) alongside those
+// counts, sharing this same entry/TTL/mutex rather than a second,
+// independent cache — see networkHeight/networkHeightNodeCount fields
+// below. Both handleDashboard and handleFullNetwork call
+// store.NetworkHeight every request (see their own doc comments); prior
+// to this, that call was NOT covered by this cache at all (unlike
+// internal/api's GET /v1/stats' statsCache, which has always wrapped
+// FetchNodeCounts and NetworkHeight together), so repeated GET //GET
+// /network requests within the TTL window saw no speedup on this call
+// even though the counts fetch was already being served from cache.
 //
 // One instance is created per NewHandler call (i.e. once per process,
 // at router construction time) and passed to BOTH handleDashboard and
 // handleFullNetwork — this is deliberately ONE shared cache entry, not
 // two: a cache hit on GET / populates it for a subsequent GET /network
 // within the same TTL window, and vice versa, since both routes would
-// otherwise recompute the exact same query.
+// otherwise recompute the exact same queries.
 //
 // Guarded by a sync.RWMutex, mirroring internal/api/stats.go's
 // statsCache (see PR #48) for consistency rather than inventing a
@@ -432,33 +442,39 @@ const DefaultDashboardCountsCacheTTL = 20 * time.Second
 type dashboardCountsCache struct {
 	ttl time.Duration
 
-	mu          sync.RWMutex
-	counts      dashboardCounts
-	addrsByNode map[uuid.UUID][]storage.NodeAddress
-	computedAt  time.Time
-	valid       bool
+	mu                     sync.RWMutex
+	counts                 dashboardCounts
+	addrsByNode            map[uuid.UUID][]storage.NodeAddress
+	networkHeight          *int64
+	networkHeightNodeCount int
+	computedAt             time.Time
+	valid                  bool
 }
 
-// get returns the cached whole-population counts and addrsByNode map,
-// and true, if the cache holds a value computed within the last ttl;
-// otherwise it returns the zero value and false (cache miss/expiry —
-// the caller must recompute and call set).
-func (c *dashboardCountsCache) get() (dashboardCounts, map[uuid.UUID][]storage.NodeAddress, bool) {
+// get returns the cached whole-population counts, addrsByNode map, and
+// NetworkHeight result (height + node count), and true, if the cache
+// holds a value computed within the last ttl; otherwise it returns the
+// zero value and false (cache miss/expiry — the caller must recompute
+// and call set).
+func (c *dashboardCountsCache) get() (dashboardCounts, map[uuid.UUID][]storage.NodeAddress, *int64, int, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if !c.valid || time.Since(c.computedAt) >= c.ttl {
-		return dashboardCounts{}, nil, false
+		return dashboardCounts{}, nil, nil, 0, false
 	}
-	return c.counts, c.addrsByNode, true
+	return c.counts, c.addrsByNode, c.networkHeight, c.networkHeightNodeCount, true
 }
 
-// set stores counts/addrsByNode as the new cached value, stamped with
-// the current time — the starting point for the next get's TTL check.
-func (c *dashboardCountsCache) set(counts dashboardCounts, addrsByNode map[uuid.UUID][]storage.NodeAddress) {
+// set stores counts/addrsByNode/networkHeight/networkHeightNodeCount as
+// the new cached value, stamped with the current time — the starting
+// point for the next get's TTL check.
+func (c *dashboardCountsCache) set(counts dashboardCounts, addrsByNode map[uuid.UUID][]storage.NodeAddress, networkHeight *int64, networkHeightNodeCount int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.counts = counts
 	c.addrsByNode = addrsByNode
+	c.networkHeight = networkHeight
+	c.networkHeightNodeCount = networkHeightNodeCount
 	c.computedAt = time.Now()
 	c.valid = true
 }
@@ -536,9 +552,10 @@ func computeWholePopulationCounts(ctx context.Context, store storage.Store) (das
 // buildNodeTableData fetches the whole-population dashboardCounts
 // (Total/P2P/Registry/Both/Confirmed/Unconfirmed/OnionCapable/
 // ClearnetCapable/ClearnetOnly — always unfiltered, regardless of
-// reachableSince) plus a paginated page of dashboardNodeRow for a node
-// table. reachableSince nil means no filter (the full node population,
-// for /network); non-nil applies that cutoff (the main dashboard's
+// reachableSince), store.NetworkHeight's result (height + node count),
+// plus a paginated page of dashboardNodeRow for a node table.
+// reachableSince nil means no filter (the full node population, for
+// /network); non-nil applies that cutoff (the main dashboard's
 // dashboardReachableWindow liveness view). page/limit/offset drive the
 // SQL-level LIMIT/OFFSET of the paginated page; historyLimit controls
 // how many HealthCheck rows are fetched per row (see
@@ -548,26 +565,34 @@ func computeWholePopulationCounts(ctx context.Context, store storage.Store) (das
 //
 // This is shared, extract-don't-change logic behind both
 // handleDashboard and handleFullNetwork: same whole-population counts
-// query, same per-row scrub+history+pagination-math shape, differing
-// only in the ReachableSince filter and historyLimit each passes in.
+// and NetworkHeight queries, same per-row scrub+history+pagination-math
+// shape, differing only in the ReachableSince filter and historyLimit
+// each passes in.
 //
-// The whole-population counts/addrsByNode fetch (computeWholePopulationCounts)
-// is served from cache when possible — see dashboardCountsCache's doc
-// comment — falling back to a fresh fetch (which populates the cache
-// for subsequent callers, including the OTHER route sharing this same
-// cache instance) on a miss/expiry. The paginated LIMIT/OFFSET row
-// fetch below is completely untouched by this cache either way.
-func buildNodeTableData(ctx context.Context, store storage.Store, cache *dashboardCountsCache, reachableSince *time.Time, page, limit, offset, historyLimit int) (dashboardCounts, []dashboardNodeRow, nodeTablePagination, error) {
+// The whole-population counts/addrsByNode/NetworkHeight fetch
+// (computeWholePopulationCounts + store.NetworkHeight) is served from
+// cache when possible — see dashboardCountsCache's doc comment —
+// falling back to a fresh fetch (which populates the cache for
+// subsequent callers, including the OTHER route sharing this same
+// cache instance) on a miss/expiry. On a cache hit, store.NetworkHeight
+// is skipped entirely, same as ListNodes/ListNodeAddressesForNodes. The
+// paginated LIMIT/OFFSET row fetch below is completely untouched by
+// this cache either way.
+func buildNodeTableData(ctx context.Context, store storage.Store, cache *dashboardCountsCache, reachableSince *time.Time, page, limit, offset, historyLimit int) (dashboardCounts, []dashboardNodeRow, nodeTablePagination, *int64, int, error) {
 	var pagination nodeTablePagination
 
-	counts, addrsByNode, ok := cache.get()
+	counts, addrsByNode, networkHeight, networkHeightNodeCount, ok := cache.get()
 	if !ok {
 		var err error
 		counts, addrsByNode, err = computeWholePopulationCounts(ctx, store)
 		if err != nil {
-			return counts, nil, pagination, err
+			return counts, nil, pagination, nil, 0, err
 		}
-		cache.set(counts, addrsByNode)
+		networkHeight, networkHeightNodeCount, err = store.NetworkHeight(ctx)
+		if err != nil {
+			return counts, nil, pagination, nil, 0, err
+		}
+		cache.set(counts, addrsByNode, networkHeight, networkHeightNodeCount)
 	}
 
 	// Paginated: the actual SQL-level LIMIT/OFFSET query backing the
@@ -577,7 +602,7 @@ func buildNodeTableData(ctx context.Context, store storage.Store, cache *dashboa
 	// unfiltered allNodes query and never use this filter.
 	pageNodes, err := store.ListNodes(ctx, storage.NodeFilter{ReachableSince: reachableSince, Limit: limit, Offset: offset})
 	if err != nil {
-		return counts, nil, pagination, err
+		return counts, nil, pagination, nil, 0, err
 	}
 
 	var rows []dashboardNodeRow
@@ -591,7 +616,7 @@ func buildNodeTableData(ctx context.Context, store storage.Store, cache *dashboa
 		}
 		history, err := store.GetNodeHistory(ctx, n.ID, historyLimit)
 		if err != nil {
-			return counts, nil, pagination, err
+			return counts, nil, pagination, nil, 0, err
 		}
 		if len(history) > 0 {
 			row.LatestHealth = &history[0]
@@ -609,7 +634,7 @@ func buildNodeTableData(ctx context.Context, store storage.Store, cache *dashboa
 	if reachableSince != nil {
 		filteredNodes, err := store.ListNodes(ctx, storage.NodeFilter{ReachableSince: reachableSince})
 		if err != nil {
-			return counts, nil, pagination, err
+			return counts, nil, pagination, nil, 0, err
 		}
 		filteredTotal = len(filteredNodes)
 	}
@@ -626,7 +651,7 @@ func buildNodeTableData(ctx context.Context, store storage.Store, cache *dashboa
 	pagination.HasNextPage = offset+len(pageNodes) < filteredTotal
 	pagination.NextPage = page + 1
 
-	return counts, rows, pagination, nil
+	return counts, rows, pagination, networkHeight, networkHeightNodeCount, nil
 }
 
 // parseNodeTablePageParams parses the `?page=`/`?limit=` query params
@@ -742,7 +767,7 @@ func handleDashboard(tmpl *template.Template, store storage.Store, countsCache *
 		// buildNodeTableData returns are deliberately built from an
 		// unfiltered query and don't use this cutoff at all.
 		cutoff := time.Now().Add(-dashboardReachableWindow)
-		counts, rows, pagination, err := buildNodeTableData(ctx, store, countsCache, &cutoff, page, limit, offset, dashboardRowHistoryLimit)
+		counts, rows, pagination, height, heightNodeCount, err := buildNodeTableData(ctx, store, countsCache, &cutoff, page, limit, offset, dashboardRowHistoryLimit)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -763,11 +788,6 @@ func handleDashboard(tmpl *template.Template, store storage.Store, countsCache *
 			NextPage:             pagination.NextPage,
 		}
 
-		height, heightNodeCount, err := store.NetworkHeight(ctx)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
 		data.NetworkHeight = height
 		data.NetworkHeightNodeCount = heightNodeCount
 
@@ -831,7 +851,7 @@ func handleFullNetwork(tmpl *template.Template, store storage.Store, countsCache
 
 		// reachableSince is nil here — /network's table has no
 		// liveness filter at all, unlike handleDashboard's.
-		counts, rows, pagination, err := buildNodeTableData(ctx, store, countsCache, nil, page, limit, offset, networkRowHistoryLimit)
+		counts, rows, pagination, height, heightNodeCount, err := buildNodeTableData(ctx, store, countsCache, nil, page, limit, offset, networkRowHistoryLimit)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -851,11 +871,6 @@ func handleFullNetwork(tmpl *template.Template, store storage.Store, countsCache
 			NextPage:       pagination.NextPage,
 		}
 
-		height, heightNodeCount, err := store.NetworkHeight(ctx)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
 		data.NetworkHeight = height
 		data.NetworkHeightNodeCount = heightNodeCount
 
