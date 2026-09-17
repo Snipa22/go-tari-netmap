@@ -209,7 +209,8 @@ const GeoIPSuccessTTL = 30 * 24 * time.Hour
 const GeoIPFailedTTL = 24 * time.Hour
 
 // maxGRPCPollWorkers bounds the number of concurrent in-flight gRPC PollOnce dials within a
-// single poll() pass (shared by PollConfirmed, PollUnconfirmed, and PollNeverContacted). Each
+// single poll() pass (shared by PollOwnedConfirmed, PollGenericConfirmed, PollUnconfirmed, and
+// PollNeverContacted). Each
 // gRPC dial can take up to dialTimeout (see grpc_client.go, currently 180s), and with tens of
 // thousands of tracked nodes, fully sequential dialing cannot remotely keep up with the poll
 // cadences above — see this repo's collector-concurrency-brief for the full rationale.
@@ -346,7 +347,8 @@ type Config struct {
 	SeedNodes []string
 
 	// DialJitter is the delay inserted before each per-node dial within a
-	// single Discover, PollConfirmed, or PollUnconfirmed pass (only
+	// single Discover, PollOwnedConfirmed, PollGenericConfirmed, or PollUnconfirmed pass
+	// (only
 	// immediately before a dial that's actually about to happen — nodes
 	// skipped by a due()/dueForDiscovery cooldown check don't incur it),
 	// to avoid hammering many different nodes in rapid succession even
@@ -372,14 +374,14 @@ type Collector struct {
 
 	// GRPCClient talks to Tari base nodes over go-tari-grpc-lib's gRPC
 	// BaseNode service. Optional/nilable: if nil, the gRPC probe is
-	// skipped entirely for Discover, PollConfirmed, and PollUnconfirmed,
-	// rather than erroring.
+	// skipped entirely for Discover, PollOwnedConfirmed, PollGenericConfirmed, and
+	// PollUnconfirmed, rather than erroring.
 	GRPCClient NodeClient
 
 	// P2PClient talks to Tari nodes over go-tari-lib/p2p's direct
 	// comms/RPC-over-P2P transport. Optional/nilable: if nil, the P2P
-	// probe is skipped entirely for Discover, PollConfirmed, and
-	// PollUnconfirmed, rather than erroring. A Collector with only one
+	// probe is skipped entirely for Discover, PollOwnedConfirmed,
+	// PollGenericConfirmed, and PollUnconfirmed, rather than erroring. A Collector with only one
 	// of GRPCClient/P2PClient set still works correctly, just without
 	// data from the other transport.
 	P2PClient NodeClient
@@ -397,23 +399,48 @@ type Collector struct {
 	// erroring.
 	GeoIPClient *geoip.Client
 
-	// TickInterval governs how often Run checks which known confirmed
-	// nodes are due for a poll, and how often Run kicks off a fresh
-	// discovery pass. These run on independent tickers/goroutines (see
-	// Run) but share this same cadence value for simplicity — there's
-	// no need for separate configuration since a discovery pass that's
-	// still running when its next tick fires simply doesn't overlap
-	// with itself (Run waits for the previous Discover call to return
-	// before scheduling off the next tick), and the same is true for
-	// PollConfirmed. Defaults to defaultTickInterval if unset. Kept
-	// short and independent of the (much longer) per-node poll cadence
-	// so tests don't need to wait an hour for anything.
+	// TickInterval governs how often Run checks which known
+	// GENERIC-confirmed nodes (confirmed but NOT pool-owned — see
+	// PollGenericConfirmed) are due for a poll, and how often Run kicks
+	// off a fresh discovery pass. These run on independent tickers/
+	// goroutines (see Run) but share this same cadence value for
+	// simplicity — there's no need for separate configuration since a
+	// discovery pass that's still running when its next tick fires
+	// simply doesn't overlap with itself (Run waits for the previous
+	// Discover call to return before scheduling off the next tick), and
+	// the same is true for PollGenericConfirmed. Defaults to
+	// defaultTickInterval if unset. Kept short and independent of the
+	// (much longer) per-node poll cadence so tests don't need to wait
+	// an hour for anything.
 	//
-	// The unconfirmed-node poll loop (see UnconfirmedTickInterval) is
-	// deliberately NOT governed by this field — it is fully independent
-	// so that unconfirmed-node volume/backlog can never affect the
-	// confirmed loop's cadence, and vice versa.
+	// This field intentionally does NOT govern the owned-confirmed poll
+	// loop (see OwnedPollTickInterval) — the two confirmed-population
+	// halves run on fully independent tickers so a slow/backlogged
+	// generic-confirmed pass (dominated in production by a huge,
+	// low-value onion-only tail) can never delay the next
+	// owned-confirmed pass, and vice versa; this is the entire point of
+	// the owned/generic confirmed-poll split — see PollOwnedConfirmed's
+	// doc comment for the production bug this fixes. Nor does it govern
+	// the unconfirmed-node poll loop (see UnconfirmedTickInterval) —
+	// same independence rationale, one level down the priority order.
 	TickInterval time.Duration
+
+	// OwnedPollTickInterval governs how often Run checks which known
+	// pool-owned CONFIRMED nodes (see PollOwnedConfirmed) are due for a
+	// poll, mirroring TickInterval but for the separate, explicitly
+	// HIGHER-priority owned-confirmed poll loop (see
+	// runOwnedConfirmedPollLoop). Optional: unlike UnconfirmedTickInterval,
+	// this does NOT default to TickInterval's (possibly long-backlogged)
+	// effective cadence when left unset/<= 0 — it defaults to
+	// PollIntervalPoolOwned (5 minutes) instead, since guaranteeing that
+	// cadence for our own small, fast, business-critical owned node
+	// population — regardless of how large or slow the generic-confirmed
+	// backlog is — is the entire reason this independent loop/field
+	// exists. Set this explicitly only if the owned-confirmed loop's
+	// tick cadence needs to differ from PollIntervalPoolOwned itself —
+	// e.g. in tests, which use a short interval so they don't need to
+	// wait 5 minutes for anything.
+	OwnedPollTickInterval time.Duration
 
 	// UnconfirmedTickInterval governs how often Run checks which known
 	// unconfirmed placeholder nodes (Node.PublicKey == nil) are due for
@@ -424,7 +451,7 @@ type Collector struct {
 	// so existing callers that don't care about tuning the two loops'
 	// cadences independently see no behavior change. Set this
 	// explicitly only if the unconfirmed loop's cadence needs to differ
-	// from the confirmed loop's.
+	// from the generic-confirmed loop's.
 	UnconfirmedTickInterval time.Duration
 
 	// NeverContactedTickInterval governs how often Run checks which
@@ -479,8 +506,8 @@ type Collector struct {
 	GeoIPRefreshTickInterval time.Duration
 
 	// OnPollResult is an OPTIONAL observer invoked once per individual probe attempt made by
-	// this Collector's own scheduled poll loops (PollConfirmed/PollUnconfirmed/
-	// PollNeverContacted, via poll()) -- see PollResultFunc's doc comment for exactly what
+	// this Collector's own scheduled poll loops (PollOwnedConfirmed/PollGenericConfirmed/
+	// PollUnconfirmed/PollNeverContacted, via poll()) -- see PollResultFunc's doc comment for exactly what
 	// "success" means. Nil (the zero value, and the default for every existing caller/test)
 	// means no observer at all -- poll() behaves identically either way, this is purely an
 	// observability hook. Wired from cmd/netmap/main.go to a Prometheus counter (see
@@ -504,8 +531,9 @@ type Collector struct {
 // P2PClient are left nil (network calls are opt-in): set Storage
 // (required) and at least one of GRPCClient/P2PClient (recommended, but
 // not required — a Collector with neither set just does nothing on
-// Discover/PollConfirmed/PollUnconfirmed rather than panicking) before
-// calling Run, Discover, PollConfirmed, or PollUnconfirmed.
+// Discover/PollOwnedConfirmed/PollGenericConfirmed/PollUnconfirmed rather than
+// panicking) before calling Run, Discover, PollOwnedConfirmed,
+// PollGenericConfirmed, or PollUnconfirmed.
 func New(cfg Config) *Collector {
 	return &Collector{
 		cfg:           cfg,
@@ -515,34 +543,43 @@ func New(cfg Config) *Collector {
 }
 
 // Run starts the collector's discovery and poll loops. Discovery, the
-// confirmed-node poll loop, and the unconfirmed-node poll loop each run
-// on their own independent goroutine/ticker so that none can starve
-// another:
+// owned-confirmed poll loop, the generic-confirmed poll loop, and the
+// unconfirmed-node poll loop each run on their own independent
+// goroutine/ticker so that none can starve another:
 //
 //   - a slow or never-ending Discover pass (a synchronous BFS over the
 //     real peer graph, with real network dials — this can take minutes
 //     against the real mainnet, or longer as the network grows, though
 //     now bounded per-pass by DiscoveryPassDeadline — see discoverWith's
-//     doc comment) cannot starve either poll loop, which is what
-//     actually produces the health-check data the rest of this tool is
-//     for.
-//   - the unconfirmed-node poll loop (PollUnconfirmed) cannot starve the
-//     confirmed-node poll loop (PollConfirmed), even when the unconfirmed
+//     doc comment) cannot starve any poll loop, which is what actually
+//     produces the health-check data the rest of this tool is for.
+//   - the generic-confirmed poll loop (PollGenericConfirmed) cannot
+//     starve the owned-confirmed poll loop (PollOwnedConfirmed), even
+//     when the generic-confirmed population (in production, an
+//     overwhelmingly onion-only tail of ~7,400 nodes) vastly outnumbers
+//     the owned population (~10 nodes) — owned nodes must be polled
+//     reliably on their own PollIntervalPoolOwned cadence regardless of
+//     generic-confirmed volume/backlog, including the slow/timing-out
+//     P2P/onion dials that backlog is dominated by. This is the core
+//     fix this split exists for — see PollOwnedConfirmed's doc comment
+//     for the production timestamp-gap bug (observed gaps up to 40
+//     minutes against a 5-minute intended cadence) that motivated it.
+//   - the unconfirmed-node poll loop (PollUnconfirmed) cannot starve
+//     either confirmed-population poll loop, even when the unconfirmed
 //     node population vastly outnumbers confirmed nodes (in production,
 //     ~243:1) — confirmed nodes must be polled reliably every tick
-//     regardless of unconfirmed-queue volume/backlog. This is the core
-//     fix this split exists for; see PollConfirmed/PollUnconfirmed's doc
-//     comments.
+//     regardless of unconfirmed-queue volume/backlog.
 //   - the never-contacted poll loop (PollNeverContacted) cannot be
-//     starved by, or starve, either of the other two — it runs on its
-//     own goroutine/ticker just like the other two, so a never-contacted
-//     node gets its first probe attempt on its own fast, independent
-//     cadence (see NeverContactedTickInterval) regardless of how large
-//     the confirmed or unconfirmed backlogs are. See PollNeverContacted's
-//     doc comment for why this queue exists as a THIRD, distinct
-//     category rather than folding into PollUnconfirmed.
+//     starved by, or starve, any of the other poll loops — it runs on
+//     its own goroutine/ticker just like the others, so a
+//     never-contacted node gets its first probe attempt on its own
+//     fast, independent cadence (see NeverContactedTickInterval)
+//     regardless of how large the confirmed or unconfirmed backlogs
+//     are. See PollNeverContacted's doc comment for why this queue
+//     exists as a distinct category rather than folding into
+//     PollUnconfirmed.
 //   - the owned-discovery loop (DiscoverOwned) cannot be starved by, or
-//     starve, any of the other four — it runs on its own
+//     starve, any of the other loops — it runs on its own
 //     goroutine/ticker (see OwnedDiscoveryTickInterval/
 //     runOwnedDiscoverLoop), so Config.SeedNodes and every pool-owned
 //     node get a fresh peer-walk on their own short, independent
@@ -555,7 +592,7 @@ func New(cfg Config) *Collector {
 //     DiscoveryIntervalPoolOwned's intended cadence. See DiscoverOwned's
 //     doc comment for the full rationale.
 //   - the geoip-cache refresh loop (RefreshGeoIP) cannot be starved by,
-//     or starve, any of the other five — it runs on its own
+//     or starve, any of the other loops — it runs on its own
 //     goroutine/ticker (see GeoIPRefreshTickInterval/
 //     runGeoIPRefreshLoop), and is a pure no-op (not even a Storage
 //     query) when GeoIPClient is nil. This is the loop GET
@@ -563,31 +600,37 @@ func New(cfg Config) *Collector {
 //     outbound geoip lookup of its own — see RefreshGeoIP's doc
 //     comment.
 //
-// All six goroutines share Storage and the NodeClients, and all
-// observe ctx cancellation independently. Run blocks until all six have
-// exited (via a sync.WaitGroup) and returns nil on clean shutdown.
+// All seven goroutines share Storage and the NodeClients, and all
+// observe ctx cancellation independently. Run blocks until all seven
+// have exited (via a sync.WaitGroup) and returns nil on clean shutdown.
 //
 // Discover() and DiscoverOwned() only ever touch Storage and the
 // NodeClients — never c.nextPoll — so running them concurrently with the
 // poll loops introduces no new data race. c.nextPoll access is already
 // guarded by c.mu, which is generic over address keys and thus safe for
-// concurrent due/setNextPoll access from all three poll loops
-// simultaneously — PollConfirmed, PollUnconfirmed, and
-// PollNeverContacted only ever touch disjoint address keys (a node
-// belongs to exactly one of the three categories at any given time —
-// see PollNeverContacted's doc comment), but the mutex makes this safe
-// even so. c.nextDiscovery is shared between Discover and DiscoverOwned
-// (both key it identically via discoveryCooldownKey) and is likewise
-// guarded by c.mu — a shared owned/seed address being discovery-walked
-// concurrently by both loops is a race on WHICH of the two happens to
-// perform that particular dial, never a data race, and either outcome
-// is a correct, complete discovery-walk of that address. RefreshGeoIP
-// touches neither map — it only reads Storage and, when a lookup is
-// actually due, calls GeoIPClient.
+// concurrent due/setNextPoll access from all four poll loops
+// simultaneously — PollOwnedConfirmed, PollGenericConfirmed,
+// PollUnconfirmed, and PollNeverContacted only ever touch disjoint
+// address keys (a node belongs to exactly one of the four categories at
+// any given time — see PollOwnedConfirmed's and PollNeverContacted's
+// doc comments), but the mutex makes this safe even so. c.nextDiscovery
+// is shared between Discover and DiscoverOwned (both key it identically
+// via discoveryCooldownKey) and is likewise guarded by c.mu — a shared
+// owned/seed address being discovery-walked concurrently by both loops
+// is a race on WHICH of the two happens to perform that particular
+// dial, never a data race, and either outcome is a correct, complete
+// discovery-walk of that address. RefreshGeoIP touches neither map — it
+// only reads Storage and, when a lookup is actually due, calls
+// GeoIPClient.
 func (c *Collector) Run(ctx context.Context) error {
 	tick := c.TickInterval
 	if tick <= 0 {
 		tick = defaultTickInterval
+	}
+
+	ownedPollTick := c.OwnedPollTickInterval
+	if ownedPollTick <= 0 {
+		ownedPollTick = PollIntervalPoolOwned
 	}
 
 	unconfirmedTick := c.UnconfirmedTickInterval
@@ -611,7 +654,7 @@ func (c *Collector) Run(ctx context.Context) error {
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(6)
+	wg.Add(7)
 
 	go func() {
 		defer wg.Done()
@@ -620,7 +663,12 @@ func (c *Collector) Run(ctx context.Context) error {
 
 	go func() {
 		defer wg.Done()
-		c.runPollLoop(ctx, tick)
+		c.runOwnedConfirmedPollLoop(ctx, ownedPollTick)
+	}()
+
+	go func() {
+		defer wg.Done()
+		c.runGenericConfirmedPollLoop(ctx, tick)
 	}()
 
 	go func() {
@@ -648,8 +696,9 @@ func (c *Collector) Run(ctx context.Context) error {
 }
 
 // runDiscoverLoop runs Discover once immediately, then on every tick,
-// until ctx is cancelled. It runs entirely independently of runPollLoop
-// and runUnconfirmedPollLoop.
+// until ctx is cancelled. It runs entirely independently of
+// runOwnedConfirmedPollLoop, runGenericConfirmedPollLoop, and
+// runUnconfirmedPollLoop.
 func (c *Collector) runDiscoverLoop(ctx context.Context, tick time.Duration) {
 	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
@@ -670,17 +719,23 @@ func (c *Collector) runDiscoverLoop(ctx context.Context, tick time.Duration) {
 	}
 }
 
-// runPollLoop runs PollConfirmed once immediately, then on every tick,
-// until ctx is cancelled. It runs entirely independently of
-// runDiscoverLoop and runUnconfirmedPollLoop, so neither a slow/hanging
-// Discover pass nor unconfirmed-node poll volume/backlog ever delays or
-// starves polling of confirmed nodes.
-func (c *Collector) runPollLoop(ctx context.Context, tick time.Duration) {
+// runOwnedConfirmedPollLoop runs PollOwnedConfirmed once immediately,
+// then on every tick, until ctx is cancelled. It runs entirely
+// independently of runDiscoverLoop, runGenericConfirmedPollLoop, and
+// runUnconfirmedPollLoop, on its own ticker (see Run's ownedPollTick,
+// which defaults to PollIntervalPoolOwned) — this is the loop that
+// actually fixes the production timestamp-gap bug (see
+// PollOwnedConfirmed's doc comment): neither a slow/hanging Discover
+// pass, nor a slow/backlogged generic-confirmed pass (dominated by a
+// huge, low-value onion-only tail), nor unconfirmed-node poll
+// volume/backlog can ever delay or starve polling of our own small,
+// fast, business-critical owned nodes.
+func (c *Collector) runOwnedConfirmedPollLoop(ctx context.Context, tick time.Duration) {
 	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
 
-	if err := c.PollConfirmed(ctx); err != nil {
-		log.Printf("collector: confirmed poll pass error: %v", err)
+	if err := c.PollOwnedConfirmed(ctx); err != nil {
+		log.Printf("collector: owned-confirmed poll pass error: %v", err)
 	}
 
 	for {
@@ -688,8 +743,36 @@ func (c *Collector) runPollLoop(ctx context.Context, tick time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := c.PollConfirmed(ctx); err != nil {
-				log.Printf("collector: confirmed poll pass error: %v", err)
+			if err := c.PollOwnedConfirmed(ctx); err != nil {
+				log.Printf("collector: owned-confirmed poll pass error: %v", err)
+			}
+		}
+	}
+}
+
+// runGenericConfirmedPollLoop runs PollGenericConfirmed once
+// immediately, then on every tick, until ctx is cancelled. It runs
+// entirely independently of runDiscoverLoop, runOwnedConfirmedPollLoop,
+// and runUnconfirmedPollLoop, on its own ticker (see Run's tick) — this
+// is the generic-confirmed half of the confirmed-population priority
+// split (see PollOwnedConfirmed's doc comment): a slow/backlogged pass
+// here (e.g. many due onion dials queued behind maxP2PWorkersPerShard)
+// must never delay the next owned-confirmed pass.
+func (c *Collector) runGenericConfirmedPollLoop(ctx context.Context, tick time.Duration) {
+	ticker := time.NewTicker(tick)
+	defer ticker.Stop()
+
+	if err := c.PollGenericConfirmed(ctx); err != nil {
+		log.Printf("collector: generic-confirmed poll pass error: %v", err)
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := c.PollGenericConfirmed(ctx); err != nil {
+				log.Printf("collector: generic-confirmed poll pass error: %v", err)
 			}
 		}
 	}
@@ -697,12 +780,14 @@ func (c *Collector) runPollLoop(ctx context.Context, tick time.Duration) {
 
 // runUnconfirmedPollLoop runs PollUnconfirmed once immediately, then on
 // every tick, until ctx is cancelled. It runs entirely independently of
-// runDiscoverLoop and runPollLoop, on its own ticker (see Run's
-// unconfirmedTick) — this loop is explicitly lower-priority than
-// runPollLoop: it never blocks or starves the confirmed loop in any way
+// runDiscoverLoop, runOwnedConfirmedPollLoop, and
+// runGenericConfirmedPollLoop, on its own ticker (see Run's
+// unconfirmedTick) — this loop is explicitly lower-priority than either
+// confirmed-population loop: it never blocks or starves them in any way
 // (no shared per-tick budget, no shared blocking lock held across a
-// dial; the two loops' only shared state is c.nextPoll/c.mu, and
-// PollConfirmed/PollUnconfirmed only ever touch disjoint address keys).
+// dial; the loops' only shared state is c.nextPoll/c.mu, and
+// PollOwnedConfirmed/PollGenericConfirmed/PollUnconfirmed only ever
+// touch disjoint address keys).
 func (c *Collector) runUnconfirmedPollLoop(ctx context.Context, tick time.Duration) {
 	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
@@ -725,17 +810,18 @@ func (c *Collector) runUnconfirmedPollLoop(ctx context.Context, tick time.Durati
 
 // runNeverContactedPollLoop runs PollNeverContacted once immediately,
 // then on every tick, until ctx is cancelled. It runs entirely
-// independently of runDiscoverLoop, runPollLoop, and
-// runUnconfirmedPollLoop, on its own ticker (see Run's
-// neverContactedTick) — this loop is explicitly the HIGHEST-priority of
-// the three poll loops (see PollNeverContacted's doc comment): it must
-// never be blocked or starved by either of the other two, and its own
-// (typically much smaller) never-contacted node population must never
-// be crowded out by however large the confirmed or unconfirmed backlogs
-// are. The three loops' only shared state is c.nextPoll/c.mu, and
-// PollConfirmed/PollUnconfirmed/PollNeverContacted only ever touch
-// disjoint address keys (a node belongs to exactly one of the three
-// categories at any given time).
+// independently of runDiscoverLoop, runOwnedConfirmedPollLoop,
+// runGenericConfirmedPollLoop, and runUnconfirmedPollLoop, on its own
+// ticker (see Run's neverContactedTick) — this loop is explicitly the
+// HIGHEST-priority of the poll loops (see PollNeverContacted's doc
+// comment): it must never be blocked or starved by any of the others,
+// and its own (typically much smaller) never-contacted node population
+// must never be crowded out by however large the confirmed or
+// unconfirmed backlogs are. These loops' only shared state is
+// c.nextPoll/c.mu, and PollOwnedConfirmed/PollGenericConfirmed/
+// PollUnconfirmed/PollNeverContacted only ever touch disjoint address
+// keys (a node belongs to exactly one of the four categories at any
+// given time).
 func (c *Collector) runNeverContactedPollLoop(ctx context.Context, tick time.Duration) {
 	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
@@ -758,7 +844,8 @@ func (c *Collector) runNeverContactedPollLoop(ctx context.Context, tick time.Dur
 
 // runOwnedDiscoverLoop runs DiscoverOwned once immediately, then on
 // every tick, until ctx is cancelled. It runs entirely independently of
-// runDiscoverLoop, runPollLoop, runUnconfirmedPollLoop, and
+// runDiscoverLoop, runOwnedConfirmedPollLoop, runGenericConfirmedPollLoop,
+// runUnconfirmedPollLoop, and
 // runNeverContactedPollLoop, on its own ticker (see Run's
 // ownedDiscoveryTick) — this is the loop that actually guarantees
 // DiscoveryIntervalPoolOwned's intended cadence for Config.SeedNodes and
@@ -1155,31 +1242,71 @@ func (c *Collector) ownedAddresses(ctx context.Context) ([]string, error) {
 	return addrs, nil
 }
 
-// PollConfirmed checks all known confirmed nodes (Node.PublicKey != nil)
-// and, for those whose next-poll time is due, calls PollOnce (which
-// independently attempts GRPCClient and P2PClient, whichever are
-// non-nil). It runs entirely independently of PollUnconfirmed — this is
-// the confirmed half of the priority split described in Run's doc
-// comment: confirmed nodes must be polled reliably every tick regardless
-// of unconfirmed-node population/backlog, since production experience
-// showed a single interleaved node list (confirmed and unconfirmed
-// nodes sharing one fixed per-tick dial budget) lets unconfirmed
-// placeholder nodes — which can outnumber confirmed nodes by orders of
-// magnitude — starve confirmed nodes of reliable polling.
-func (c *Collector) PollConfirmed(ctx context.Context) error {
+// PollOwnedConfirmed checks all known CONFIRMED nodes (Node.PublicKey !=
+// nil) that are ALSO pool-owned (per storage.NodeFilter.Owned's exact
+// isPoolOwned-mirroring predicate) and, for those whose next-poll time
+// is due, calls PollOnce (which independently attempts GRPCClient and
+// P2PClient, whichever are non-nil). It runs entirely independently of
+// every other poll loop, including PollGenericConfirmed — this is the
+// owned half of the confirmed-population priority split described in
+// Run's doc comment.
+//
+// This split exists to fix a real production bug: PollConfirmed (the
+// single, now-removed function this and PollGenericConfirmed replace)
+// queried ALL confirmed nodes — our handful of owned base nodes AND the
+// overwhelming majority onion-only generic-confirmed tail (~7,400 nodes
+// in production, vs. ~10 owned) — in one poll() pass. poll() does not
+// return until every dispatched dial across both gRPC and (bounded but
+// still potentially slow, especially over Tor) P2P/onion transports
+// completes, so a backlog of slow/timing-out onion dials in that same
+// pass delayed the next tick's re-poll of our own fast, business-
+// critical owned nodes, even though each owned node's OWN dial is fast.
+// Production Postgres data confirmed gaps of up to 40 minutes between
+// successive probes of our biggest owned mainnet base node, despite a
+// 5-minute intended cadence (PollIntervalPoolOwned) and a 5-minute
+// outer tick (defaultTickInterval) — exactly the same
+// generic-population-starves-priority-population anti-pattern the
+// PollUnconfirmed/PollNeverContacted split (see their doc comments)
+// already existed to prevent, just never applied to the confirmed
+// population until now. Splitting owned confirmed nodes onto their own
+// independent goroutine/ticker (see runOwnedConfirmedPollLoop/
+// OwnedPollTickInterval) means a slow/backlogged generic-confirmed pass
+// can never again delay the next owned-confirmed pass.
+func (c *Collector) PollOwnedConfirmed(ctx context.Context) error {
 	confirmed := true
-	return c.poll(ctx, storage.NodeFilter{Confirmed: &confirmed})
+	owned := true
+	return c.poll(ctx, storage.NodeFilter{Confirmed: &confirmed, Owned: &owned})
+}
+
+// PollGenericConfirmed checks all known CONFIRMED nodes (Node.PublicKey
+// != nil) that are NOT pool-owned and, for those whose next-poll time is
+// due, calls PollOnce, exactly mirroring PollOwnedConfirmed but over the
+// complementary confirmed-node subset — this is the generic half of the
+// confirmed-population priority split; see PollOwnedConfirmed's doc
+// comment for why this split exists. It runs entirely independently of
+// PollOwnedConfirmed and every other poll loop: this queue's own
+// cadence (see Run's genericConfirmedTick, which defaults to
+// defaultTickInterval — the same cadence the removed PollConfirmed used
+// to run at) is deliberately UNCHANGED from before this split, so this
+// large, low-priority, low-value onion tail's polling behavior does not
+// regress — only owned nodes get a new, independent, protected fast
+// lane.
+func (c *Collector) PollGenericConfirmed(ctx context.Context) error {
+	confirmed := true
+	owned := false
+	return c.poll(ctx, storage.NodeFilter{Confirmed: &confirmed, Owned: &owned})
 }
 
 // PollUnconfirmed checks all known unconfirmed placeholder nodes
 // (Node.PublicKey == nil) that have AT LEAST ONE recorded health check
 // (i.e. have been probed before, successfully or not) and, for those
 // whose next-poll time is due, calls PollOnce, exactly mirroring
-// PollConfirmed but over the complementary node subset. It runs
-// entirely independently of PollConfirmed — see PollConfirmed's doc
-// comment and Run's doc comment for why this split exists and why this
-// loop is explicitly lower-priority (it must never block or starve
-// PollConfirmed).
+// PollOwnedConfirmed/PollGenericConfirmed but over the complementary
+// node subset (unconfirmed rather than confirmed). It runs entirely
+// independently of both confirmed poll loops — see PollOwnedConfirmed's
+// doc comment and Run's doc comment for why this split exists and why
+// this loop is explicitly lower-priority (it must never block or starve
+// either confirmed poll loop).
 //
 // The HasHealthChecks: true half of this filter is deliberate and
 // distinct from a plain Confirmed: false filter: a node that has NEVER
@@ -1204,8 +1331,8 @@ func (c *Collector) PollUnconfirmed(ctx context.Context) error {
 // storage.NodeFilter.HasHealthChecks's doc comment for why "zero rows"
 // really does mean "never attempted", not just "never succeeded") and,
 // for those whose next-poll time is due, calls PollOnce, mirroring
-// PollConfirmed/PollUnconfirmed but over this third, disjoint node
-// subset.
+// PollOwnedConfirmed/PollGenericConfirmed/PollUnconfirmed but over this
+// fourth, disjoint node subset.
 //
 // This is deliberately NOT the same thing as "unconfirmed" (see this
 // repo's collector-concurrency-brief): an unconfirmed node can have
@@ -1215,69 +1342,79 @@ func (c *Collector) PollUnconfirmed(ctx context.Context) error {
 // because they were only just discovered and the confirmed/unconfirmed
 // poll backlog hasn't reached them yet.
 //
-// This is the HIGHEST-priority of the three poll loops (see Run's doc
+// This is the HIGHEST-priority of the four poll loops (see Run's doc
 // comment and Collector.NeverContactedTickInterval's shorter default
 // tick): a brand-new, zero-history node getting its very first probe
 // attempt as soon as possible after discovery is what actually grows
 // the confirmed population, per Alex's explicit "walk the network more
-// aggressively" request. It runs entirely independently of both
-// PollConfirmed and PollUnconfirmed — a large backlog in either of the
-// other two must never delay a never-contacted node's first probe.
+// aggressively" request. It runs entirely independently of
+// PollOwnedConfirmed, PollGenericConfirmed, and PollUnconfirmed — a
+// large backlog in any of the other three must never delay a
+// never-contacted node's first probe.
 //
 // A node moves OFF this queue and onto PollUnconfirmed (or, if the
 // first probe happens to succeed and yield a pubkey, straight to
-// PollConfirmed) the instant its first health-check row is written —
-// this is a pure query-time distinction (see
-// storage.NodeFilter.HasHealthChecks), not a separate stored flag/state
-// machine that needs its own bookkeeping, exactly mirroring how the
-// confirmed/unconfirmed split itself works.
+// PollOwnedConfirmed or PollGenericConfirmed) the instant its first
+// health-check row is written — this is a pure query-time distinction
+// (see storage.NodeFilter.HasHealthChecks), not a separate stored
+// flag/state machine that needs its own bookkeeping, exactly mirroring
+// how the confirmed/unconfirmed split itself works.
 func (c *Collector) PollNeverContacted(ctx context.Context) error {
 	confirmed := false
 	hasHistory := false
 	return c.poll(ctx, storage.NodeFilter{Confirmed: &confirmed, HasHealthChecks: &hasHistory})
 }
 
-// QueueSizes returns the current size of each of the three disjoint poll queues
-// PollConfirmed/PollUnconfirmed/PollNeverContacted operate over (see their doc comments), for
-// gauge-style observability (see cmd/netmap's Prometheus metrics wiring, which exposes these as
-// netmap_<network>_collector_queue_backlog{queue="confirmed"|"unconfirmed"|"never_contacted"}).
-// This performs three ListNodes calls, one per filter -- exactly mirroring what
-// PollConfirmed/PollUnconfirmed/PollNeverContacted already query, with no new SQL query logic
-// of its own. The three results are a true partition of the whole node population: every node
-// belongs to exactly one of the three (see PollNeverContacted's doc comment), so
-// confirmed+unconfirmed+neverContacted always equals the total node count.
-func (c *Collector) QueueSizes(ctx context.Context) (confirmed, unconfirmed, neverContacted int, err error) {
+// QueueSizes returns the current size of each of the four disjoint poll queues
+// PollOwnedConfirmed/PollGenericConfirmed/PollUnconfirmed/PollNeverContacted operate over (see
+// their doc comments), for gauge-style observability (see cmd/netmap's Prometheus metrics
+// wiring, which exposes these as
+// netmap_<network>_collector_queue_backlog{queue="confirmed_owned"|"confirmed_generic"|"unconfirmed"|"never_contacted"}).
+// This performs four ListNodes calls, one per filter -- exactly mirroring what
+// PollOwnedConfirmed/PollGenericConfirmed/PollUnconfirmed/PollNeverContacted already query, with
+// no new SQL query logic of its own. The four results are a true partition of the whole node
+// population: every node belongs to exactly one of the four (see PollOwnedConfirmed's and
+// PollNeverContacted's doc comments), so
+// ownedConfirmed+genericConfirmed+unconfirmed+neverContacted always equals the total node count.
+func (c *Collector) QueueSizes(ctx context.Context) (ownedConfirmed, genericConfirmed, unconfirmed, neverContacted int, err error) {
 	if c.Storage == nil {
-		return 0, 0, 0, errors.New("collector: Storage is not configured")
+		return 0, 0, 0, 0, errors.New("collector: Storage is not configured")
 	}
 
 	isConfirmed := true
-	confirmedNodes, err := c.Storage.ListNodes(ctx, storage.NodeFilter{Confirmed: &isConfirmed})
+	isOwned := true
+	ownedConfirmedNodes, err := c.Storage.ListNodes(ctx, storage.NodeFilter{Confirmed: &isConfirmed, Owned: &isOwned})
 	if err != nil {
-		return 0, 0, 0, fmt.Errorf("collector: list confirmed nodes: %w", err)
+		return 0, 0, 0, 0, fmt.Errorf("collector: list owned-confirmed nodes: %w", err)
+	}
+
+	isNotOwned := false
+	genericConfirmedNodes, err := c.Storage.ListNodes(ctx, storage.NodeFilter{Confirmed: &isConfirmed, Owned: &isNotOwned})
+	if err != nil {
+		return 0, 0, 0, 0, fmt.Errorf("collector: list generic-confirmed nodes: %w", err)
 	}
 
 	isUnconfirmed := false
 	hasHistory := true
 	unconfirmedNodes, err := c.Storage.ListNodes(ctx, storage.NodeFilter{Confirmed: &isUnconfirmed, HasHealthChecks: &hasHistory})
 	if err != nil {
-		return 0, 0, 0, fmt.Errorf("collector: list unconfirmed nodes: %w", err)
+		return 0, 0, 0, 0, fmt.Errorf("collector: list unconfirmed nodes: %w", err)
 	}
 
 	noHistory := false
 	neverContactedNodes, err := c.Storage.ListNodes(ctx, storage.NodeFilter{Confirmed: &isUnconfirmed, HasHealthChecks: &noHistory})
 	if err != nil {
-		return 0, 0, 0, fmt.Errorf("collector: list never-contacted nodes: %w", err)
+		return 0, 0, 0, 0, fmt.Errorf("collector: list never-contacted nodes: %w", err)
 	}
 
-	return len(confirmedNodes), len(unconfirmedNodes), len(neverContactedNodes), nil
+	return len(ownedConfirmedNodes), len(genericConfirmedNodes), len(unconfirmedNodes), len(neverContactedNodes), nil
 }
 
 // poll checks all nodes matching filter and, for those whose next-poll
 // time is due, dials each configured transport for that node. Shared by
-// PollConfirmed, PollUnconfirmed, and PollNeverContacted — all three
-// call the same due/setNextPoll/dispatch/jitter logic, just over a
-// filtered node set each; per-node poll-interval selection
+// PollOwnedConfirmed, PollGenericConfirmed, PollUnconfirmed, and
+// PollNeverContacted — all four call the same due/setNextPoll/dispatch/jitter logic, just over
+// a filtered node set each; per-node poll-interval selection
 // (pollInterval) is completely unaffected by this split, since it
 // already branches on n.PublicKey (and, for the never-contacted case,
 // on empty history) itself.
@@ -1758,7 +1895,7 @@ func (c *Collector) dueForDiscovery(key string, now time.Time) bool {
 // setNextDiscovery records the next discovery-walk due time for the given
 // discoveryCooldownKey, mirroring setNextPoll. It is guarded by the same
 // c.mu as nextPoll — both maps belong to the same Collector and none of
-// Discover, PollConfirmed, or PollUnconfirmed need to hold the lock for
+// Discover, PollOwnedConfirmed, PollGenericConfirmed, or PollUnconfirmed need to hold the lock for
 // long, so a second mutex would add no real benefit.
 func (c *Collector) setNextDiscovery(key string, t time.Time) {
 	c.mu.Lock()

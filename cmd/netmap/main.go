@@ -146,7 +146,7 @@ func main() {
 	c := collector.New(collector.Config{
 		SeedNodes: parseSeedNodes(os.Getenv("NETMAP_SEED_NODES")),
 		// 500ms between per-node dials within a single Discover/
-		// PollConfirmed/PollUnconfirmed pass, so we don't hammer many
+		// PollOwnedConfirmed/PollGenericConfirmed/PollUnconfirmed pass, so we don't hammer many
 		// different nodes in rapid succession even though the overall
 		// pass frequency is polite.
 		// The collector package itself defaults DialJitter to zero (no
@@ -167,8 +167,8 @@ func main() {
 	// zero candidate nodes means zero outbound requests, not even a
 	// Storage query beyond the initial ListNodes).
 	c.GeoIPClient = geoip.NewClient()
-	// OnPollResult feeds this process' own scheduled poll loops (PollConfirmed/
-	// PollUnconfirmed/PollNeverContacted) into netmap_<network>_collector_poll_result_total
+	// OnPollResult feeds this process' own scheduled poll loops (PollOwnedConfirmed/
+	// PollGenericConfirmed/PollUnconfirmed/PollNeverContacted) into netmap_<network>_collector_poll_result_total
 	// (see metrics.go's netmapMetrics.onPollResult/PollResultFunc) -- deliberately NOT wired
 	// into api.NewRouter's own grpcClient/p2pClient below, since its ad hoc admin-triggered
 	// probes (poll-now, submission approval) are a different, unrelated activity that must
