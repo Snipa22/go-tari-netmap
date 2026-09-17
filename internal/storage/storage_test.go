@@ -2082,6 +2082,76 @@ func TestUpsertConfirmedNodeMergesPlaceholderIntoConfirmedNode(t *testing.T) {
 	}
 }
 
+// TestUpsertConfirmedNodeMergeRepointsPendingSubmissionPromotedNodeID is a
+// regression test for the FK violation seen in production
+// (pending_submissions_promoted_node_id_fkey, SQLSTATE 23503): when the
+// placeholder being merged away (case (d) of UpsertConfirmedNode) is
+// itself the promoted_node_id of an approved pending_submissions row,
+// mergeNodeInto must repoint that row onto the surviving confirmed node
+// before deleting the placeholder's nodes row -- otherwise the final
+// DELETE FROM nodes hits the FK's default ON DELETE RESTRICT and the
+// whole UpsertConfirmedNode transaction rolls back.
+func TestUpsertConfirmedNodeMergeRepointsPendingSubmissionPromotedNodeID(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	// Placeholder node (no pubkey yet) at addrB:1, promoted from an
+	// approved pending_submissions row -- mirrors how the real
+	// registry-submission review flow ends up with promoted_node_id
+	// pointing at a still-unconfirmed placeholder.
+	placeholder, err := store.UpsertDiscoveredNode(ctx, "addrB:1", DiscoverySourceRegistry, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert discovered placeholder: %v", err)
+	}
+	ps, err := store.CreatePendingSubmission(ctx, "addrB:1", nil, nil)
+	if err != nil {
+		t.Fatalf("create pending submission: %v", err)
+	}
+	if err := store.ApprovePendingSubmission(ctx, ps.ID, placeholder.ID); err != nil {
+		t.Fatalf("approve pending submission: %v", err)
+	}
+
+	pubkeyX := []byte("shared-pubkey-y")
+
+	// A second, already-confirmed node with a real pubkey at a
+	// different address.
+	confirmed, err := store.UpsertConfirmedNode(ctx, "addrA:1", pubkeyX, DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("upsert confirmed: %v", err)
+	}
+
+	// Confirm the placeholder's address under the SAME pubkey: this
+	// triggers case (d), merging the placeholder into confirmed and
+	// deleting the placeholder's nodes row. Before the fix, this
+	// returned an error (FK violation) instead of nil.
+	merged, err := store.UpsertConfirmedNode(ctx, "addrB:1", pubkeyX, DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("upsert confirmed at placeholder address (merge): %v", err)
+	}
+	if merged.ID != confirmed.ID {
+		t.Fatalf("merged.ID = %v, want confirmed.ID = %v (confirmed survives the merge)", merged.ID, confirmed.ID)
+	}
+
+	// The placeholder's nodes row must be gone.
+	if _, err := store.GetNode(ctx, placeholder.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetNode(placeholder.ID) err = %v, want ErrNotFound (placeholder should have been deleted)", err)
+	}
+
+	// The pending_submissions row's promoted_node_id must now point at
+	// the surviving confirmed node, not the deleted placeholder, and
+	// must not be left dangling or null.
+	gotPS, err := store.GetPendingSubmission(ctx, ps.ID)
+	if err != nil {
+		t.Fatalf("get pending submission: %v", err)
+	}
+	if gotPS.PromotedNodeID == nil {
+		t.Fatalf("promoted_node_id = nil, want %v", confirmed.ID)
+	}
+	if *gotPS.PromotedNodeID != confirmed.ID {
+		t.Fatalf("promoted_node_id = %v, want %v (repointed onto surviving node)", *gotPS.PromotedNodeID, confirmed.ID)
+	}
+}
+
 // TestUpsertConfirmedNodeByPubKeyCreatesNodeWithNoAddress is
 // UpsertConfirmedNodeByPubKey's brand-new-pubkey case (BRIEF6.md): it must
 // create a confirmed node row with the given pubkey, address = "" (never a
