@@ -53,17 +53,19 @@ var MaxPendingSubmissions = 100
 // configures the HTTP Basic Auth gate in front of every /admin/* route
 // (the submission review queue and the poll-now admin tool) — see
 // internal/adminauth.Wrap's doc comment for the fail-closed-503 behavior
-// when adminCreds isn't fully configured. collectorKeys configures the
+// when adminCreds isn't fully configured. collectors configures the
 // X-Collector-Key gate in front of the single /internal/collectors/report
 // route (the trusted remote-collector-satellite ingestion channel, see
-// collector_report.go) — a map of collector_name -> api_key, sourced from
-// NETMAP_COLLECTOR_KEYS in cmd/netmap/main.go; see wrapCollectorAuth's doc
-// comment for the fail-closed-503 behavior when it's empty/unconfigured,
-// mirroring adminCreds' own fail-closed convention. statsCacheTTL
+// collector_report.go) — a map of collector_name -> CollectorConfig (see
+// its own doc comment for the API-key + self_identity-allowlist shape),
+// sourced from NETMAP_COLLECTOR_KEYS/NETMAP_COLLECTOR_SELF_ADDRESSES in
+// cmd/netmap/main.go; see wrapCollectorAuth's doc comment for the
+// fail-closed-503 behavior when it's empty/unconfigured, mirroring
+// adminCreds' own fail-closed convention. statsCacheTTL
 // configures GET /v1/stats' in-process response cache (see stats.go's
 // statsCache/handleStats/DefaultStatsCacheTTL) — callers that don't care
 // can pass DefaultStatsCacheTTL.
-func NewRouter(store storage.Store, grpcClient, p2pClient collector.NodeClient, adminCreds adminauth.Credentials, collectorKeys map[string]string, statsCacheTTL time.Duration) http.Handler {
+func NewRouter(store storage.Store, grpcClient, p2pClient collector.NodeClient, adminCreds adminauth.Credentials, collectors map[string]CollectorConfig, statsCacheTTL time.Duration) http.Handler {
 	mux := http.NewServeMux()
 
 	// Created once and shared across every POST /nodes call (NewRouter
@@ -154,7 +156,7 @@ func NewRouter(store storage.Store, grpcClient, p2pClient collector.NodeClient, 
 	// area at all.
 	collectorMux := http.NewServeMux()
 	collectorMux.HandleFunc("POST /internal/collectors/report", handleCollectorReport(store))
-	mux.Handle("/internal/", wrapCollectorAuth(collectorKeys, collectorMux))
+	mux.Handle("/internal/", wrapCollectorAuth(collectors, collectorMux))
 
 	return mux
 }
@@ -981,7 +983,7 @@ func handleTopPeeredNodes(store storage.Store) http.HandlerFunc {
 				writeError(w, http.StatusInternalServerError, err)
 				return
 			}
-			if isCollectorRole(n.Tags) {
+			if IsCollectorRole(n.Tags) {
 				continue
 			}
 

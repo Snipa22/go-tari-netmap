@@ -303,6 +303,43 @@ type HealthCheckInput struct {
 	// PeerIdentityUpdatedAt mirrors HealthCheck.PeerIdentityUpdatedAt —
 	// see its doc comment above.
 	PeerIdentityUpdatedAt *time.Time
+
+	// ReportedByCollector, if non-nil/non-empty, records which trusted remote collector
+	// satellite (see internal/api/collector_auth.go's X-Collector-Key convention) reported
+	// this health check via POST /internal/collectors/report — see
+	// 0011_reported_by_collector.sql and internal/api/collector_report.go's
+	// applyCollectorReport, the only real caller that ever sets this. Every other caller
+	// (the local collector's own direct probes, cmd/netmap-p2p-responder's onPeerIdentity)
+	// leaves this nil, recorded as NULL — "reported by a remote collector satellite" is
+	// opt-in metadata, not a general-purpose attribution field. This is write-only: it is
+	// deliberately NOT surfaced on HealthCheck (the read-side type) at all, so it never
+	// leaks into a public API response (GET /nodes/{id}/history) — see this repo's
+	// readiness-review follow-up, Fix 4, for why "queryable directly against node_health
+	// for incident response" is sufficient without adding this to every public read path.
+	ReportedByCollector *string
+
+	// ReportBatchID, if non-nil, is a deterministic idempotency key (see
+	// 0012_report_batch_idempotency.sql/internal/remotestore/flush.go's reportBatchID) that
+	// lets RecordHealthCheck recognize and skip a byte-identical retry of the same collector
+	// report batch, rather than inserting a duplicate row — see this repo's readiness-review
+	// follow-up, Fix 3. Nil for every caller except applyCollectorReport.
+	ReportBatchID *uuid.UUID
+}
+
+// PeerEdgeReportMeta is RecordPeerEdgeObservation's optional per-call metadata parameter --
+// see that method's own doc comment on the Store interface for why it's a variadic struct
+// rather than two new required parameters. Mirrors HealthCheckInput.ReportedByCollector/
+// ReportBatchID's roles exactly, just for peer_edge_observations instead of node_health.
+type PeerEdgeReportMeta struct {
+	// ReportedByCollector, if non-empty, records which trusted remote collector satellite
+	// reported this edge -- see HealthCheckInput.ReportedByCollector's doc comment (Fix 4).
+	ReportedByCollector string
+
+	// ReportBatchID, if non-nil, is this batch's idempotency key -- see
+	// HealthCheckInput.ReportBatchID's doc comment (Fix 3). Unlike node_health,
+	// peer_edge_observations enforces this via a real partial UNIQUE index (see
+	// 0012_report_batch_idempotency.sql) since it isn't a TimescaleDB hypertable candidate.
+	ReportBatchID *uuid.UUID
 }
 
 // PendingSubmission is one row of the public node-submission review
