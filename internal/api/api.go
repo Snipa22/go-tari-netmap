@@ -53,11 +53,17 @@ var MaxPendingSubmissions = 100
 // configures the HTTP Basic Auth gate in front of every /admin/* route
 // (the submission review queue and the poll-now admin tool) — see
 // internal/adminauth.Wrap's doc comment for the fail-closed-503 behavior
-// when adminCreds isn't fully configured. statsCacheTTL configures GET
-// /v1/stats' in-process response cache (see stats.go's statsCache/
-// handleStats/DefaultStatsCacheTTL) — callers that don't care can pass
-// DefaultStatsCacheTTL.
-func NewRouter(store storage.Store, grpcClient, p2pClient collector.NodeClient, adminCreds adminauth.Credentials, statsCacheTTL time.Duration) http.Handler {
+// when adminCreds isn't fully configured. collectorKeys configures the
+// X-Collector-Key gate in front of the single /internal/collectors/report
+// route (the trusted remote-collector-satellite ingestion channel, see
+// collector_report.go) — a map of collector_name -> api_key, sourced from
+// NETMAP_COLLECTOR_KEYS in cmd/netmap/main.go; see wrapCollectorAuth's doc
+// comment for the fail-closed-503 behavior when it's empty/unconfigured,
+// mirroring adminCreds' own fail-closed convention. statsCacheTTL
+// configures GET /v1/stats' in-process response cache (see stats.go's
+// statsCache/handleStats/DefaultStatsCacheTTL) — callers that don't care
+// can pass DefaultStatsCacheTTL.
+func NewRouter(store storage.Store, grpcClient, p2pClient collector.NodeClient, adminCreds adminauth.Credentials, collectorKeys map[string]string, statsCacheTTL time.Duration) http.Handler {
 	mux := http.NewServeMux()
 
 	// Created once and shared across every POST /nodes call (NewRouter
@@ -102,9 +108,25 @@ func NewRouter(store storage.Store, grpcClient, p2pClient collector.NodeClient, 
 	// health-verified nodes, so — unlike every other node-returning
 	// route in this file — they are NOT run through ScrubNode/PublicNode
 	// (see handleListSeedCandidates' doc comment for why real addresses
-	// are the entire point here).
+	// are the entire point here). Both are additionally filtered to
+	// exclude role=collector-tagged nodes (see collectorrole.go) — a
+	// remote collector satellite's own advertised identity must never be
+	// recommended as a peer to connect to.
+	//
+	// GET /nodes/seed_list and GET /nodes/seed_list_tari are plain
+	// aliases of GET /nodes/seeds and GET /config/peer-seeds
+	// respectively, under the route name remote collector satellites
+	// poll every ~60s to refresh their own local peer cache (see
+	// internal/remotestore) — same handler, same underlying query, same
+	// collector-role filtering, just a second route name. There is
+	// deliberately no separate response shape or query logic for these:
+	// the population a satellite should draw its peer cache from is
+	// exactly the same "opted-in and recently reachable" set every
+	// other seed-node consumer already gets.
 	mux.HandleFunc("GET /nodes/seeds", handleListSeedCandidates(store))
+	mux.HandleFunc("GET /nodes/seed_list", handleListSeedCandidates(store))
 	mux.HandleFunc("GET /config/peer-seeds", handleConfigPeerSeeds(store))
+	mux.HandleFunc("GET /nodes/seed_list_tari", handleConfigPeerSeeds(store))
 
 	// Every /admin/* route — the submission review queue (list/approve/
 	// reject) and the poll-now admin tool — is registered on its own
@@ -122,6 +144,17 @@ func NewRouter(store storage.Store, grpcClient, p2pClient collector.NodeClient, 
 	adminMux.HandleFunc("POST /admin/submissions/{id}/reject", handleRejectSubmission(store))
 	adminMux.HandleFunc("POST /admin/nodes/poll-now", handlePollNow(store, grpcClient, p2pClient))
 	mux.Handle("/admin/", adminauth.Wrap(adminCreds, adminMux))
+
+	// The trusted remote-collector-satellite ingestion channel (see
+	// collector_report.go/collector_auth.go) — a single route, gated by
+	// wrapCollectorAuth as its own protected sub-mux, mirroring the
+	// adminMux pattern above but with a distinct, simpler trust model
+	// (a per-collector API key via X-Collector-Key, not HTTP Basic
+	// Auth) — separate from /admin/* since this isn't a human-operated
+	// area at all.
+	collectorMux := http.NewServeMux()
+	collectorMux.HandleFunc("POST /internal/collectors/report", handleCollectorReport(store))
+	mux.Handle("/internal/", wrapCollectorAuth(collectorKeys, collectorMux))
 
 	return mux
 }
@@ -869,6 +902,24 @@ func handleTopology(store storage.Store) http.HandlerFunc {
 			return
 		}
 
+		// Exclude role=collector-tagged nodes (see collectorrole.go) — a remote collector
+		// satellite's own advertised identity must never be recommended as a peer to
+		// connect to via the topology graph. Edges are filtered alongside so the response
+		// never dangles a reference to an excluded node, preserving ListTopology's own
+		// "every edge's endpoints are both present in the returned node list" invariant.
+		nodes = filterOutCollectorNodes(nodes)
+		keptNodeIDs := make(map[uuid.UUID]bool, len(nodes))
+		for _, n := range nodes {
+			keptNodeIDs[n.ID] = true
+		}
+		filteredEdges := make([]storage.PeerEdge, 0, len(edges))
+		for _, e := range edges {
+			if keptNodeIDs[e.FromNodeID] && keptNodeIDs[e.ToNodeID] {
+				filteredEdges = append(filteredEdges, e)
+			}
+		}
+		edges = filteredEdges
+
 		nodeIDs := make([]uuid.UUID, len(nodes))
 		for i, n := range nodes {
 			nodeIDs[i] = n.ID
@@ -917,14 +968,29 @@ func handleTopPeeredNodes(store storage.Store) http.HandlerFunc {
 			return
 		}
 
-		public := make([]PublicNodeDegree, len(degrees))
-		for i, d := range degrees {
+		public := make([]PublicNodeDegree, 0, len(degrees))
+		for _, d := range degrees {
+			// Exclude role=collector-tagged nodes (see collectorrole.go) — a remote
+			// collector satellite's own advertised identity must never be recommended
+			// as a peer to connect to. This costs one extra GetNode lookup per result
+			// beyond what ScrubNodeDegree already does (see its own doc comment on the
+			// existing, accepted N+1 pattern here — TopPeeredNodes results are capped at
+			// limit).
+			n, err := store.GetNode(r.Context(), d.NodeID)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+			if isCollectorRole(n.Tags) {
+				continue
+			}
+
 			pd, err := ScrubNodeDegree(r.Context(), store, d)
 			if err != nil {
 				writeError(w, http.StatusInternalServerError, err)
 				return
 			}
-			public[i] = pd
+			public = append(public, pd)
 		}
 		writeJSON(w, http.StatusOK, public)
 	}
@@ -995,6 +1061,10 @@ func handleListSeedCandidates(store storage.Store) http.HandlerFunc {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		// Exclude role=collector-tagged candidates (see collectorrole.go) — a remote
+		// collector satellite's own advertised identity must never be recommended as a
+		// seed peer, even if it happens to also be opted-in/recently-reachable.
+		candidates = filterOutCollectorSeedCandidates(candidates)
 
 		public := make([]PublicSeedCandidate, len(candidates))
 		for i, c := range candidates {
@@ -1080,6 +1150,9 @@ func handleConfigPeerSeeds(store storage.Store) http.HandlerFunc {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		// Exclude role=collector-tagged candidates (see collectorrole.go), same as
+		// handleListSeedCandidates above.
+		candidates = filterOutCollectorSeedCandidates(candidates)
 
 		body := renderPeerSeedsTOML(candidates, network)
 

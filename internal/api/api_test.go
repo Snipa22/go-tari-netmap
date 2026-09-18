@@ -143,6 +143,22 @@ const (
 	testAdminPassword = "admin-test-password"
 )
 
+// testCollectorName/testCollectorAPIKey are the fixed trusted-collector
+// identity/key newTestServer builds api.NewRouter with (see
+// testCollectorKeys below) — used by every test exercising POST
+// /internal/collectors/report with a valid key.
+const (
+	testCollectorName   = "test-collector"
+	testCollectorAPIKey = "collector-test-api-key"
+)
+
+// testCollectorKeys returns the fixed collector_name -> api_key map every
+// newTestServer/newTestServerWithCreds/newTestServerWithStatsCacheTTL-built test server is
+// configured with, mirroring testAdminUser/testAdminPassword's role for adminauth.Credentials.
+func testCollectorKeys() map[string]string {
+	return map[string]string{testCollectorName: testCollectorAPIKey}
+}
+
 func newTestServer(t *testing.T, client collector.NodeClient) (*httptest.Server, storage.Store) {
 	t.Helper()
 	return newTestServerWithCreds(t, client, adminauth.Credentials{Username: testAdminUser, Password: testAdminPassword})
@@ -167,7 +183,7 @@ func newTestServerWithCreds(t *testing.T, client collector.NodeClient, creds adm
 	// p2pClient is nil here: these tests only exercise the gRPC-labeled
 	// async health-check kickoff path; dual-probe behavior is covered by
 	// internal/collector's own tests.
-	srv := httptest.NewServer(api.NewRouter(store, client, nil, creds, api.DefaultStatsCacheTTL))
+	srv := httptest.NewServer(api.NewRouter(store, client, nil, creds, testCollectorKeys(), api.DefaultStatsCacheTTL))
 	t.Cleanup(srv.Close)
 	return srv, store
 }
@@ -2976,7 +2992,7 @@ func (c *countingStatsStore) NetworkHeight(ctx context.Context) (*int64, int, er
 // specifically exercise the cache's own timing behavior.
 func newTestServerWithStatsCacheTTL(t *testing.T, store storage.Store, ttl time.Duration) *httptest.Server {
 	t.Helper()
-	srv := httptest.NewServer(api.NewRouter(store, collector.NewStubClient(), nil, adminauth.Credentials{Username: testAdminUser, Password: testAdminPassword}, ttl))
+	srv := httptest.NewServer(api.NewRouter(store, collector.NewStubClient(), nil, adminauth.Credentials{Username: testAdminUser, Password: testAdminPassword}, testCollectorKeys(), ttl))
 	t.Cleanup(srv.Close)
 	return srv
 }
