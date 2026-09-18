@@ -2411,6 +2411,127 @@ func TestUpsertConfirmedNodeMergeRepointsPendingSubmissionPromotedNodeID(t *test
 	}
 }
 
+// TestUpsertConfirmedNodeMergeDedupesReportBatchIDCollision is a regression
+// test for the live production bug documented in
+// mergenode-idempotency-bug-brief.md: 0012_report_batch_idempotency.sql's
+// idx_peer_edge_observations_report_batch_id (a UNIQUE index on
+// (from_node_id, to_node_id, report_batch_id) WHERE report_batch_id IS NOT
+// NULL) can collide with mergeNodeInto's placeholder->confirmed repoint of
+// peer_edge_observations when both the placeholder and the confirmed node
+// already have a row for the same counterpart node under the SAME
+// report_batch_id -- repointing the placeholder's row would then produce an
+// exact duplicate of the confirmed node's existing row.
+//
+// This exercises BOTH directions mergeNodeInto repoints
+// (peer_edge_observations.to_node_id -- the exact direction that 500'd in
+// production per the brief's log excerpt -- and .from_node_id, for
+// symmetry) in a single merge:
+//
+//   - other1 -> placeholder and other1 -> confirmed, same batchID: repointing
+//     the first row's to_node_id from placeholder to confirmed would collide
+//     with the second row.
+//   - placeholder -> other2 and confirmed -> other2, same batchID: repointing
+//     the first row's from_node_id from placeholder to confirmed would
+//     collide with the second row.
+//
+// Before the fix, either collision makes the repoint UPDATE fail with
+// SQLSTATE 23505, which UpsertConfirmedNode surfaces as an error (and, in
+// production via applyCollectorReport, as an HTTP 500 that the satellite's
+// remotestore retries forever with the same batch -- see the brief for the
+// full loop). The fix must drop the now-redundant placeholder-side row
+// instead of erroring, keeping exactly one surviving row per collision and
+// losing no distinct information.
+func TestUpsertConfirmedNodeMergeDedupesReportBatchIDCollision(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	other1, err := store.UpsertDiscoveredNode(ctx, "merge:collision:other1", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert discovered other1: %v", err)
+	}
+	other2, err := store.UpsertDiscoveredNode(ctx, "merge:collision:other2", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert discovered other2: %v", err)
+	}
+	placeholder, err := store.UpsertDiscoveredNode(ctx, "merge:collision:placeholder", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert discovered placeholder: %v", err)
+	}
+
+	pubkeyZ := []byte("shared-pubkey-collision-z")
+	confirmed, err := store.UpsertConfirmedNode(ctx, "merge:collision:confirmed", pubkeyZ, DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("upsert confirmed: %v", err)
+	}
+
+	batchID := uuid.New()
+	meta := PeerEdgeReportMeta{ReportBatchID: &batchID}
+
+	// to_node_id collision setup: other1 -> placeholder and other1 ->
+	// confirmed, same report_batch_id.
+	if err := store.RecordPeerEdgeObservation(ctx, other1.ID, placeholder.ID, meta); err != nil {
+		t.Fatalf("record edge other1->placeholder: %v", err)
+	}
+	if err := store.RecordPeerEdgeObservation(ctx, other1.ID, confirmed.ID, meta); err != nil {
+		t.Fatalf("record edge other1->confirmed: %v", err)
+	}
+
+	// from_node_id collision setup: placeholder -> other2 and confirmed ->
+	// other2, same report_batch_id.
+	if err := store.RecordPeerEdgeObservation(ctx, placeholder.ID, other2.ID, meta); err != nil {
+		t.Fatalf("record edge placeholder->other2: %v", err)
+	}
+	if err := store.RecordPeerEdgeObservation(ctx, confirmed.ID, other2.ID, meta); err != nil {
+		t.Fatalf("record edge confirmed->other2: %v", err)
+	}
+
+	// Confirming placeholder's address under confirmed's pubkey triggers
+	// case (d): merge placeholder into confirmed. Before the fix, this
+	// returned an error (SQLSTATE 23505 from the repoint UPDATE) instead of
+	// nil.
+	merged, err := store.UpsertConfirmedNode(ctx, "merge:collision:placeholder", pubkeyZ, DiscoverySourceP2P)
+	if err != nil {
+		t.Fatalf("upsert confirmed at placeholder address (merge): %v", err)
+	}
+	if merged.ID != confirmed.ID {
+		t.Fatalf("merged.ID = %v, want confirmed.ID = %v (confirmed survives the merge)", merged.ID, confirmed.ID)
+	}
+
+	countRows := func(from, to uuid.UUID) int {
+		t.Helper()
+		var count int
+		if err := store.(*pgStore).pool.QueryRow(ctx, `
+			SELECT count(*) FROM peer_edge_observations
+			WHERE from_node_id = $1 AND to_node_id = $2 AND report_batch_id = $3
+		`, from, to, batchID).Scan(&count); err != nil {
+			t.Fatalf("count peer_edge_observations: %v", err)
+		}
+		return count
+	}
+
+	// Exactly one row must survive for each collision -- the redundant
+	// repointed duplicate must have been dropped, not both kept (which
+	// would violate the unique index) and not both dropped (which would
+	// lose the observation entirely).
+	if got := countRows(other1.ID, confirmed.ID); got != 1 {
+		t.Fatalf("peer_edge_observations(other1->confirmed) count = %d, want 1 (to_node_id collision must dedupe to one surviving row)", got)
+	}
+	if got := countRows(confirmed.ID, other2.ID); got != 1 {
+		t.Fatalf("peer_edge_observations(confirmed->other2) count = %d, want 1 (from_node_id collision must dedupe to one surviving row)", got)
+	}
+
+	// No row should still reference the deleted placeholder.
+	var placeholderCount int
+	if err := store.(*pgStore).pool.QueryRow(ctx, `
+		SELECT count(*) FROM peer_edge_observations WHERE from_node_id = $1 OR to_node_id = $1
+	`, placeholder.ID).Scan(&placeholderCount); err != nil {
+		t.Fatalf("count placeholder-referencing rows: %v", err)
+	}
+	if placeholderCount != 0 {
+		t.Fatalf("placeholder-referencing peer_edge_observations count = %d, want 0 (placeholder must be fully repointed/deduped away)", placeholderCount)
+	}
+}
+
 // TestUpsertConfirmedNodeByPubKeyCreatesNodeWithNoAddress is
 // UpsertConfirmedNodeByPubKey's brand-new-pubkey case (BRIEF6.md): it must
 // create a confirmed node row with the given pubkey, address = "" (never a
