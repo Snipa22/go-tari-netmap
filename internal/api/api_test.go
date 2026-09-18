@@ -152,11 +152,21 @@ const (
 	testCollectorAPIKey = "collector-test-api-key"
 )
 
-// testCollectorKeys returns the fixed collector_name -> api_key map every
+// testCollectorSelfAddresses are the self_identity address(es) testCollectorKeys' entry for
+// testCollectorName allows -- must cover every literal self_identity address any test in this
+// package (or collector_report_test.go, same api_test package) actually sends, or Fix 6(c)'s
+// self-address allowlist enforcement will make self_identity tagging assertions fail. See
+// collector_report_test.go's TestCollectorReportAppliesBatch for the current sole real user of
+// this.
+var testCollectorSelfAddresses = []string{"203.0.113.9:18189"}
+
+// testCollectorKeys returns the fixed collector_name -> CollectorConfig map every
 // newTestServer/newTestServerWithCreds/newTestServerWithStatsCacheTTL-built test server is
 // configured with, mirroring testAdminUser/testAdminPassword's role for adminauth.Credentials.
-func testCollectorKeys() map[string]string {
-	return map[string]string{testCollectorName: testCollectorAPIKey}
+func testCollectorKeys() map[string]api.CollectorConfig {
+	return map[string]api.CollectorConfig{
+		testCollectorName: {APIKey: testCollectorAPIKey, SelfAddresses: testCollectorSelfAddresses},
+	}
 }
 
 func newTestServer(t *testing.T, client collector.NodeClient) (*httptest.Server, storage.Store) {

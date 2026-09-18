@@ -102,11 +102,11 @@ func TestEndToEndReportFlowAgainstRealCentralAPI(t *testing.T) {
 	ctx := context.Background()
 
 	const collectorKey = "sat1-test-key"
-	srv := httptest.NewServer(api.NewRouter(central, nil, nil, adminauth.Credentials{}, map[string]string{"sat1": collectorKey}, api.DefaultStatsCacheTTL))
+	const selfAddr = "203.0.113.200:18189"
+	srv := httptest.NewServer(api.NewRouter(central, nil, nil, adminauth.Credentials{}, map[string]api.CollectorConfig{"sat1": {APIKey: collectorKey, SelfAddresses: []string{selfAddr}}}, api.DefaultStatsCacheTTL))
 	defer srv.Close()
 
 	const (
-		selfAddr       = "203.0.113.200:18189"
 		confirmedAddr  = "198.51.100.200:18189"
 		discoveredAddr = "198.51.100.201:18189"
 	)
@@ -198,7 +198,7 @@ func TestEndToEndSeedListCacheAgainstRealCentralAPI(t *testing.T) {
 	central := newTestCentralStore(t)
 	ctx := context.Background()
 
-	srv := httptest.NewServer(api.NewRouter(central, nil, nil, adminauth.Credentials{}, map[string]string{"sat1": "unused"}, api.DefaultStatsCacheTTL))
+	srv := httptest.NewServer(api.NewRouter(central, nil, nil, adminauth.Credentials{}, map[string]api.CollectorConfig{"sat1": {APIKey: "unused"}}, api.DefaultStatsCacheTTL))
 	defer srv.Close()
 
 	const seedAddr = "192.0.2.77:18189"

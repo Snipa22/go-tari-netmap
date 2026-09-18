@@ -199,7 +199,15 @@ func (s *Store) RecordHealthCheck(ctx context.Context, in storage.HealthCheckInp
 // RecordPeerEdgeObservation implements storage.Store, resolving both fromNodeID/toNodeID back
 // to addresses (see RecordHealthCheck's doc comment for why an unresolvable ID is an error,
 // not a silent no-op) and buffering a peer_edges entry for the next flush.
-func (s *Store) RecordPeerEdgeObservation(ctx context.Context, fromNodeID, toNodeID uuid.UUID) error {
+//
+// meta (see storage.Store's own doc comment on this parameter) is always ignored here: this
+// Store's own local RecordPeerEdgeObservation calls are exactly the raw discovery-walk
+// observations this satellite is buffering up TO report -- the central API is what stamps
+// reported_by_collector/report_batch_id, once, when it actually applies the flushed batch (see
+// internal/api/collector_report.go's applyCollectorReport), never this client-side buffering
+// step. Accepting (and ignoring) the variadic parameter here purely satisfies the
+// storage.Store interface.
+func (s *Store) RecordPeerEdgeObservation(ctx context.Context, fromNodeID, toNodeID uuid.UUID, meta ...storage.PeerEdgeReportMeta) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
