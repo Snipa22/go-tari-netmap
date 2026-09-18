@@ -195,6 +195,43 @@ func TestOnSubstreamProtocolDeclinedIncrementsMetric(t *testing.T) {
 	}
 }
 
+// TestOnReportFlushResultIncrementsMetric exercises the report-flush counter (see this
+// repo's readiness-review follow-up, Fix 2) -- wired as remotestore.Config.OnFlushResult's
+// counter-only half in main.go.
+func TestOnReportFlushResultIncrementsMetric(t *testing.T) {
+	m := mustTestResponderMetrics(t)
+	beforeSuccess := testutil.ToFloat64(m.reportFlushResult.WithLabelValues("success"))
+	beforeFailure := testutil.ToFloat64(m.reportFlushResult.WithLabelValues("failure"))
+
+	m.onReportFlushResult(true)
+	m.onReportFlushResult(false)
+
+	if got := testutil.ToFloat64(m.reportFlushResult.WithLabelValues("success")); got != beforeSuccess+1 {
+		t.Errorf("report_flush_result_total{result=success} = %v, want %v", got, beforeSuccess+1)
+	}
+	if got := testutil.ToFloat64(m.reportFlushResult.WithLabelValues("failure")); got != beforeFailure+1 {
+		t.Errorf("report_flush_result_total{result=failure} = %v, want %v", got, beforeFailure+1)
+	}
+}
+
+// TestOnPollResultIncrementsMetric exercises the active-scanner poll-result counter (Fix
+// 2 / findings I17/I28) -- wired as collector.Collector.OnPollResult in newActiveScanner.
+func TestOnPollResultIncrementsMetric(t *testing.T) {
+	m := mustTestResponderMetrics(t)
+	beforeGRPCSuccess := testutil.ToFloat64(m.pollResult.WithLabelValues("grpc", "success"))
+	beforeP2PFailure := testutil.ToFloat64(m.pollResult.WithLabelValues("p2p", "failure"))
+
+	m.onPollResult(storage.ProbeSourceGRPC, true)
+	m.onPollResult(storage.ProbeSourceP2P, false)
+
+	if got := testutil.ToFloat64(m.pollResult.WithLabelValues("grpc", "success")); got != beforeGRPCSuccess+1 {
+		t.Errorf("collector_poll_result_total{probe_source=grpc,result=success} = %v, want %v", got, beforeGRPCSuccess+1)
+	}
+	if got := testutil.ToFloat64(m.pollResult.WithLabelValues("p2p", "failure")); got != beforeP2PFailure+1 {
+		t.Errorf("collector_poll_result_total{probe_source=p2p,result=failure} = %v, want %v", got, beforeP2PFailure+1)
+	}
+}
+
 // TestOnPeerIdentityIncrementsDBWriteMetrics exercises the DB-write result counters wired
 // directly at dbBackedResponder's storage.Store call sites (responder.go), against the real
 // test database (same pattern as responder_test.go's newTestStore).
@@ -208,8 +245,8 @@ func TestOnPeerIdentityIncrementsDBWriteMetrics(t *testing.T) {
 	metrics := mustTestResponderMetrics(t)
 	r := &dbBackedResponder{store: store, logf: t.Logf, metrics: metrics}
 
-	beforeUpsertSuccess := testutil.ToFloat64(metrics.dbWriteResult.WithLabelValues(dbOperationUpsertNode, "success"))
-	beforeHealthSuccess := testutil.ToFloat64(metrics.dbWriteResult.WithLabelValues(dbOperationRecordHealth, "success"))
+	beforeUpsertSuccess := testutil.ToFloat64(metrics.bufferAppendResult.WithLabelValues(bufferOperationUpsertNode, "success"))
+	beforeHealthSuccess := testutil.ToFloat64(metrics.bufferAppendResult.WithLabelValues(bufferOperationRecordHealth, "success"))
 
 	claimedAddr, err := p2p.EncodeMultiaddrString("/ip4/198.51.100.90/tcp/18189")
 	if err != nil {
@@ -221,10 +258,10 @@ func TestOnPeerIdentityIncrementsDBWriteMetrics(t *testing.T) {
 		Features:           p2p.FeaturesCommunicationNode,
 	})
 
-	if got := testutil.ToFloat64(metrics.dbWriteResult.WithLabelValues(dbOperationUpsertNode, "success")); got != beforeUpsertSuccess+1 {
+	if got := testutil.ToFloat64(metrics.bufferAppendResult.WithLabelValues(bufferOperationUpsertNode, "success")); got != beforeUpsertSuccess+1 {
 		t.Errorf("db_write_result_total{operation=upsert_node,result=success} = %v, want %v", got, beforeUpsertSuccess+1)
 	}
-	if got := testutil.ToFloat64(metrics.dbWriteResult.WithLabelValues(dbOperationRecordHealth, "success")); got != beforeHealthSuccess+1 {
+	if got := testutil.ToFloat64(metrics.bufferAppendResult.WithLabelValues(bufferOperationRecordHealth, "success")); got != beforeHealthSuccess+1 {
 		t.Errorf("db_write_result_total{operation=record_health,result=success} = %v, want %v", got, beforeHealthSuccess+1)
 	}
 }
@@ -262,8 +299,8 @@ func TestOnPeerIdentityRecordsDBWriteFailureMetric(t *testing.T) {
 	metrics := mustTestResponderMetrics(t)
 	r := &dbBackedResponder{store: &failingStore{Store: store}, logf: t.Logf, metrics: metrics}
 
-	beforeUpsertFailure := testutil.ToFloat64(metrics.dbWriteResult.WithLabelValues(dbOperationUpsertNode, "failure"))
-	beforeHealthSuccess := testutil.ToFloat64(metrics.dbWriteResult.WithLabelValues(dbOperationRecordHealth, "success"))
+	beforeUpsertFailure := testutil.ToFloat64(metrics.bufferAppendResult.WithLabelValues(bufferOperationUpsertNode, "failure"))
+	beforeHealthSuccess := testutil.ToFloat64(metrics.bufferAppendResult.WithLabelValues(bufferOperationRecordHealth, "success"))
 
 	claimedAddr, err := p2p.EncodeMultiaddrString("/ip4/198.51.100.91/tcp/18189")
 	if err != nil {
@@ -275,10 +312,10 @@ func TestOnPeerIdentityRecordsDBWriteFailureMetric(t *testing.T) {
 		Features:           p2p.FeaturesCommunicationNode,
 	})
 
-	if got := testutil.ToFloat64(metrics.dbWriteResult.WithLabelValues(dbOperationUpsertNode, "failure")); got != beforeUpsertFailure+1 {
+	if got := testutil.ToFloat64(metrics.bufferAppendResult.WithLabelValues(bufferOperationUpsertNode, "failure")); got != beforeUpsertFailure+1 {
 		t.Errorf("db_write_result_total{operation=upsert_node,result=failure} = %v, want %v", got, beforeUpsertFailure+1)
 	}
-	if got := testutil.ToFloat64(metrics.dbWriteResult.WithLabelValues(dbOperationRecordHealth, "success")); got != beforeHealthSuccess {
+	if got := testutil.ToFloat64(metrics.bufferAppendResult.WithLabelValues(bufferOperationRecordHealth, "success")); got != beforeHealthSuccess {
 		t.Errorf("db_write_result_total{operation=record_health,result=success} = %v, want unchanged %v (RecordHealthCheck must never be reached after a failed UpsertConfirmedNode)", got, beforeHealthSuccess)
 	}
 }

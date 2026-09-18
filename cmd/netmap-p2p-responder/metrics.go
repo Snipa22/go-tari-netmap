@@ -86,14 +86,53 @@ type responderMetrics struct {
 	// the right things.
 	substreamProtocolDeclined *prometheus.CounterVec
 
-	// dbWriteResult counts every UpsertConfirmedNode/RecordHealthCheck call outcome, labeled by
-	// operation and result -- incremented from dbBackedResponder's own storage.Store call sites
-	// (see responder.go). This is the most operationally important metric here: a nonzero,
-	// growing connections_accepted_total with near-zero identity_exchange_result_total{result=
-	// "success"} means "nobody's really talking to us yet"; growing identity-exchange successes
-	// with matching db_write successes means real peers ARE finding and exchanging identity
-	// with us.
-	dbWriteResult *prometheus.CounterVec
+	// bufferAppendResult counts every UpsertConfirmedNode/RecordHealthCheck call outcome
+	// AGAINST THIS PROCESS' OWN internal/remotestore.Store, labeled by operation and result
+	// -- incremented from dbBackedResponder's own storage.Store call sites (see
+	// responder.go). This metric's name and meaning were fixed as part of this repo's
+	// readiness-review follow-up (Fix 2 / findings I4/I23/I27): on a remote-collector
+	// satellite, a "success" here means the write was accepted into internal/remotestore's
+	// in-memory pending buffer -- it does NOT mean the data reached durable central
+	// storage. This was previously named db_write_result_total, which -- combined with
+	// every other Store implementation in this repo genuinely writing straight to Postgres
+	// -- silently implied "persisted" for a metric that, on this binary specifically, only
+	// ever means "buffered locally, not yet confirmed delivered". See reportFlushResult
+	// below for the metric that actually reflects successful central persistence.
+	bufferAppendResult *prometheus.CounterVec
+
+	// reportFlushResult counts every actual POST /internal/collectors/report attempt this
+	// process' internal/remotestore.Store makes (one increment per sub-batch -- see that
+	// package's flush.go), labeled by result (success|failure) -- wired via
+	// remotestore.Config.OnFlushResult in main.go. THIS is the metric that reflects whether
+	// data buffered locally (bufferAppendResult above) is actually reaching durable central
+	// storage -- see this repo's readiness-review follow-up, Fix 2 (S5/I4/I23/I27/I28): the
+	// satellite's report channel previously had zero observability of its own.
+	reportFlushResult *prometheus.CounterVec
+
+	// reportPendingRecords is a gauge of internal/remotestore.Store.PendingRecordCount() --
+	// how many records are currently buffered locally, awaiting their next flush attempt.
+	// Updated after every flush attempt (see main.go's OnFlushResult wiring) -- a
+	// persistently large/growing value here, alongside reportFlushResult{result=failure}
+	// climbing, is exactly the "report channel is broken" signal Fix 1's /healthz check also
+	// surfaces, just as a numeric trend an operator can graph/alert on instead of a binary
+	// healthy/unhealthy.
+	reportPendingRecords prometheus.Gauge
+
+	// reportLastSuccessTimestamp is a gauge of internal/remotestore.Store.
+	// LastSuccessfulFlushAt(), as Unix seconds (0 if no flush has ever succeeded) --
+	// updated after every flush attempt, same convention as reportPendingRecords above.
+	// Lets an operator alert on "no successful flush in N minutes" directly, independent of
+	// this process' own /healthz check.
+	reportLastSuccessTimestamp prometheus.Gauge
+
+	// pollResult counts every individual probe attempt made by this process' own active-
+	// scanner Collector (via collector.Collector.OnPollResult, see
+	// internal/collector/collector.go's PollResultFunc), labeled by probe_source (grpc|p2p)
+	// and result (success|failure) -- mirrors cmd/netmap/metrics.go's netmapMetrics.
+	// pollResult exactly. Before this repo's readiness-review follow-up (Fix 2 /
+	// findings I17/I28), this binary's active-scanner role emitted ZERO metrics at all --
+	// OnPollResult was never wired, unlike cmd/netmap's identical Collector wiring.
+	pollResult *prometheus.CounterVec
 }
 
 // validMainnetOrTestnet is the exact, closed set of values the required -network flag (see
@@ -153,10 +192,26 @@ func newResponderMetrics(network string) (*responderMetrics, error) {
 		Name: prefix + "substream_protocol_declined_total",
 		Help: "Total number of substream protocol negotiations we declined (NOT_SUPPORTED), labeled by the requested protocol id.",
 	}, []string{"protocol"})
-	m.dbWriteResult = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: prefix + "db_write_result_total",
-		Help: "Total number of storage.Store write outcomes, labeled by operation (upsert_node|record_health) and result (success|failure).",
+	m.bufferAppendResult = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "buffer_append_result_total",
+		Help: "Total number of internal/remotestore.Store write outcomes (buffered locally, NOT yet confirmed persisted centrally -- see reportFlushResult for that), labeled by operation (upsert_node|record_health) and result (success|failure). Renamed from db_write_result_total (see this repo's readiness-review follow-up, Fix 2) -- that name implied durable persistence, which this metric has never actually measured on this binary.",
 	}, []string{"operation", "result"})
+	m.reportFlushResult = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "report_flush_result_total",
+		Help: "Total number of POST /internal/collectors/report attempts (one per sub-batch), labeled by result (success|failure) -- THIS is the metric that reflects whether locally-buffered data (see buffer_append_result_total) is actually reaching durable central storage.",
+	}, []string{"result"})
+	m.reportPendingRecords = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: prefix + "report_pending_records",
+		Help: "Current combined size of every pending-write buffer (confirmed nodes + discovered nodes + health checks + peer edges), awaiting the next flush attempt. Updated after every flush attempt, not live per-scrape.",
+	})
+	m.reportLastSuccessTimestamp = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: prefix + "report_last_successful_flush_timestamp_seconds",
+		Help: "Unix timestamp (seconds) of the most recent successful POST /internal/collectors/report attempt, or 0 if none has ever succeeded. Updated after every flush attempt, not live per-scrape.",
+	})
+	m.pollResult = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "collector_poll_result_total",
+		Help: "Total number of individual probe attempts made by this process' own active-scanner Collector, labeled by probe_source (grpc|p2p) and result (success|failure). Mirrors cmd/netmap's netmap_<network>_collector_poll_result_total.",
+	}, []string{"probe_source", "result"})
 
 	m.registry.MustRegister(
 		m.connectionsAccepted,
@@ -165,7 +220,11 @@ func newResponderMetrics(network string) (*responderMetrics, error) {
 		m.getPeersServed,
 		m.getPeersPeerCount,
 		m.substreamProtocolDeclined,
-		m.dbWriteResult,
+		m.bufferAppendResult,
+		m.reportFlushResult,
+		m.reportPendingRecords,
+		m.reportLastSuccessTimestamp,
+		m.pollResult,
 		// Deliberately registered explicitly here (see this struct's doc comment) rather than
 		// relying on prometheus.DefaultRegisterer's own implicit package-init registration of
 		// these two, since we're no longer using DefaultRegisterer at all -- process_start_
@@ -214,11 +273,30 @@ func (m *responderMetrics) onSubstreamProtocolDeclined(_ net.Addr, protocol []by
 	m.substreamProtocolDeclined.WithLabelValues(string(protocol)).Inc()
 }
 
-// dbOperationUpsertNode and dbOperationRecordHealth are the "operation" label values for
-// dbWriteResult, matching BRIEF4.md's exact naming (operation="upsert_node|record_health").
+// onReportFlushResult is wired (indirectly, see main.go's onFlushResult closure) as
+// remotestore.Config.OnFlushResult -- called once per actual
+// POST /internal/collectors/report attempt (see internal/remotestore/flush.go's flushOnce).
+// See this repo's readiness-review follow-up, Fix 2. The pending-records/last-successful-
+// flush-timestamp gauges are updated by main.go's own wrapping closure, not here (see its
+// doc comment for why: they need to poll the *remotestore.Store this callback is wired
+// against, which isn't available to this metrics-only method).
+func (m *responderMetrics) onReportFlushResult(success bool) {
+	m.reportFlushResult.WithLabelValues(resultLabel(success)).Inc()
+}
+
+// onPollResult implements collector.PollResultFunc -- wired as Collector.OnPollResult in
+// newActiveScanner (activescanner.go), mirroring cmd/netmap/metrics.go's netmapMetrics.
+// onPollResult exactly. See this repo's readiness-review follow-up, Fix 2 / findings
+// I17/I28: before this, this binary's active-scanner role emitted zero metrics of its own.
+func (m *responderMetrics) onPollResult(probeSource storage.ProbeSource, success bool) {
+	m.pollResult.WithLabelValues(string(probeSource), resultLabel(success)).Inc()
+}
+
+// bufferOperationUpsertNode and bufferOperationRecordHealth are the "operation" label values for
+// bufferAppendResult, matching BRIEF4.md's exact naming (operation="upsert_node|record_health").
 const (
-	dbOperationUpsertNode   = "upsert_node"
-	dbOperationRecordHealth = "record_health"
+	bufferOperationUpsertNode   = "upsert_node"
+	bufferOperationRecordHealth = "record_health"
 )
 
 // healthzTimeout bounds the store.Ping call /healthz makes -- BRIEF4.md specifies "a short

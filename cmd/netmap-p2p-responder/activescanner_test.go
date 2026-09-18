@@ -129,7 +129,7 @@ func TestNewActiveScannerWiresStorage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("remotestore.New: %v", err)
 	}
-	c := newActiveScanner(store)
+	c := newActiveScanner(store, mustTestResponderMetrics(t))
 	if c.Storage == nil {
 		t.Error("expected Storage to be wired")
 	}
@@ -138,5 +138,8 @@ func TestNewActiveScannerWiresStorage(t *testing.T) {
 	}
 	if c.P2PClient == nil {
 		t.Error("expected P2PClient to be wired")
+	}
+	if c.OnPollResult == nil {
+		t.Error("expected OnPollResult to be wired (see this repo's readiness-review follow-up, Fix 2 / findings I17/I28 -- the active-scanner role must not go unmetriced)")
 	}
 }
