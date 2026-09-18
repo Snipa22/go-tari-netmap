@@ -10,6 +10,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/Snipa22/go-tari-netmap/internal/adminauth"
 	"github.com/Snipa22/go-tari-netmap/internal/api"
 	"github.com/Snipa22/go-tari-netmap/internal/storage"
@@ -357,6 +360,316 @@ func TestSeedsAndTopologyExcludeCollectorRoleTaggedNode(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("GET /nodes must still list the role=collector node (plain listing routes are out of scope for this filter)")
+	}
+}
+
+// TestCollectorReportForcesDiscoverySourceToP2P proves Fix 6(a): a collector report claiming
+// discovery_source=registry_submitted for a confirmed node, combined with a reachable=true
+// health check in the same batch, must NOT mint a fully opted-in seed candidate -- the central
+// handler must force discovery_source to p2p_discovered regardless of what the report claims,
+// so the node never appears in ListSeedCandidates without going through the same
+// pending_submissions review gate the public POST /nodes path uses.
+func TestCollectorReportForcesDiscoverySourceToP2P(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
+
+	const addr = "198.51.100.220:18189"
+	const pubkeyHex = "aabbccdd"
+
+	reqBody := map[string]any{
+		"confirmed_nodes": []map[string]any{
+			{"address": addr, "public_key": pubkeyHex, "discovery_source": "registry_submitted"},
+		},
+		"health_checks": []map[string]any{
+			{"address": addr, "reachable": true, "probe_source": "p2p"},
+		},
+	}
+	raw, err := json.Marshal(reqBody)
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	resp := doCollectorReportRequest(t, srv.URL, testCollectorAPIKey, string(raw))
+	defer resp.Body.Close()
+	body, _ := readAllForTest(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", resp.StatusCode, http.StatusOK, body)
+	}
+
+	nodes, err := store.ListNodes(ctx, storage.NodeFilter{})
+	if err != nil {
+		t.Fatalf("list nodes: %v", err)
+	}
+	var got storage.Node
+	found := false
+	for _, n := range nodes {
+		if n.Address == addr {
+			got, found = n, true
+		}
+	}
+	if !found {
+		t.Fatalf("node %s not found", addr)
+	}
+	if got.DiscoverySource != storage.DiscoverySourceP2P {
+		t.Errorf("discovery_source = %q, want %q (must be forced regardless of the claimed value)", got.DiscoverySource, storage.DiscoverySourceP2P)
+	}
+
+	candidates, err := store.ListSeedCandidates(ctx, storage.DefaultSeedHealthWindow)
+	if err != nil {
+		t.Fatalf("list seed candidates: %v", err)
+	}
+	for _, c := range candidates {
+		if c.NodeID == got.ID {
+			t.Errorf("node %s (%s) unexpectedly appears in ListSeedCandidates -- a collector report must never mint an opted-in seed candidate without human review", got.ID, addr)
+		}
+	}
+}
+
+// TestCollectorReportRejectsPrivateReservedAddresses proves Fix 6(b): every address field in
+// a collector report (self_identity and every "observed" address) is rejected with 400 -- not
+// silently accepted -- when it's a private/loopback/reserved IP, mirroring
+// validate_test.go's existing coverage for the public POST /nodes path. No write is applied
+// for any of these malformed-per-trust-boundary payloads.
+func TestCollectorReportRejectsPrivateReservedAddresses(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"self_identity loopback", `{"self_identity":["127.0.0.1:18189"]}`},
+		{"self_identity private RFC1918", `{"self_identity":["192.168.1.5:18189"]}`},
+		{"confirmed_nodes address private", `{"confirmed_nodes":[{"address":"10.0.0.5:18189","public_key":"aabb","discovery_source":"p2p_discovered"}]}`},
+		{"discovered_nodes address loopback", `{"discovered_nodes":[{"address":"127.0.0.1:18189"}]}`},
+		{"health_checks address link-local", `{"health_checks":[{"address":"169.254.1.1:18189","reachable":true,"probe_source":"p2p"}]}`},
+		{"peer_edges from_address private", `{"peer_edges":[{"from_address":"10.1.2.3:18189","to_address":"198.51.100.1:18189"}]}`},
+		{"peer_edges to_address private", `{"peer_edges":[{"from_address":"198.51.100.1:18189","to_address":"172.16.0.1:18189"}]}`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, store := newTestServer(t, nil)
+			ctx := context.Background()
+
+			resp := doCollectorReportRequest(t, srv.URL, testCollectorAPIKey, tc.body)
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				body, _ := readAllForTest(t, resp)
+				t.Fatalf("status = %d, want %d, body=%s", resp.StatusCode, http.StatusBadRequest, body)
+			}
+
+			nodes, err := store.ListNodes(ctx, storage.NodeFilter{})
+			if err != nil {
+				t.Fatalf("list nodes: %v", err)
+			}
+			if len(nodes) != 0 {
+				t.Fatalf("len(nodes) = %d, want 0 (a private/reserved address must reject the whole batch, not partially apply)", len(nodes))
+			}
+		})
+	}
+}
+
+// TestCollectorReportSelfIdentityRequiresAllowlistedAddress proves Fix 6(c): a self_identity
+// address NOT present in the authenticated collector's configured SelfAddresses allowlist is
+// skipped (not tagged role=collector), while the rest of an otherwise-valid batch still
+// applies successfully (200, not 400/500) -- self_identity tagging is constrained to
+// addresses the operator has independently confirmed this collector controls, it cannot mint
+// arbitrary role=collector suppression.
+func TestCollectorReportSelfIdentityRequiresAllowlistedAddress(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
+
+	// NOT in testCollectorSelfAddresses -- see api_test.go.
+	const disallowedAddr = "203.0.113.99:18189"
+	const discoveredAddr = "198.51.100.230:18189"
+
+	reqBody := map[string]any{
+		"self_identity": []string{disallowedAddr},
+		"discovered_nodes": []map[string]any{
+			{"address": discoveredAddr},
+		},
+	}
+	raw, err := json.Marshal(reqBody)
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	resp := doCollectorReportRequest(t, srv.URL, testCollectorAPIKey, string(raw))
+	defer resp.Body.Close()
+	body, _ := readAllForTest(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", resp.StatusCode, http.StatusOK, body)
+	}
+
+	var got struct {
+		DiscoveredNodesApplied int `json:"discovered_nodes_applied"`
+		SelfIdentityTagged     int `json:"self_identity_tagged"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode response %s: %v", body, err)
+	}
+	if got.DiscoveredNodesApplied != 1 {
+		t.Errorf("discovered_nodes_applied = %d, want 1 (rest of the batch must still apply)", got.DiscoveredNodesApplied)
+	}
+	if got.SelfIdentityTagged != 0 {
+		t.Errorf("self_identity_tagged = %d, want 0 (disallowed address must not be tagged)", got.SelfIdentityTagged)
+	}
+
+	nodes, err := store.ListNodes(ctx, storage.NodeFilter{})
+	if err != nil {
+		t.Fatalf("list nodes: %v", err)
+	}
+	for _, n := range nodes {
+		if n.Address == disallowedAddr {
+			if role, _ := n.Tags["role"].(string); role == "collector" {
+				t.Errorf("disallowed self_identity address %s was tagged role=collector despite not being in the collector's configured allowlist", disallowedAddr)
+			}
+		}
+	}
+}
+
+// TestCollectorReportRecordsAttribution proves Fix 4: every node_health/peer_edge_observations
+// row a collector report writes is stamped with reported_by_collector = the authenticated
+// collector's name. reported_by_collector is deliberately not exposed via storage.Store's read
+// methods (see HealthCheckInput.ReportedByCollector's doc comment: it's queryable directly for
+// incident response, not part of any public API response), so this test queries the
+// underlying table directly via a raw connection to the same test database newTestServer's
+// store was built with.
+func TestCollectorReportRecordsAttribution(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
+
+	const confirmedAddr = "198.51.100.240:18189"
+	const peerAddr = "198.51.100.241:18189"
+	const pubkeyHex = "aabbccddee"
+
+	reqBody := map[string]any{
+		"confirmed_nodes": []map[string]any{
+			{"address": confirmedAddr, "public_key": pubkeyHex, "discovery_source": "p2p_discovered"},
+		},
+		"health_checks": []map[string]any{
+			{"address": confirmedAddr, "reachable": true, "probe_source": "p2p"},
+		},
+		"peer_edges": []map[string]any{
+			{"from_address": confirmedAddr, "to_address": peerAddr},
+		},
+	}
+	raw, err := json.Marshal(reqBody)
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	resp := doCollectorReportRequest(t, srv.URL, testCollectorAPIKey, string(raw))
+	defer resp.Body.Close()
+	body, _ := readAllForTest(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", resp.StatusCode, http.StatusOK, body)
+	}
+
+	nodes, err := store.ListNodes(ctx, storage.NodeFilter{})
+	if err != nil {
+		t.Fatalf("list nodes: %v", err)
+	}
+	var confirmedID uuid.UUID
+	found := false
+	for _, n := range nodes {
+		if n.Address == confirmedAddr {
+			confirmedID, found = n.ID, true
+		}
+	}
+	if !found {
+		t.Fatalf("confirmed node %s not found", confirmedAddr)
+	}
+
+	pool, err := pgxpool.New(ctx, testDSN())
+	if err != nil {
+		t.Fatalf("connect to test db: %v", err)
+	}
+	defer pool.Close()
+
+	var healthAttribution *string
+	if err := pool.QueryRow(ctx, `SELECT reported_by_collector FROM node_health WHERE node_id = $1`, confirmedID).Scan(&healthAttribution); err != nil {
+		t.Fatalf("query node_health.reported_by_collector: %v", err)
+	}
+	if healthAttribution == nil || *healthAttribution != testCollectorName {
+		t.Errorf("node_health.reported_by_collector = %v, want %q", healthAttribution, testCollectorName)
+	}
+
+	var edgeAttribution *string
+	if err := pool.QueryRow(ctx, `SELECT reported_by_collector FROM peer_edge_observations WHERE from_node_id = $1`, confirmedID).Scan(&edgeAttribution); err != nil {
+		t.Fatalf("query peer_edge_observations.reported_by_collector: %v", err)
+	}
+	if edgeAttribution == nil || *edgeAttribution != testCollectorName {
+		t.Errorf("peer_edge_observations.reported_by_collector = %v, want %q", edgeAttribution, testCollectorName)
+	}
+}
+
+// TestCollectorReportRetryWithIdenticalBodyIsIdempotent proves the server-side half of Fix 3:
+// POSTing the exact same request body twice (simulating internal/remotestore's own retry of a
+// byte-identical sub-batch after a client-side failure -- see flush.go's flushOnce/splitBatch)
+// applies the health check and peer edge exactly ONCE, not twice, even though both are
+// append-only writes with no natural primary key to upsert against.
+func TestCollectorReportRetryWithIdenticalBodyIsIdempotent(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
+
+	const confirmedAddr = "198.51.100.250:18189"
+	const peerAddr = "198.51.100.251:18189"
+	const pubkeyHex = "aabbccddeeff"
+
+	reqBody := map[string]any{
+		"confirmed_nodes": []map[string]any{
+			{"address": confirmedAddr, "public_key": pubkeyHex, "discovery_source": "p2p_discovered"},
+		},
+		"health_checks": []map[string]any{
+			{"address": confirmedAddr, "reachable": true, "probe_source": "p2p"},
+		},
+		"peer_edges": []map[string]any{
+			{"from_address": confirmedAddr, "to_address": peerAddr},
+		},
+	}
+	raw, err := json.Marshal(reqBody)
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	// Send the IDENTICAL body twice -- simulating a client-side retry of the same sub-batch.
+	for i := 0; i < 2; i++ {
+		resp := doCollectorReportRequest(t, srv.URL, testCollectorAPIKey, string(raw))
+		body, _ := readAllForTest(t, resp)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("attempt #%d: status = %d, want %d, body=%s", i+1, resp.StatusCode, http.StatusOK, body)
+		}
+	}
+
+	nodes, err := store.ListNodes(ctx, storage.NodeFilter{})
+	if err != nil {
+		t.Fatalf("list nodes: %v", err)
+	}
+	var confirmedID uuid.UUID
+	found := false
+	for _, n := range nodes {
+		if n.Address == confirmedAddr {
+			confirmedID, found = n.ID, true
+		}
+	}
+	if !found {
+		t.Fatalf("confirmed node %s not found", confirmedAddr)
+	}
+
+	history, err := store.GetNodeHistory(ctx, confirmedID, 10)
+	if err != nil {
+		t.Fatalf("get node history: %v", err)
+	}
+	if len(history) != 1 {
+		t.Errorf("len(history) = %d, want 1 (identical retry must not duplicate the health check row)", len(history))
+	}
+
+	edges, err := store.ListNodeEdges(ctx, confirmedID, 10)
+	if err != nil {
+		t.Fatalf("list node edges: %v", err)
+	}
+	if len(edges) != 1 {
+		t.Errorf("len(edges) = %d, want 1 (identical retry must not duplicate the peer edge row)", len(edges))
 	}
 }
 

@@ -185,7 +185,15 @@ type Store interface {
 	// so repeated discovery-walk observations of the same (from, to) pair
 	// accumulate as real history rather than overwriting a single
 	// last_seen timestamp.
-	RecordPeerEdgeObservation(ctx context.Context, fromNodeID, toNodeID uuid.UUID) error
+	//
+	// meta is an optional variadic parameter (at most one value is meaningful; a caller
+	// passes either zero or one) rather than a new required parameter, specifically so
+	// every pre-existing call site keeps compiling unchanged. Only
+	// internal/api/collector_report.go's applyCollectorReport ever passes a non-zero
+	// PeerEdgeReportMeta (see its own doc comment for the Fix 4 attribution / Fix 3
+	// idempotency rationale); every other caller (the local collector's own discovery
+	// walk) omits it entirely, recorded as NULL on both columns.
+	RecordPeerEdgeObservation(ctx context.Context, fromNodeID, toNodeID uuid.UUID, meta ...PeerEdgeReportMeta) error
 
 	// ListTopology returns nodes and edges for the graph view, with no
 	// time-window filtering (every edge ever observed is treated as
@@ -1010,13 +1018,33 @@ func (s *pgStore) RecordHealthCheck(ctx context.Context, in HealthCheckInput) er
 		return fmt.Errorf("storage: probe_source is required")
 	}
 
+	// Idempotency check (Fix 3, see 0012_report_batch_idempotency.sql's doc comment for why
+	// this is a plain existence check rather than a DB-level unique constraint + ON
+	// CONFLICT, unlike RecordPeerEdgeObservation below): a byte-identical retry of the same
+	// collector report batch carries the same ReportBatchID, and if a row for
+	// (node_id, report_batch_id) already exists, this retry already applied -- skip it
+	// rather than inserting a duplicate.
+	if in.ReportBatchID != nil {
+		var exists bool
+		if err := s.pool.QueryRow(ctx, `
+			SELECT EXISTS(SELECT 1 FROM node_health WHERE node_id = $1 AND report_batch_id = $2)
+		`, in.NodeID, *in.ReportBatchID).Scan(&exists); err != nil {
+			return fmt.Errorf("storage: check report_batch_id idempotency: %w", err)
+		}
+		if exists {
+			return nil
+		}
+	}
+
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO node_health (
 			node_id, ts, reachable, probe_source, height, chain_tip_height, version,
-			latency_ms, rxt_hashrate, c29_hashrate, sha3x_hashrate, peer_identity_updated_at
-		) VALUES ($1, now(), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			latency_ms, rxt_hashrate, c29_hashrate, sha3x_hashrate, peer_identity_updated_at,
+			reported_by_collector, report_batch_id
+		) VALUES ($1, now(), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 	`, in.NodeID, in.Reachable, string(in.ProbeSource), in.Height, in.ChainTipHeight, in.Version,
 		in.LatencyMS, in.RxtHashrate, in.C29Hashrate, in.Sha3xHashrate, in.PeerIdentityUpdatedAt,
+		in.ReportedByCollector, in.ReportBatchID,
 	)
 	if err != nil {
 		return fmt.Errorf("storage: record health check: %w", err)
@@ -1148,11 +1176,26 @@ func (s *pgStore) GetRecentSuccessfulHealthChecks(ctx context.Context, nodeID uu
 	return checks, nil
 }
 
-func (s *pgStore) RecordPeerEdgeObservation(ctx context.Context, fromNodeID, toNodeID uuid.UUID) error {
+func (s *pgStore) RecordPeerEdgeObservation(ctx context.Context, fromNodeID, toNodeID uuid.UUID, meta ...PeerEdgeReportMeta) error {
+	var collectorName *string
+	var batchID *uuid.UUID
+	if len(meta) > 0 {
+		if meta[0].ReportedByCollector != "" {
+			collectorName = &meta[0].ReportedByCollector
+		}
+		batchID = meta[0].ReportBatchID
+	}
+	// ON CONFLICT DO NOTHING against the partial unique index on
+	// (from_node_id, to_node_id, report_batch_id) WHERE report_batch_id IS NOT NULL (see
+	// 0012_report_batch_idempotency.sql) makes a byte-identical retry of the same collector
+	// report batch a safe, atomic no-op instead of a duplicate row (Fix 3) -- this only ever
+	// applies when batchID is non-nil; every other caller (batchID == nil) inserts
+	// unconditionally, exactly as before.
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO peer_edge_observations (from_node_id, to_node_id, observed_at)
-		VALUES ($1, $2, now())
-	`, fromNodeID, toNodeID)
+		INSERT INTO peer_edge_observations (from_node_id, to_node_id, observed_at, reported_by_collector, report_batch_id)
+		VALUES ($1, $2, now(), $3, $4)
+		ON CONFLICT (from_node_id, to_node_id, report_batch_id) WHERE report_batch_id IS NOT NULL DO NOTHING
+	`, fromNodeID, toNodeID, collectorName, batchID)
 	if err != nil {
 		return fmt.Errorf("storage: record peer edge observation: %w", err)
 	}

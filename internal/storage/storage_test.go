@@ -1132,6 +1132,113 @@ func TestRecordHealthCheckPeerIdentityUpdatedAtRoundTrip(t *testing.T) {
 	}
 }
 
+// TestRecordHealthCheckReportBatchIDIdempotency proves Fix 3's node_health half: a second
+// RecordHealthCheck call for the same node with the SAME ReportBatchID is a no-op (the row is
+// not duplicated), while a call with a DIFFERENT ReportBatchID (or none at all) still inserts
+// normally -- see 0012_report_batch_idempotency.sql's doc comment for why this is a plain
+// existence check rather than a DB-level unique constraint (node_health is a TimescaleDB
+// hypertable candidate).
+func TestRecordHealthCheckReportBatchIDIdempotency(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	n, err := store.UpsertDiscoveredNode(ctx, "node:idempotency:1", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	batchID := uuid.New()
+	input := HealthCheckInput{NodeID: n.ID, Reachable: true, ProbeSource: ProbeSourceP2P, ReportBatchID: &batchID}
+
+	if err := store.RecordHealthCheck(ctx, input); err != nil {
+		t.Fatalf("first record: %v", err)
+	}
+	// Retry with the exact same ReportBatchID -- must be recognized as a duplicate and
+	// skipped, not inserted a second time.
+	if err := store.RecordHealthCheck(ctx, input); err != nil {
+		t.Fatalf("retried record with same batch id: %v", err)
+	}
+
+	history, err := store.GetNodeHistory(ctx, n.ID, 10)
+	if err != nil {
+		t.Fatalf("get history: %v", err)
+	}
+	if len(history) != 1 {
+		t.Fatalf("len(history) = %d, want 1 (identical ReportBatchID retry must not duplicate)", len(history))
+	}
+
+	// A different batch id (a genuinely new report) must still insert normally.
+	otherBatchID := uuid.New()
+	input2 := input
+	input2.ReportBatchID = &otherBatchID
+	if err := store.RecordHealthCheck(ctx, input2); err != nil {
+		t.Fatalf("record with different batch id: %v", err)
+	}
+	history2, err := store.GetNodeHistory(ctx, n.ID, 10)
+	if err != nil {
+		t.Fatalf("get history: %v", err)
+	}
+	if len(history2) != 2 {
+		t.Fatalf("len(history) = %d, want 2 (a different ReportBatchID must insert normally)", len(history2))
+	}
+}
+
+// TestRecordPeerEdgeObservationReportBatchIDIdempotency proves Fix 3's
+// peer_edge_observations half: a second RecordPeerEdgeObservation call for the same
+// (from, to) pair with the SAME ReportBatchID is a no-op (atomic ON CONFLICT DO NOTHING
+// against the partial unique index, see 0012_report_batch_idempotency.sql), while a call
+// with a DIFFERENT ReportBatchID (or none at all) still inserts a new, distinct
+// observation row. Counts the underlying peer_edge_observations table directly (via a raw
+// connection) rather than ListNodeEdges/the peer_edges view, which rolls multiple
+// observations of the same (from, to) pair into a single row regardless of how many
+// underlying observations exist -- exactly the distinction this test needs to see through.
+func TestRecordPeerEdgeObservationReportBatchIDIdempotency(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	a, err := store.UpsertDiscoveredNode(ctx, "edge:idempotency:a", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert a: %v", err)
+	}
+	b, err := store.UpsertDiscoveredNode(ctx, "edge:idempotency:b", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert b: %v", err)
+	}
+
+	batchID := uuid.New()
+	meta := PeerEdgeReportMeta{ReportBatchID: &batchID}
+
+	if err := store.RecordPeerEdgeObservation(ctx, a.ID, b.ID, meta); err != nil {
+		t.Fatalf("first record: %v", err)
+	}
+	if err := store.RecordPeerEdgeObservation(ctx, a.ID, b.ID, meta); err != nil {
+		t.Fatalf("retried record with same batch id: %v", err)
+	}
+
+	countObservations := func() int {
+		t.Helper()
+		var count int
+		if err := store.(*pgStore).pool.QueryRow(ctx, `
+			SELECT count(*) FROM peer_edge_observations WHERE from_node_id = $1 AND to_node_id = $2
+		`, a.ID, b.ID).Scan(&count); err != nil {
+			t.Fatalf("count peer_edge_observations: %v", err)
+		}
+		return count
+	}
+
+	if got := countObservations(); got != 1 {
+		t.Fatalf("peer_edge_observations count = %d, want 1 (identical ReportBatchID retry must not duplicate)", got)
+	}
+
+	otherBatchID := uuid.New()
+	if err := store.RecordPeerEdgeObservation(ctx, a.ID, b.ID, PeerEdgeReportMeta{ReportBatchID: &otherBatchID}); err != nil {
+		t.Fatalf("record with different batch id: %v", err)
+	}
+	if got := countObservations(); got != 2 {
+		t.Fatalf("peer_edge_observations count = %d, want 2 (a different ReportBatchID must insert a new row)", got)
+	}
+}
+
 // TestGetRecentSuccessfulHealthChecks verifies that
 // GetRecentSuccessfulHealthChecks returns only reachable=true rows,
 // newest first, respecting limit — excluding unreachable rows entirely

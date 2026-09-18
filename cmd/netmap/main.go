@@ -213,14 +213,32 @@ func main() {
 	// api.NewRouter's wrapCollectorAuth treats as fail-closed (503 on every request to that
 	// route) — mirroring adminCreds' own fail-closed convention above — never "accept
 	// anything" just because this wasn't configured.
+	//
+	// NETMAP_COLLECTOR_SELF_ADDRESSES (see this repo's readiness-review follow-up, Fix 6(c))
+	// separately configures, per collector, the address(es) that collector is ALLOWED to
+	// self-identify as via a report's self_identity field -- i.e. the exact same address(es)
+	// that satellite's own deployment advertises via cmd/netmap-p2p-responder's
+	// -public-tcp-addr/-onion3-addr flags. Format: comma-separated
+	// "collector_name:addr1|addr2" entries (pipe-separated when a collector advertises more
+	// than one address, e.g. both a clearnet and an onion address), e.g.
+	// "sydney:203.0.113.9:18189,london:198.51.100.4:18189|abc...xyz.onion:18189". A collector
+	// with no entry here (or an empty raw value) gets an empty allowlist -- self_identity
+	// tagging is fail-closed per-collector, same "never silently accept just because it
+	// wasn't configured" discipline as NETMAP_COLLECTOR_KEYS above, NOT fail-open to
+	// "anything goes" for a collector missing from this map.
 	collectorKeys := parseCollectorKeys(os.Getenv("NETMAP_COLLECTOR_KEYS"))
 	if len(collectorKeys) == 0 {
 		log.Printf("NETMAP_COLLECTOR_KEYS not configured — POST /internal/collectors/report is disabled (503)")
 	}
+	collectorSelfAddresses := parseCollectorSelfAddresses(os.Getenv("NETMAP_COLLECTOR_SELF_ADDRESSES"))
+	collectors := make(map[string]api.CollectorConfig, len(collectorKeys))
+	for name, key := range collectorKeys {
+		collectors[name] = api.CollectorConfig{APIKey: key, SelfAddresses: collectorSelfAddresses[name]}
+	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/", webHandler)
-	mux.Handle("/api/", http.StripPrefix("/api", api.NewRouter(store, grpcClient, p2pClient, adminCreds, collectorKeys, *statsCacheTTL)))
+	mux.Handle("/api/", http.StripPrefix("/api", api.NewRouter(store, grpcClient, p2pClient, adminCreds, collectors, *statsCacheTTL)))
 
 	// instrumentHTTP wraps the whole dashboard+API mux above with httpRequestsTotal/
 	// httpRequestDuration -- see metrics.go's doc comment. This mux is served on *addr (the
@@ -338,12 +356,19 @@ func parseOwnedGRPCAddresses(raw string) map[string]string {
 // trimming) is logged and skipped rather than failing the whole binary at startup, matching
 // parseOwnedGRPCAddresses' "one typo shouldn't take down every other correctly-configured
 // entry" convention.
+//
+// CREDENTIAL EXPOSURE FIX (see this repo's readiness-review follow-up, Fix 7 / I33): the log
+// line below must NEVER include pair's raw value -- pair is "collector_name:api_key", so on
+// any malformed entry (e.g. a mistyped delimiter that shifts where the split lands) that
+// string very likely still contains real key material. Only the entry's 1-based position in
+// the comma-separated list is logged; an operator debugging a typo can still find the right
+// entry by counting, without a raw API key ever landing in a log line/log aggregator.
 func parseCollectorKeys(raw string) map[string]string {
 	if raw == "" {
 		return nil
 	}
 	out := make(map[string]string)
-	for _, pair := range strings.Split(raw, ",") {
+	for i, pair := range strings.Split(raw, ",") {
 		pair = strings.TrimSpace(pair)
 		if pair == "" {
 			continue
@@ -352,10 +377,50 @@ func parseCollectorKeys(raw string) map[string]string {
 		name = strings.TrimSpace(name)
 		key = strings.TrimSpace(key)
 		if !ok || name == "" || key == "" {
-			log.Printf("netmap: skipping malformed NETMAP_COLLECTOR_KEYS entry %q (want \"collector_name:api_key\")", pair)
+			log.Printf("netmap: skipping malformed NETMAP_COLLECTOR_KEYS entry #%d (want \"collector_name:api_key\"; value redacted, it may contain key material)", i+1)
 			continue
 		}
 		out[name] = key
+	}
+	return out
+}
+
+// parseCollectorSelfAddresses parses NETMAP_COLLECTOR_SELF_ADDRESSES' raw value: a
+// comma-separated list of "collector_name:addr1|addr2" entries (see collectorSelfAddresses'
+// construction site above for the exact format/example and the Fix 6(c) "why") -- mirroring
+// parseCollectorKeys' style (trim whitespace, skip empty entries, split on the first ":").
+// Each entry's address list is itself pipe-separated (never comma-separated -- comma already
+// separates entries) and each address is individually trimmed; an entry with no ":" or an
+// empty name is logged and skipped, matching parseCollectorKeys' "one typo shouldn't take
+// down every other correctly-configured entry" convention. Unlike parseCollectorKeys, an
+// entry's address LIST is allowed to be empty after trimming (a collector configured only in
+// NETMAP_COLLECTOR_KEYS, with no self_identity allowlist at all, is a normal, common
+// configuration -- it just means that collector's self_identity tagging is always rejected,
+// not that the entry itself is malformed). An empty/unset raw value returns a nil (empty) map.
+func parseCollectorSelfAddresses(raw string) map[string][]string {
+	if raw == "" {
+		return nil
+	}
+	out := make(map[string][]string)
+	for i, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		name, addrList, ok := strings.Cut(entry, ":")
+		name = strings.TrimSpace(name)
+		if !ok || name == "" {
+			log.Printf("netmap: skipping malformed NETMAP_COLLECTOR_SELF_ADDRESSES entry #%d (want \"collector_name:addr1|addr2\")", i+1)
+			continue
+		}
+		var addrs []string
+		for _, a := range strings.Split(addrList, "|") {
+			a = strings.TrimSpace(a)
+			if a != "" {
+				addrs = append(addrs, a)
+			}
+		}
+		out[name] = addrs
 	}
 	return out
 }
