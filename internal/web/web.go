@@ -802,6 +802,14 @@ func handleDashboard(tmpl *template.Template, store storage.Store, countsCache *
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
+			// Exclude role=collector-tagged nodes (see api.IsCollectorRole) -- a remote
+			// collector satellite's own advertised identity must never be recommended as a
+			// peer, on the dashboard's top-peered panel any more than on the API's own GET
+			// /topology/top-peered (which already excludes it -- this was the gap: this
+			// package read the same underlying storage.TopPeeredNodes data unfiltered).
+			if api.IsCollectorRole(n.Tags) {
+				continue
+			}
 			addrs, err := store.ListNodeAddresses(ctx, nd.NodeID)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)

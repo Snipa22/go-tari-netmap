@@ -17,14 +17,20 @@ const collectorRoleTagValue = "collector"
 // OPPOSITE filtering treatment from collectorRoleTagValue above: a relay's address IS meant to
 // be recommended as a real, dialable peer (that is the entire point of proxy mode), unlike a
 // plain collector's own ingestion-channel identity. Do not fold "relay" into
-// isCollectorRole/filterOutCollectorNodes below when that ships -- it needs its own predicate
+// IsCollectorRole/filterOutCollectorNodes below when that ships -- it needs its own predicate
 // and must NOT be excluded by the routes this file's filters gate. This comment is a
 // deliberate placeholder only; per the governing brief, no code for "relay" filtering exists
 // yet.
 
-// isCollectorRole reports whether tags marks its node as a remote collector satellite's own
-// advertised identity (tags["role"] == "collector", see collectorRoleTagValue above).
-func isCollectorRole(tags map[string]any) bool {
+// IsCollectorRole reports whether tags marks its node as a remote collector satellite's own
+// advertised identity (tags["role"] == "collector", see collectorRoleTagValue above). Exported
+// so any package that reads node Tags directly and needs to apply the exact same
+// "never recommend a collector's own identity as a peer" exclusion this package's own routes
+// apply (see filterOutCollectorNodes/filterOutCollectorSeedCandidates's doc comments for the
+// full route list) can share this one predicate rather than drifting a second copy of it --
+// see internal/web's top-peered rendering for the motivating case (a role=collector node was
+// visible there even though GET /topology/top-peered already excluded it via this same check).
+func IsCollectorRole(tags map[string]any) bool {
 	v, ok := tags["role"]
 	if !ok {
 		return false
@@ -34,7 +40,7 @@ func isCollectorRole(tags map[string]any) bool {
 }
 
 // filterOutCollectorNodes returns a new slice containing every entry of nodes EXCEPT those
-// tagged role=collector (see isCollectorRole), preserving relative order otherwise. This must
+// tagged role=collector (see IsCollectorRole), preserving relative order otherwise. This must
 // be applied by every route that recommends or exposes nodes as PEERS TO CONNECT TO: GET
 // /topology, GET /topology/top-peered, and (via filterOutCollectorSeedCandidates below) GET
 // /nodes/seeds, GET /config/peer-seeds, and their GET /nodes/seed_list(_tari) aliases.
@@ -45,7 +51,7 @@ func isCollectorRole(tags map[string]any) bool {
 func filterOutCollectorNodes(nodes []storage.Node) []storage.Node {
 	out := make([]storage.Node, 0, len(nodes))
 	for _, n := range nodes {
-		if isCollectorRole(n.Tags) {
+		if IsCollectorRole(n.Tags) {
 			continue
 		}
 		out = append(out, n)
@@ -60,7 +66,7 @@ func filterOutCollectorNodes(nodes []storage.Node) []storage.Node {
 func filterOutCollectorSeedCandidates(candidates []storage.SeedCandidate) []storage.SeedCandidate {
 	out := make([]storage.SeedCandidate, 0, len(candidates))
 	for _, c := range candidates {
-		if isCollectorRole(c.Tags) {
+		if IsCollectorRole(c.Tags) {
 			continue
 		}
 		out = append(out, c)
