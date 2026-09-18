@@ -3,6 +3,7 @@ package remotestore
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -33,6 +34,120 @@ func mustNewStore(t *testing.T, cfg Config) *Store {
 		t.Fatalf("New: %v", err)
 	}
 	return s
+}
+
+// TestFlushSplitsIntoMultipleBoundedBatches proves Fix 3: a flush whose combined pending
+// buffer exceeds Config.FlushBatchSize is split into multiple requests, each bounded at (at
+// most) FlushBatchSize combined records -- not sent as a single unbounded request, the
+// previous (fixed) behavior. See flushOnce/splitBatch's own doc comments.
+func TestFlushSplitsIntoMultipleBoundedBatches(t *testing.T) {
+	srv, captured := newCapturingReportServer()
+	defer srv.Close()
+
+	cfg := testConfig(srv.URL)
+	cfg.FlushBatchSize = 2
+	s := mustNewStore(t, cfg)
+	ctx := context.Background()
+
+	// 5 confirmed nodes buffered, FlushBatchSize=2 -- must split into ceil(5/2) = 3 requests
+	// (2, 2, 1), not one request carrying all 5.
+	const total = 5
+	for i := 0; i < total; i++ {
+		addr := fmt.Sprintf("10.10.10.%d:1", i)
+		if _, err := s.UpsertConfirmedNode(ctx, addr, []byte{byte(i)}, storage.DiscoverySourceP2P); err != nil {
+			t.Fatalf("upsert %d: %v", i, err)
+		}
+	}
+
+	if err := s.flushOnce(ctx); err != nil {
+		t.Fatalf("flushOnce: %v", err)
+	}
+
+	if got := captured.requestCount(); got != 3 {
+		t.Fatalf("requestCount = %d, want 3 (ceil(%d/%d))", got, total, cfg.FlushBatchSize)
+	}
+
+	var seenAddrs []string
+	sumApplied := 0
+	for i, req := range captured.allRequests() {
+		if len(req.ConfirmedNodes) > cfg.FlushBatchSize {
+			t.Errorf("request #%d has %d confirmed_nodes, want <= %d (FlushBatchSize)", i, len(req.ConfirmedNodes), cfg.FlushBatchSize)
+		}
+		sumApplied += len(req.ConfirmedNodes)
+		for _, cn := range req.ConfirmedNodes {
+			seenAddrs = append(seenAddrs, cn.Address)
+		}
+	}
+	if sumApplied != total {
+		t.Errorf("sum of confirmed_nodes across all requests = %d, want %d", sumApplied, total)
+	}
+	for i := 0; i < total; i++ {
+		want := fmt.Sprintf("10.10.10.%d:1", i)
+		if i >= len(seenAddrs) || seenAddrs[i] != want {
+			t.Errorf("seenAddrs[%d] = %q, want %q (order must be preserved across sub-batches)", i, safeIndex(seenAddrs, i), want)
+		}
+	}
+
+	s.mu.Lock()
+	pending := len(s.pendingConfirmed)
+	s.mu.Unlock()
+	if pending != 0 {
+		t.Errorf("pendingConfirmed after a fully successful multi-batch flush = %d, want 0", pending)
+	}
+}
+
+// TestFlushMultiBatchFailurePreservesRemainderInOrder proves the failure-handling half of
+// Fix 3: if a sub-batch partway through a multi-batch flush fails, every not-yet-sent item
+// (the failed sub-batch itself, plus everything still queued behind it) is restored to the
+// pending buffer, in its original order, for retry -- exactly one sub-batch's worth of items
+// (not the whole original backlog) was actually sent to the (failing) server.
+func TestFlushMultiBatchFailurePreservesRemainderInOrder(t *testing.T) {
+	srv, captured := newCapturingReportServer()
+	defer srv.Close()
+	captured.fail.Store(true)
+
+	cfg := testConfig(srv.URL)
+	cfg.FlushBatchSize = 2
+	s := mustNewStore(t, cfg)
+	ctx := context.Background()
+
+	const total = 5
+	for i := 0; i < total; i++ {
+		addr := fmt.Sprintf("10.20.30.%d:1", i)
+		if _, err := s.UpsertConfirmedNode(ctx, addr, []byte{byte(i)}, storage.DiscoverySourceP2P); err != nil {
+			t.Fatalf("upsert %d: %v", i, err)
+		}
+	}
+
+	if err := s.flushOnce(ctx); err == nil {
+		t.Fatal("expected flushOnce to fail")
+	}
+
+	// Only the FIRST sub-batch (<=FlushBatchSize items) was ever attempted -- flushOnce
+	// stops at the first failure rather than trying every remaining sub-batch too.
+	if got := captured.requestCount(); got != 1 {
+		t.Fatalf("requestCount = %d, want 1 (flushOnce must stop retrying further sub-batches after the first failure)", got)
+	}
+
+	s.mu.Lock()
+	pending := append([]pendingConfirmedNode{}, s.pendingConfirmed...)
+	s.mu.Unlock()
+	if len(pending) != total {
+		t.Fatalf("pendingConfirmed after failure = %d, want %d (every unsent item must be restored)", len(pending), total)
+	}
+	for i, p := range pending {
+		want := fmt.Sprintf("10.20.30.%d:1", i)
+		if p.Address != want {
+			t.Errorf("restored pendingConfirmed[%d].Address = %q, want %q (order must be preserved)", i, p.Address, want)
+		}
+	}
+}
+
+func safeIndex(s []string, i int) string {
+	if i < 0 || i >= len(s) {
+		return "<out of range>"
+	}
+	return s[i]
 }
 
 func TestNewRequiresBaseURLAndAPIKey(t *testing.T) {
@@ -190,6 +305,13 @@ func (c *capturingReportServer) lastRequest() reportWireRequest {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.requests[len(c.requests)-1]
+}
+
+// allRequests returns a snapshot of every request captured so far, in receipt order.
+func (c *capturingReportServer) allRequests() []reportWireRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]reportWireRequest{}, c.requests...)
 }
 
 func TestFlushSendsSelfIdentityEvenWithNothingElseBuffered(t *testing.T) {
@@ -406,6 +528,138 @@ func TestLocalUpsertThenCacheRefreshUpgradesToRealID(t *testing.T) {
 	}
 	if upgraded.ID != realID {
 		t.Errorf("post-refresh upsert ID = %s, want the real ID %s", upgraded.ID, realID)
+	}
+}
+
+// TestPingFailsWhenReportChannelStaleEvenIfHealthzOK proves Fix 1: Ping must reflect the
+// report channel's own health, not just proxy the central GET /healthz call (which is an
+// unconditional 200 with no backend check at all -- see internal/api/api.go's own doc
+// comment on that route). A satellite whose last flush attempt failed, and whose last
+// success (or, if none, first attempt) is further in the past than
+// Config.ReportChannelUnhealthyThreshold, must fail Ping even though the central GET
+// /healthz itself still returns 200.
+func TestPingFailsWhenReportChannelStaleEvenIfHealthzOK(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cfg := testConfig(srv.URL)
+	cfg.ReportChannelUnhealthyThreshold = 10 * time.Millisecond
+	s := mustNewStore(t, cfg)
+	ctx := context.Background()
+
+	// Simulate a stale, never-successful report channel directly (rather than actually
+	// waiting out a real flush failure/threshold cycle).
+	s.mu.Lock()
+	s.lastFlushAttempt = time.Now().Add(-1 * time.Hour)
+	s.lastFlushErr = errRemoteStore("simulated failure")
+	s.mu.Unlock()
+
+	if err := s.Ping(ctx); err == nil {
+		t.Error("Ping = nil, want an error (report channel has been failing well past the configured threshold)")
+	}
+}
+
+// TestPingToleratesRecentReportFailureWithinGracePeriod proves Ping does NOT fail
+// immediately on a single recent flush failure -- only once it's been failing for longer
+// than Config.ReportChannelUnhealthyThreshold (a generous grace period, see
+// DefaultReportChannelUnhealthyThreshold's own doc comment).
+func TestPingToleratesRecentReportFailureWithinGracePeriod(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cfg := testConfig(srv.URL)
+	cfg.ReportChannelUnhealthyThreshold = time.Hour
+	s := mustNewStore(t, cfg)
+	ctx := context.Background()
+
+	s.mu.Lock()
+	s.lastFlushAttempt = time.Now()
+	s.lastFlushSuccess = time.Now().Add(-time.Minute)
+	s.lastFlushErr = errRemoteStore("simulated transient failure")
+	s.mu.Unlock()
+
+	if err := s.Ping(ctx); err != nil {
+		t.Errorf("Ping = %v, want nil (a single recent failure within the grace threshold must not fail Ping)", err)
+	}
+}
+
+// TestPingUnaffectedByReportChannelBeforeFirstAttempt proves a freshly-constructed Store
+// (no flush attempted yet) is judged purely on central-API reachability, never on
+// report-channel staleness it hasn't had a chance to establish yet.
+func TestPingUnaffectedByReportChannelBeforeFirstAttempt(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cfg := testConfig(srv.URL)
+	cfg.ReportChannelUnhealthyThreshold = time.Nanosecond
+	s := mustNewStore(t, cfg)
+	ctx := context.Background()
+
+	if err := s.Ping(ctx); err != nil {
+		t.Errorf("Ping = %v, want nil (no flush has been attempted yet)", err)
+	}
+}
+
+// TestFlushUpdatesHealthAndMetricsState proves flushOnce actually records
+// lastFlushAttempt/lastFlushSuccess/lastFlushErr and invokes Config.OnFlushResult (Fix 1/Fix
+// 2's underlying bookkeeping), and that PendingRecordCount/LastSuccessfulFlushAt reflect it.
+func TestFlushUpdatesHealthAndMetricsState(t *testing.T) {
+	srv, captured := newCapturingReportServer()
+	defer srv.Close()
+
+	var onFlushResults []bool
+	cfg := testConfig(srv.URL)
+	cfg.OnFlushResult = func(success bool) { onFlushResults = append(onFlushResults, success) }
+	s := mustNewStore(t, cfg)
+	ctx := context.Background()
+
+	if _, err := s.UpsertConfirmedNode(ctx, "6.6.6.6:1", []byte{0x06}, storage.DiscoverySourceP2P); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if got := s.PendingRecordCount(); got != 1 {
+		t.Fatalf("PendingRecordCount before flush = %d, want 1", got)
+	}
+
+	before := time.Now()
+	if err := s.flushOnce(ctx); err != nil {
+		t.Fatalf("flushOnce: %v", err)
+	}
+
+	if len(onFlushResults) != 1 || !onFlushResults[0] {
+		t.Fatalf("onFlushResults = %+v, want [true]", onFlushResults)
+	}
+	if got := s.PendingRecordCount(); got != 0 {
+		t.Errorf("PendingRecordCount after successful flush = %d, want 0", got)
+	}
+	if last := s.LastSuccessfulFlushAt(); last.Before(before) {
+		t.Errorf("LastSuccessfulFlushAt = %v, want a time at/after %v", last, before)
+	}
+	if captured.requestCount() != 1 {
+		t.Fatalf("requestCount = %d, want 1", captured.requestCount())
+	}
+
+	// Now a failing flush.
+	captured.fail.Store(true)
+	if _, err := s.UpsertConfirmedNode(ctx, "7.7.7.7:1", []byte{0x07}, storage.DiscoverySourceP2P); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if err := s.flushOnce(ctx); err == nil {
+		t.Fatal("expected flushOnce to fail")
+	}
+	if len(onFlushResults) != 2 || onFlushResults[1] {
+		t.Fatalf("onFlushResults = %+v, want [true false]", onFlushResults)
 	}
 }
 

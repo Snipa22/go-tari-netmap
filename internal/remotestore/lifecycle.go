@@ -51,12 +51,58 @@ func (s *Store) Run(ctx context.Context) error {
 	}
 }
 
-// Ping implements storage.Store by checking connectivity to the central API's GET /healthz
-// route -- this is what backs cmd/netmap-p2p-responder's own /healthz check (see that
-// binary's metrics.go: it calls store.Ping to decide its own liveness), so a satellite
-// correctly reports itself unhealthy when it can no longer reach the central system, not just
-// when its own process has crashed.
+// Ping implements storage.Store by checking BOTH bare central-API reachability (GET
+// /healthz) AND, more importantly, the report channel's own actual health (see this repo's
+// readiness-review follow-up, Fix 1) -- this is what backs cmd/netmap-p2p-responder's own
+// /healthz check (see that binary's metrics.go: it calls store.Ping to decide its own
+// liveness), so a satellite correctly reports itself unhealthy when it can no longer
+// actually report data, not just when the central system's bare GET /healthz (an
+// unconditional 200 with no backend check at all, see internal/api/api.go's own doc comment
+// on that route) happens to respond, and not just when its own process has crashed.
+//
+// Before Fix 1, this method ONLY proxied the central GET /healthz call -- so a satellite with
+// a wrong/rotated collector API key, a central Postgres outage, or NETMAP_COLLECTOR_KEYS
+// unset centrally reported fully healthy here while every single
+// POST /internal/collectors/report was actually failing (GET /healthz doesn't touch auth or
+// storage at all). The report-channel check below closes that gap: if the most recent flush
+// attempt failed AND it's been longer than Config.ReportChannelUnhealthyThreshold since the
+// last SUCCESSFUL flush, Ping fails on that basis alone, without even needing to make the
+// GET /healthz call.
+//
+// A satellite that has never yet attempted a flush (lastFlushAttempt is the zero time.Time --
+// e.g. immediately after startup, before the first FlushInterval tick) is NOT considered
+// unhealthy on this basis: there's nothing to judge yet, so this check is skipped entirely and
+// Ping falls through to the bare central-API reachability check below, exactly as before Fix
+// 1. Likewise, a satellite whose most recent flush attempt succeeded skips this check (nothing
+// to report), and one whose most recent attempt failed but is still within the configured
+// grace threshold ALSO falls through to the bare-reachability check below, rather than failing
+// immediately on a single blip.
 func (s *Store) Ping(ctx context.Context) error {
+	s.mu.Lock()
+	lastAttempt := s.lastFlushAttempt
+	lastSuccess := s.lastFlushSuccess
+	lastErr := s.lastFlushErr
+	s.mu.Unlock()
+
+	if lastErr != nil && !lastAttempt.IsZero() {
+		staleSince := lastSuccess
+		neverSucceeded := staleSince.IsZero()
+		if neverSucceeded {
+			// Never once succeeded -- judge staleness from the first-ever attempt instead,
+			// so a satellite that has been failing to report since the moment it started
+			// doesn't get an indefinite pass just because lastFlushSuccess is still the
+			// zero value.
+			staleSince = lastAttempt
+		}
+		threshold := s.reportChannelUnhealthyThreshold()
+		if time.Since(staleSince) > threshold {
+			if neverSucceeded {
+				return errRemoteStore("report channel unhealthy: last flush attempt failed (%v); no flush has ever succeeded (threshold %s)", lastErr, threshold)
+			}
+			return errRemoteStore("report channel unhealthy: last flush attempt failed (%v); last successful flush was %s ago (threshold %s)", lastErr, time.Since(lastSuccess).Round(time.Second), threshold)
+		}
+	}
+
 	url := strings.TrimRight(s.cfg.BaseURL, "/") + "/healthz"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
