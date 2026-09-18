@@ -455,10 +455,13 @@ func insertConfirmedNode(ctx context.Context, tx pgx.Tx, address string, publicK
 // node_addresses/peer_edge_observations/node_health/pending_submissions.promoted_node_id
 // row referencing placeholderID is repointed at confirmedID (deleting any
 // node_addresses row that would otherwise collide with confirmedID's own
-// UNIQUE(node_id, address) constraint), placeholderID's nodes row is
-// deleted, and confirmedID's last_seen is bumped. Called from within an
-// existing transaction (tx) — the caller is responsible for
-// Commit/Rollback.
+// UNIQUE(node_id, address) constraint, and any peer_edge_observations row
+// that would otherwise collide with confirmedID's own
+// idx_peer_edge_observations_report_batch_id partial unique index — see
+// 0012_report_batch_idempotency.sql — on (from_node_id, to_node_id,
+// report_batch_id)), placeholderID's nodes row is deleted, and
+// confirmedID's last_seen is bumped. Called from within an existing
+// transaction (tx) — the caller is responsible for Commit/Rollback.
 func mergeNodeInto(ctx context.Context, tx pgx.Tx, placeholderID, confirmedID uuid.UUID) error {
 	// Drop any of the placeholder's node_addresses rows that would
 	// collide with an address confirmedID already has, before
@@ -474,8 +477,49 @@ func mergeNodeInto(ctx context.Context, tx pgx.Tx, placeholderID, confirmedID uu
 	if _, err := tx.Exec(ctx, `UPDATE node_addresses SET node_id = $2 WHERE node_id = $1`, placeholderID, confirmedID); err != nil {
 		return fmt.Errorf("storage: merge: repoint node_addresses: %w", err)
 	}
+	// Drop any of the placeholder's peer_edge_observations rows (as the
+	// from_node_id side) that would collide with a row confirmedID
+	// already has for the same (to_node_id, report_batch_id) —
+	// mirroring the node_addresses dedupe above. This only ever
+	// discards a genuine duplicate of the batch-idempotency unique
+	// index (report_batch_id IS NOT NULL); rows with report_batch_id ==
+	// NULL never collide (the index is partial), so distinct historical
+	// observations without a batch id are never dropped. The dropped
+	// row carries no information the surviving row doesn't already
+	// have — same directed edge, same report batch.
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM peer_edge_observations peo
+		WHERE peo.from_node_id = $1
+		  AND peo.report_batch_id IS NOT NULL
+		  AND EXISTS (
+		      SELECT 1 FROM peer_edge_observations peo2
+		      WHERE peo2.from_node_id = $2
+		        AND peo2.to_node_id = peo.to_node_id
+		        AND peo2.report_batch_id = peo.report_batch_id
+		  )
+	`, placeholderID, confirmedID); err != nil {
+		return fmt.Errorf("storage: merge: dedupe peer_edge_observations.from_node_id: %w", err)
+	}
 	if _, err := tx.Exec(ctx, `UPDATE peer_edge_observations SET from_node_id = $2 WHERE from_node_id = $1`, placeholderID, confirmedID); err != nil {
 		return fmt.Errorf("storage: merge: repoint peer_edge_observations.from_node_id: %w", err)
+	}
+	// Same dedupe, mirrored for the to_node_id side (this is the
+	// direction that hit SQLSTATE 23505 in production — see
+	// mergenode-idempotency-bug-brief.md). Runs after the from_node_id
+	// repoint above, so it correctly sees any rows that step already
+	// repointed onto confirmedID.
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM peer_edge_observations peo
+		WHERE peo.to_node_id = $1
+		  AND peo.report_batch_id IS NOT NULL
+		  AND EXISTS (
+		      SELECT 1 FROM peer_edge_observations peo2
+		      WHERE peo2.to_node_id = $2
+		        AND peo2.from_node_id = peo.from_node_id
+		        AND peo2.report_batch_id = peo.report_batch_id
+		  )
+	`, placeholderID, confirmedID); err != nil {
+		return fmt.Errorf("storage: merge: dedupe peer_edge_observations.to_node_id: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `UPDATE peer_edge_observations SET to_node_id = $2 WHERE to_node_id = $1`, placeholderID, confirmedID); err != nil {
 		return fmt.Errorf("storage: merge: repoint peer_edge_observations.to_node_id: %w", err)
