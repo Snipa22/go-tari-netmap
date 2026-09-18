@@ -36,12 +36,22 @@
 //
 // This binary always talks to the central system over HTTP, never Postgres directly:
 //
-//	-central-api-url   / NETMAP_CENTRAL_API_URL    REQUIRED: the central system's API base URL,
+//	-central-api-url / NETMAP_CENTRAL_API_URL     REQUIRED: the central system's API base URL,
 //	                                                e.g. https://netmap.example.com/api
-//	-collector-api-key / NETMAP_COLLECTOR_API_KEY   REQUIRED: this collector's own API key (must
-//	                                                match an entry in the central system's own
-//	                                                NETMAP_COLLECTOR_KEYS)
-//	-collector-name    / NETMAP_COLLECTOR_NAME      REQUIRED: this collector's own name (e.g.
+//	NETMAP_COLLECTOR_API_KEY (env var ONLY, no flag) REQUIRED: this collector's own API key
+//	                                                (must match an entry in the central
+//	                                                system's own NETMAP_COLLECTOR_KEYS) --
+//	                                                deliberately NOT also accepted as a CLI
+//	                                                flag, unlike the other two below: a flag's
+//	                                                value is visible to any local user via
+//	                                                `ps`/`/proc/<pid>/cmdline` and lands in
+//	                                                shell history, which is exactly the
+//	                                                exposure this repo's other secrets
+//	                                                (NETMAP_DATABASE_URL, NETMAP_ADMIN_PASSWORD)
+//	                                                already avoid by being env-var-only -- see
+//	                                                this repo's readiness-review follow-up,
+//	                                                Fix 7 / finding I34.
+//	-collector-name  / NETMAP_COLLECTOR_NAME       REQUIRED: this collector's own name (e.g.
 //	                                                "sydney") -- used only for this binary's own
 //	                                                log messages, never sent over the wire (the
 //	                                                central API identifies a collector by which
@@ -49,8 +59,9 @@
 //
 // A flag, if set, takes precedence over its corresponding env var; each env var is otherwise
 // used as that flag's default, mirroring storage.DSNFromEnv's env-var convention elsewhere in
-// this repo. All three fail fast at startup if neither the flag nor the env var provides a
-// value.
+// this repo (this applies to -central-api-url/-collector-name only -- NETMAP_COLLECTOR_API_KEY
+// has no flag counterpart at all, see above). All three fail fast at startup if neither the
+// flag (where one exists) nor the env var provides a value.
 //
 // # Network flag (mainnet/testnet)
 //
@@ -107,15 +118,27 @@ func run() error {
 
 		// Remote-collector mode: this binary always talks to the central system over HTTP
 		// (internal/remotestore), never a direct Postgres connection -- see this binary's
-		// own doc comment for the full "Central API connection" section. Each flag's
-		// default is sourced from its corresponding env var, so either works and an
-		// explicit flag always wins if both are set, mirroring storage.DSNFromEnv's
+		// own doc comment for the full "Central API connection" section. -central-api-url/
+		// -collector-name each default to their corresponding env var, so either works and
+		// an explicit flag always wins if both are set, mirroring storage.DSNFromEnv's
 		// env-var convention elsewhere in this repo.
-		centralAPIURL   = flag.String("central-api-url", os.Getenv("NETMAP_CENTRAL_API_URL"), "REQUIRED (or NETMAP_CENTRAL_API_URL): the central go-tari-netmap system's API base URL, e.g. https://netmap.example.com/api")
-		collectorAPIKey = flag.String("collector-api-key", os.Getenv("NETMAP_COLLECTOR_API_KEY"), "REQUIRED (or NETMAP_COLLECTOR_API_KEY): this collector's own API key, sent as the X-Collector-Key header on every report -- must match an entry in the central system's own NETMAP_COLLECTOR_KEYS")
-		collectorName   = flag.String("collector-name", os.Getenv("NETMAP_COLLECTOR_NAME"), "REQUIRED (or NETMAP_COLLECTOR_NAME): this collector's own name (e.g. \"sydney\") -- used only for this binary's own log messages, never sent over the wire")
+		//
+		// -collector-api-key is the one exception (see this repo's readiness-review
+		// follow-up, Fix 7 / I34): the API key is deliberately NOT accepted as a plain flag
+		// default/value -- a flag's value is visible to any local user via `ps`/
+		// /proc/<pid>/cmdline and lands in shell history, unlike NETMAP_DATABASE_URL/
+		// NETMAP_ADMIN_PASSWORD elsewhere in this repo, which are env-var-only for exactly
+		// that reason. NETMAP_COLLECTOR_API_KEY (env var only) is required; there is no
+		// -collector-api-key flag at all.
+		centralAPIURL = flag.String("central-api-url", os.Getenv("NETMAP_CENTRAL_API_URL"), "REQUIRED (or NETMAP_CENTRAL_API_URL): the central go-tari-netmap system's API base URL, e.g. https://netmap.example.com/api")
+		collectorName = flag.String("collector-name", os.Getenv("NETMAP_COLLECTOR_NAME"), "REQUIRED (or NETMAP_COLLECTOR_NAME): this collector's own name (e.g. \"sydney\") -- used only for this binary's own log messages, never sent over the wire")
 	)
 	flag.Parse()
+
+	// collectorAPIKey is intentionally env-var-ONLY (see the flag block's own doc comment
+	// above for why): NETMAP_COLLECTOR_API_KEY, sent as the X-Collector-Key header on every
+	// report -- must match an entry in the central system's own NETMAP_COLLECTOR_KEYS.
+	collectorAPIKey := os.Getenv("NETMAP_COLLECTOR_API_KEY")
 
 	metrics, err := newResponderMetrics(*network)
 	if err != nil {
@@ -135,8 +158,8 @@ func run() error {
 	if *centralAPIURL == "" {
 		return fmt.Errorf("-central-api-url (or NETMAP_CENTRAL_API_URL) is required")
 	}
-	if *collectorAPIKey == "" {
-		return fmt.Errorf("-collector-api-key (or NETMAP_COLLECTOR_API_KEY) is required")
+	if collectorAPIKey == "" {
+		return fmt.Errorf("NETMAP_COLLECTOR_API_KEY is required (env-var only, deliberately no -collector-api-key flag -- see this repo's readiness-review follow-up, Fix 7: a flag value is visible via ps/shell history)")
 	}
 	if *collectorName == "" {
 		return fmt.Errorf("-collector-name (or NETMAP_COLLECTOR_NAME) is required")
@@ -156,11 +179,31 @@ func run() error {
 	// internal/remotestore, which talks to the central system's HTTP API -- this binary
 	// never opens a direct Postgres connection, and never calls store.Migrate (schema
 	// migrations are the central system's responsibility alone).
-	store, err := remotestore.New(remotestore.Config{
+	//
+	// onFlushResult (Fix 2, see this repo's readiness-review follow-up) wraps
+	// metrics.onReportFlushResult (the counter-only half) with a poll of the *remotestore.
+	// Store's own PendingRecordCount/LastSuccessfulFlushAt for the two gauges -- captured by
+	// reference (var store *remotestore.Store, assigned below) since remotestore.New (which
+	// needs this callback already built) necessarily runs BEFORE it returns the very Store
+	// this callback needs to poll; by the time this callback is actually invoked (from
+	// flushOnce, only after Run starts), store is always already assigned.
+	var store *remotestore.Store
+	onFlushResult := func(success bool) {
+		metrics.onReportFlushResult(success)
+		if store == nil {
+			return
+		}
+		metrics.reportPendingRecords.Set(float64(store.PendingRecordCount()))
+		if last := store.LastSuccessfulFlushAt(); !last.IsZero() {
+			metrics.reportLastSuccessTimestamp.Set(float64(last.Unix()))
+		}
+	}
+	store, err = remotestore.New(remotestore.Config{
 		BaseURL:       *centralAPIURL,
-		APIKey:        *collectorAPIKey,
+		APIKey:        collectorAPIKey,
 		CollectorName: *collectorName,
 		SelfAddresses: selfAddresses,
+		OnFlushResult: onFlushResult,
 	})
 	if err != nil {
 		return fmt.Errorf("configuring remote store: %w", err)
@@ -180,7 +223,7 @@ func run() error {
 	// binary runs, wired against the exact same remote store above -- mirroring
 	// cmd/netmap/main.go's own collector wiring, minus anything Postgres-specific (there is
 	// none left to remove beyond storage.New/store.Migrate, already absent above).
-	activeScanner := newActiveScanner(store)
+	activeScanner := newActiveScanner(store, metrics)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()

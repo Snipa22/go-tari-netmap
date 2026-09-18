@@ -137,11 +137,11 @@ func (r *dbBackedResponder) onPeerIdentity(remoteAddr net.Addr, peerStaticKey []
 
 	node, err := r.store.UpsertConfirmedNode(ctx, claimed[0], peerStaticKey, storage.DiscoverySourceP2P)
 	if err != nil {
-		r.metrics.dbWriteResult.WithLabelValues(dbOperationUpsertNode, resultLabel(false)).Inc()
+		r.metrics.bufferAppendResult.WithLabelValues(bufferOperationUpsertNode, resultLabel(false)).Inc()
 		r.logf("netmap-p2p-responder: UpsertConfirmedNode(pubkey=%x) failed: %v", peerStaticKey, err)
 		return
 	}
-	r.metrics.dbWriteResult.WithLabelValues(dbOperationUpsertNode, resultLabel(true)).Inc()
+	r.metrics.bufferAppendResult.WithLabelValues(bufferOperationUpsertNode, resultLabel(true)).Inc()
 
 	// claimed is guaranteed non-empty here (the len(claimed) == 0 early-return above), so
 	// claimed[1:] is always safe: every entry after the first (already consumed by the
@@ -149,11 +149,11 @@ func (r *dbBackedResponder) onPeerIdentity(remoteAddr net.Addr, peerStaticKey []
 	// UpsertConfirmedNode call.
 	for _, addr := range claimed[1:] {
 		if _, err := r.store.UpsertConfirmedNode(ctx, addr, peerStaticKey, storage.DiscoverySourceP2P); err != nil {
-			r.metrics.dbWriteResult.WithLabelValues(dbOperationUpsertNode, resultLabel(false)).Inc()
+			r.metrics.bufferAppendResult.WithLabelValues(bufferOperationUpsertNode, resultLabel(false)).Inc()
 			r.logf("netmap-p2p-responder: UpsertConfirmedNode(%s, self-claimed address) failed: %v", addr, err)
 			continue
 		}
-		r.metrics.dbWriteResult.WithLabelValues(dbOperationUpsertNode, resultLabel(true)).Inc()
+		r.metrics.bufferAppendResult.WithLabelValues(bufferOperationUpsertNode, resultLabel(true)).Inc()
 	}
 
 	var version *string
@@ -178,11 +178,11 @@ func (r *dbBackedResponder) onPeerIdentity(remoteAddr net.Addr, peerStaticKey []
 		Version:               version,
 		PeerIdentityUpdatedAt: peerIdentityUpdatedAt,
 	}); err != nil {
-		r.metrics.dbWriteResult.WithLabelValues(dbOperationRecordHealth, resultLabel(false)).Inc()
+		r.metrics.bufferAppendResult.WithLabelValues(bufferOperationRecordHealth, resultLabel(false)).Inc()
 		r.logf("netmap-p2p-responder: RecordHealthCheck(%s) failed: %v", node.ID, err)
 		return
 	}
-	r.metrics.dbWriteResult.WithLabelValues(dbOperationRecordHealth, resultLabel(true)).Inc()
+	r.metrics.bufferAppendResult.WithLabelValues(bufferOperationRecordHealth, resultLabel(true)).Inc()
 }
 
 // isClaimedAddressAllowed reports whether a peer-self-claimed "host:port" address (as decoded
@@ -216,9 +216,41 @@ func isClaimedAddressAllowed(hostPort string) bool {
 }
 
 // peerListProvider implements ResponderConfig.PeerListProvider: it serves REAL confirmed-good
-// peers from storage — exactly BRIEF3.md's governing requirement ("we want to let the
-// communication happen long enough that we can give them a list of known good peers") — rather
-// than a static/in-memory list.
+// peers from storage — the same underlying "known good peers" goal BRIEF3.md's original
+// governing requirement described ("we want to let the communication happen long enough that
+// we can give them a list of known good peers") — rather than a static/in-memory list.
+//
+// IMPORTANT (documentation-drift fix, see this repo's readiness-review follow-up): the DB
+// query below is storage.NodeFilter{Confirmed: true, ReachableSince: now-1h}, unchanged from
+// BRIEF3's original "all confirmed nodes reachable within the last hour" wording — but against
+// a remote-collector satellite's ACTUAL storage.Store (internal/remotestore), ReachableSince
+// does NOT mean what it means against the central Postgres-backed store. See
+// internal/remotestore/reads.go's matchesFilterLocked: a cache-derived tracked node (learned
+// via this satellite's periodic GET /nodes/seed_list refresh) is treated as satisfying ANY
+// ReachableSince filter unconditionally, while a purely locally-tracked node (confirmed by
+// this satellite's own peer walk/handshake, never yet reflected in a seed_list refresh) never
+// satisfies one at all (this store keeps no local health-check timeline to check against). So
+// in practice, on a remote-collector satellite, the population actually served here is:
+//
+//   - every node the central system already serves via GET /nodes/seed_list — i.e. opted-in
+//     (discovery_source IN ('registry_submitted', 'both')) AND recently reachable per the
+//     CENTRAL system's own storage.DefaultSeedHealthWindow (3h, not 1h), refreshed on this
+//     satellite's own CacheRefreshInterval cadence (default 60s, so up to that much
+//     additionally stale on top of the central window) — NOT "reachable within the last hour"
+//     against this satellite's own local view; and
+//   - a purely locally-confirmed node this satellite itself has handshaked with is NEVER
+//     included here, no matter how recently, until a later seed_list refresh reflects it back
+//     (if it ever does — this satellite's own on-the-wire confirmed_nodes reports are, per the
+//     Fix 6(a) trust-boundary fix, always applied centrally as discovery_source =
+//     p2p_discovered, which never qualifies for GET /nodes/seed_list's opted-in gate on its
+//     own).
+//
+// This is a REAL, intentional behavior change from BRIEF3's original 1h/"every confirmed node"
+// requirement (confirmed as intentional, given the Alex-approved satellite design — every
+// satellite geographically shares the exact same central "known-good" population rather than
+// each independently observing a locally-different subset), not merely a doc-drift bug — this
+// comment exists so a future reader isn't misled by the 1h constant/Confirmed-only filter
+// below into thinking that's still an accurate description of what gets served.
 //
 // The DB query (storage.NodeFilter{Confirmed: true, ReachableSince: now-1h}) is the SOURCE list;
 // go-tari-lib/rpc.ServeGetPeers still independently enforces the requesting peer's own N/

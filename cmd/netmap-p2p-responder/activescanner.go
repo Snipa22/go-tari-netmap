@@ -19,11 +19,16 @@ import (
 // main.go), mirrored here minus anything Postgres-specific (there is none left to remove:
 // store is passed in fully constructed, and this function never touches migrations).
 //
+// metrics' OnPollResult (see this repo's readiness-review follow-up, Fix 2 / findings
+// I17/I28) is wired here, mirroring cmd/netmap/main.go's identical `c.OnPollResult =
+// metrics.onPollResult` -- before this fix, this binary's active-scanner role emitted zero
+// metrics of its own, unlike cmd/netmap's Collector.
+//
 // Every env var below is named identically to cmd/netmap/main.go's own equivalent, so a single
 // shared deployment config convention applies across both binaries -- see each var's own
 // comment in cmd/netmap/main.go for the full rationale behind each; this function only
 // reproduces the wiring, not the reasoning already documented there.
-func newActiveScanner(store storage.Store) *collector.Collector {
+func newActiveScanner(store storage.Store, metrics *responderMetrics) *collector.Collector {
 	ownedGRPCAddresses := parseOwnedGRPCAddresses(os.Getenv("NETMAP_OWNED_GRPC_ADDRESSES"))
 	grpcClient := collector.NewGRPCClientWithAddressMap(ownedGRPCAddresses)
 
@@ -47,6 +52,7 @@ func newActiveScanner(store storage.Store) *collector.Collector {
 	c.Storage = store
 	c.GRPCClient = grpcClient
 	c.P2PClient = p2pClient
+	c.OnPollResult = metrics.onPollResult
 	return c
 }
 
