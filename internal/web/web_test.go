@@ -258,6 +258,37 @@ func TestDashboardTopPeeredIdentityIsLink(t *testing.T) {
 	}
 }
 
+// TestDashboardTopPeeredExcludesCollectorRoleTaggedNode asserts a role=collector-tagged node
+// (see api.IsCollectorRole) is excluded from the dashboard's top-peered panel, mirroring GET
+// /topology/top-peered's own exclusion (internal/api/collector_report_test.go's
+// TestSeedsAndTopologyExcludeCollectorRoleTaggedNode covers that API route; this is the
+// internal/web-side gap that fix closed, per the readiness-review follow-up's Fix 8).
+func TestDashboardTopPeeredExcludesCollectorRoleTaggedNode(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	hub, err := store.UpsertDiscoveredNode(ctx, "hub-collector-filter:1", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert hub: %v", err)
+	}
+	collectorPeer, err := store.UpsertDiscoveredNode(ctx, "collector-peer:1", storage.DiscoverySourceP2P, map[string]any{"role": "collector"}, nil)
+	if err != nil {
+		t.Fatalf("upsert collector-tagged peer: %v", err)
+	}
+	if err := store.RecordPeerEdgeObservation(ctx, hub.ID, collectorPeer.ID); err != nil {
+		t.Fatalf("record edge observation: %v", err)
+	}
+
+	srv := newTestServer(t, store)
+	status, body := getBody(t, srv.URL+"/")
+	if status != http.StatusOK {
+		t.Fatalf("GET / status = %d, want %d", status, http.StatusOK)
+	}
+	if strings.Contains(body, fmt.Sprintf(`href="/nodes/%s"`, collectorPeer.ID)) {
+		t.Errorf("GET / body unexpectedly includes top-peered link for role=collector node %s", collectorPeer.ID)
+	}
+}
+
 // TestDashboardTopPeeredOnionClearnetCounts asserts the dashboard's "top
 // peered" panel renders the new "Onion peers"/"Clearnet peers" column
 // headers and the hub row's correct per-node counts, for a hub whose
