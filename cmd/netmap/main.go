@@ -206,9 +206,21 @@ func main() {
 		log.Fatalf("failed to build web handler: %v", err)
 	}
 
+	// NETMAP_COLLECTOR_KEYS configures the trusted remote-collector-satellite ingestion
+	// channel's auth (POST /internal/collectors/report, see internal/api/collector_report.go
+	// and internal/api/collector_auth.go): comma-separated "collector_name:api_key" pairs,
+	// e.g. "sydney:key1,london:key2". Empty/unset (the default) leaves the map empty, which
+	// api.NewRouter's wrapCollectorAuth treats as fail-closed (503 on every request to that
+	// route) — mirroring adminCreds' own fail-closed convention above — never "accept
+	// anything" just because this wasn't configured.
+	collectorKeys := parseCollectorKeys(os.Getenv("NETMAP_COLLECTOR_KEYS"))
+	if len(collectorKeys) == 0 {
+		log.Printf("NETMAP_COLLECTOR_KEYS not configured — POST /internal/collectors/report is disabled (503)")
+	}
+
 	mux := http.NewServeMux()
 	mux.Handle("/", webHandler)
-	mux.Handle("/api/", http.StripPrefix("/api", api.NewRouter(store, grpcClient, p2pClient, adminCreds, *statsCacheTTL)))
+	mux.Handle("/api/", http.StripPrefix("/api", api.NewRouter(store, grpcClient, p2pClient, adminCreds, collectorKeys, *statsCacheTTL)))
 
 	// instrumentHTTP wraps the whole dashboard+API mux above with httpRequestsTotal/
 	// httpRequestDuration -- see metrics.go's doc comment. This mux is served on *addr (the
@@ -311,6 +323,39 @@ func parseOwnedGRPCAddresses(raw string) map[string]string {
 			continue
 		}
 		out[p2pAddr] = grpcAddr
+	}
+	return out
+}
+
+// parseCollectorKeys parses NETMAP_COLLECTOR_KEYS' raw value: a comma-separated list of
+// "collector_name:api_key" pairs (see collectorKeys' construction site above), mirroring
+// parseOwnedGRPCAddresses' style -- trim whitespace, skip empty entries. Each entry is split
+// on the FIRST ":" via strings.Cut, since a collector name is expected to be a short, simple
+// identifier (e.g. a city name) that never itself contains ":". An empty/unset raw value
+// returns a nil (empty) map, which api.NewRouter's wrapCollectorAuth treats as the
+// "ingestion channel not configured, fail closed" case (see its doc comment) -- distinct from
+// a populated-but-mismatched-key map. A malformed entry (no ":", or an empty name/key after
+// trimming) is logged and skipped rather than failing the whole binary at startup, matching
+// parseOwnedGRPCAddresses' "one typo shouldn't take down every other correctly-configured
+// entry" convention.
+func parseCollectorKeys(raw string) map[string]string {
+	if raw == "" {
+		return nil
+	}
+	out := make(map[string]string)
+	for _, pair := range strings.Split(raw, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		name, key, ok := strings.Cut(pair, ":")
+		name = strings.TrimSpace(name)
+		key = strings.TrimSpace(key)
+		if !ok || name == "" || key == "" {
+			log.Printf("netmap: skipping malformed NETMAP_COLLECTOR_KEYS entry %q (want \"collector_name:api_key\")", pair)
+			continue
+		}
+		out[name] = key
 	}
 	return out
 }

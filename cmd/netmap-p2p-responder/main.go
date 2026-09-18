@@ -1,26 +1,56 @@
-// Command netmap-p2p-responder is a real, Postgres-backed inbound Tari P2P responder: it
-// accepts real Tari peer connections (Noise_XX handshake + identity exchange, advertising
-// COMMUNICATION_NODE features + real addresses, see go-tari-lib/p2p's Serve/ResponderConfig)
-// and serves get_peers over `t/dht/1` with a REAL list of confirmed-good peers pulled from
-// go-tari-netmap's own storage.Store — never a static/in-memory list.
+// Command netmap-p2p-responder is a remote collector satellite: it does BOTH of
+// go-tari-netmap's collector roles -- the passive inbound Tari P2P responder (Noise_XX
+// handshake + identity exchange, advertising COMMUNICATION_NODE features + real addresses,
+// see go-tari-lib/p2p's Serve/ResponderConfig, and serving get_peers over `t/dht/1`) AND the
+// active peer-graph-walking/health-checking scanner (internal/collector's Collector, the same
+// logic cmd/netmap's own binary runs) -- against a REMOTE storage.Store implementation
+// (internal/remotestore) that talks to the central go-tari-netmap system over its HTTP API
+// instead of ever holding a direct Postgres connection of its own. See this repo's governing
+// remote-collector-satellite brief: ALL deployments of this binary, including previously
+// on-LAN ones, use this remote-API-backed mode now -- no deployment of this binary holds a
+// direct Postgres connection anymore; only the central cmd/netmap process does.
 //
-// This supersedes go-tari-lib's throwaway cmd/p2p-responder-spike/main.go (see BRIEF3.md):
-// that binary stored everything in a plain in-memory map, so nothing survived a restart and
-// nothing was queryable. This binary moves that entrypoint logic here, into go-tari-netmap's
-// own cmd/, since this is where the real storage.Store/Postgres dependency naturally lives —
-// go-tari-lib is a pure protocol library and has (deliberately) zero storage dependency of its
-// own; see BRIEF3.md's "Option A (probably cleaner)" for the full reasoning this binary follows.
+// This binary itself was originally introduced to supersede go-tari-lib's throwaway
+// cmd/p2p-responder-spike/main.go (see BRIEF3.md): that binary stored everything in a plain
+// in-memory map, so nothing survived a restart and nothing was queryable. It has since moved
+// off a direct Postgres connection entirely (see internal/remotestore) in favor of reporting
+// everything to the central system's HTTP API.
 //
 // # Advertised addresses
 //
 // A COMMUNICATION_NODE peer that advertises ZERO addresses is exactly the case a real Tari
 // node's `comms/dht/src/peer_validator.rs` PeerHasNoAddresses/PeerHasNoUsableAddresses checks
-// reject — so, mirroring the spike binary this replaces, this binary REQUIRES at least one
-// advertised address via two optional CLI flags (at least one of which must be set, or this
-// binary fails fast at startup rather than silently running unreachable):
+// reject -- so this binary REQUIRES at least one advertised address via two optional CLI
+// flags (at least one of which must be set, or this binary fails fast at startup rather than
+// silently running unreachable):
 //
 //	-public-tcp-addr /ip4/<public-ip>/tcp/<port>   e.g. -public-tcp-addr /ip4/203.0.113.7/tcp/18189
 //	-onion3-addr     /onion3/<addr>:<port>          e.g. -onion3-addr /onion3/abc...xyz:18189
+//
+// These same two addresses (converted to this repo's plain "host:port" storage convention,
+// see selfAdvertisedAddresses) are also this collector's own self_identity, reported on every
+// flush to the central API so it can tag the matching node row(s) tags.role = "collector" --
+// see internal/remotestore's doc comment and internal/api/collector_report.go.
+//
+// # Central API connection (remote-collector mode)
+//
+// This binary always talks to the central system over HTTP, never Postgres directly:
+//
+//	-central-api-url   / NETMAP_CENTRAL_API_URL    REQUIRED: the central system's API base URL,
+//	                                                e.g. https://netmap.example.com/api
+//	-collector-api-key / NETMAP_COLLECTOR_API_KEY   REQUIRED: this collector's own API key (must
+//	                                                match an entry in the central system's own
+//	                                                NETMAP_COLLECTOR_KEYS)
+//	-collector-name    / NETMAP_COLLECTOR_NAME      REQUIRED: this collector's own name (e.g.
+//	                                                "sydney") -- used only for this binary's own
+//	                                                log messages, never sent over the wire (the
+//	                                                central API identifies a collector by which
+//	                                                configured key matched, not by a name field)
+//
+// A flag, if set, takes precedence over its corresponding env var; each env var is otherwise
+// used as that flag's default, mirroring storage.DSNFromEnv's env-var convention elsewhere in
+// this repo. All three fail fast at startup if neither the flag nor the env var provides a
+// value.
 //
 // # Network flag (mainnet/testnet)
 //
@@ -53,7 +83,7 @@ import (
 
 	"github.com/Snipa22/go-tari-lib/p2p"
 
-	"github.com/Snipa22/go-tari-netmap/internal/storage"
+	"github.com/Snipa22/go-tari-netmap/internal/remotestore"
 )
 
 func main() {
@@ -74,6 +104,16 @@ func run() error {
 		network = flag.String("network", "", "REQUIRED, no default: which Tari network this deployment monitors -- \"mainnet\" or \"testnet\". "+
 			"Both networks' deployments of this exact same binary get scraped into one shared Prometheus backend, so every metric name this binary exposes is prefixed netmap_<network>_p2p_responder_... "+
 			"(e.g. netmap_mainnet_p2p_responder_connections_accepted_total on the mainnet deployment). Fails fast at startup if unset or not exactly one of these two values.")
+
+		// Remote-collector mode: this binary always talks to the central system over HTTP
+		// (internal/remotestore), never a direct Postgres connection -- see this binary's
+		// own doc comment for the full "Central API connection" section. Each flag's
+		// default is sourced from its corresponding env var, so either works and an
+		// explicit flag always wins if both are set, mirroring storage.DSNFromEnv's
+		// env-var convention elsewhere in this repo.
+		centralAPIURL   = flag.String("central-api-url", os.Getenv("NETMAP_CENTRAL_API_URL"), "REQUIRED (or NETMAP_CENTRAL_API_URL): the central go-tari-netmap system's API base URL, e.g. https://netmap.example.com/api")
+		collectorAPIKey = flag.String("collector-api-key", os.Getenv("NETMAP_COLLECTOR_API_KEY"), "REQUIRED (or NETMAP_COLLECTOR_API_KEY): this collector's own API key, sent as the X-Collector-Key header on every report -- must match an entry in the central system's own NETMAP_COLLECTOR_KEYS")
+		collectorName   = flag.String("collector-name", os.Getenv("NETMAP_COLLECTOR_NAME"), "REQUIRED (or NETMAP_COLLECTOR_NAME): this collector's own name (e.g. \"sydney\") -- used only for this binary's own log messages, never sent over the wire")
 	)
 	flag.Parse()
 
@@ -87,6 +127,21 @@ func run() error {
 		return err
 	}
 
+	selfAddresses, err := selfAdvertisedAddresses(*publicTCPAddr, *onion3Addr)
+	if err != nil {
+		return err
+	}
+
+	if *centralAPIURL == "" {
+		return fmt.Errorf("-central-api-url (or NETMAP_CENTRAL_API_URL) is required")
+	}
+	if *collectorAPIKey == "" {
+		return fmt.Errorf("-collector-api-key (or NETMAP_COLLECTOR_API_KEY) is required")
+	}
+	if *collectorName == "" {
+		return fmt.Errorf("-collector-name (or NETMAP_COLLECTOR_NAME) is required")
+	}
+
 	staticKeypair, err := loadOrGenerateKeypair(*keyPath)
 	if err != nil {
 		return fmt.Errorf("setting up static keypair: %w", err)
@@ -97,19 +152,42 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Wire the DSN exactly the way cmd/netmap/main.go does: storage.DSNFromEnv()
-	// (NETMAP_DATABASE_URL), never a hardcoded connection string or a different env var.
-	dsn := storage.DSNFromEnv()
-	store, err := storage.New(ctx, dsn)
+	// Remote-collector mode (see this binary's own doc comment): storage.Store is backed by
+	// internal/remotestore, which talks to the central system's HTTP API -- this binary
+	// never opens a direct Postgres connection, and never calls store.Migrate (schema
+	// migrations are the central system's responsibility alone).
+	store, err := remotestore.New(remotestore.Config{
+		BaseURL:       *centralAPIURL,
+		APIKey:        *collectorAPIKey,
+		CollectorName: *collectorName,
+		SelfAddresses: selfAddresses,
+	})
 	if err != nil {
-		return fmt.Errorf("connecting to storage: %w", err)
+		return fmt.Errorf("configuring remote store: %w", err)
 	}
 	defer store.Close()
 
-	// Safe to run against a fresh or partially-migrated DB, exactly like cmd/netmap/main.go.
-	if err := store.Migrate(ctx); err != nil {
-		return fmt.Errorf("running migrations: %w", err)
-	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := store.Run(ctx); err != nil {
+			log.Printf("main: remote store run error: %v", err)
+		}
+	}()
+
+	// Active-scanner role: the same internal/collector.Collector logic cmd/netmap's own
+	// binary runs, wired against the exact same remote store above -- mirroring
+	// cmd/netmap/main.go's own collector wiring, minus anything Postgres-specific (there is
+	// none left to remove beyond storage.New/store.Migrate, already absent above).
+	activeScanner := newActiveScanner(store)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := activeScanner.Run(ctx); err != nil {
+			log.Printf("main: active scanner run error: %v", err)
+		}
+	}()
 
 	listener, err := net.Listen("tcp", *addr)
 	if err != nil {
@@ -181,6 +259,7 @@ func run() error {
 	}
 	log.Printf("main: responder loop exited cleanly")
 	metricsWG.Wait()
+	wg.Wait()
 	return nil
 }
 
