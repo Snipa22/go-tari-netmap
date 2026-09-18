@@ -124,7 +124,32 @@ type Config struct {
 	// Logf is used for this store's own operational log messages (flush/refresh failures,
 	// etc.). Defaults to log.Printf when nil.
 	Logf func(format string, args ...any)
+
+	// ReportChannelUnhealthyThreshold bounds how long Ping is willing to tolerate the report
+	// channel (POST /internal/collectors/report) having failed before Ping itself starts
+	// failing -- see this repo's readiness-review follow-up, Fix 1, and Ping's own doc
+	// comment for the full rationale. Defaults to DefaultReportChannelUnhealthyThreshold
+	// when <= 0.
+	ReportChannelUnhealthyThreshold time.Duration
+
+	// OnFlushResult, if non-nil, is called once per actual POST /internal/collectors/report
+	// HTTP attempt (i.e. once per sub-batch -- see flush.go's flushOnce/splitBatch), success
+	// or failure -- lets a caller (see cmd/netmap-p2p-responder/metrics.go) wire this
+	// store's report-flush outcomes into its own Prometheus metrics, mirroring
+	// collector.Collector.OnPollResult's existing callback convention elsewhere in this
+	// repo. See this repo's readiness-review follow-up, Fix 2, for why this exists: before
+	// it, the satellite's report channel had zero observability of its own.
+	OnFlushResult func(success bool)
 }
+
+// DefaultReportChannelUnhealthyThreshold is Config.ReportChannelUnhealthyThreshold's default
+// when unset/<= 0 -- see Ping's own doc comment for the full rationale. Five times
+// DefaultFlushInterval (5 minutes, given DefaultFlushInterval's own 60s default) gives
+// several missed flush cycles' worth of grace before Ping actually starts failing, so a
+// single transient blip doesn't flip the satellite's own /healthz red, while a genuinely
+// broken report channel (wrong/rotated API key, central outage, NETMAP_COLLECTOR_KEYS unset
+// centrally) is caught well within any reasonable alerting window.
+const DefaultReportChannelUnhealthyThreshold = 5 * DefaultFlushInterval
 
 // trackedNode is one node this Store knows about, either because it was learned via a GET
 // /nodes/seed_list refresh (cacheDerived == true, id is the real central-authoritative ID) or
@@ -160,6 +185,18 @@ type Store struct {
 	// combined pending-buffer size crosses FlushBatchSize, so Run's select loop flushes
 	// immediately rather than waiting for the next FlushInterval tick.
 	flushTrigger chan struct{}
+
+	// lastFlushAttempt/lastFlushSuccess/lastFlushErr track the report channel's own health
+	// (see this repo's readiness-review follow-up, Fix 1) -- updated by flushOnce after
+	// every actual POST /internal/collectors/report attempt (one update per sub-batch, see
+	// splitBatch), consulted by Ping to decide whether the report channel itself (as
+	// distinct from bare central-API reachability, which the existing GET /healthz proxy
+	// check below still covers) has been failing for too long. lastFlushAttempt/
+	// lastFlushSuccess are both the zero time.Time until the first attempt/success
+	// respectively.
+	lastFlushAttempt time.Time
+	lastFlushSuccess time.Time
+	lastFlushErr     error
 }
 
 // New validates cfg and returns a new Store. It does not itself start any background
@@ -211,8 +248,48 @@ func (s *Store) flushBatchSize() int {
 	return DefaultFlushBatchSize
 }
 
+func (s *Store) reportChannelUnhealthyThreshold() time.Duration {
+	if s.cfg.ReportChannelUnhealthyThreshold > 0 {
+		return s.cfg.ReportChannelUnhealthyThreshold
+	}
+	return DefaultReportChannelUnhealthyThreshold
+}
+
 func (s *Store) logf(format string, args ...any) {
 	s.cfg.Logf(format, args...)
+}
+
+// PendingRecordCount returns the current combined size of every pending-write buffer
+// (confirmed nodes + discovered nodes + health checks + peer edges) -- the exact same "total"
+// maybeSignalFlushLocked (writes.go) compares against FlushBatchSize. Exposed for a caller's
+// own Prometheus pending-records gauge (see this repo's readiness-review follow-up, Fix 2 --
+// cmd/netmap-p2p-responder/metrics.go polls this after every flush attempt).
+func (s *Store) PendingRecordCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.pendingConfirmed) + len(s.pendingDiscovered) + len(s.pendingHealth) + len(s.pendingEdges)
+}
+
+// LastSuccessfulFlushAt returns the time of this Store's most recent successful
+// POST /internal/collectors/report attempt (one specific sub-batch, not necessarily "every
+// buffer fully drained" -- see flushOnce/splitBatch), or the zero time.Time if none has ever
+// succeeded. Exposed for a caller's own Prometheus last-successful-flush-timestamp gauge (Fix
+// 2) and consulted by Ping (Fix 1).
+func (s *Store) LastSuccessfulFlushAt() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastFlushSuccess
+}
+
+// onFlushResultLocked records a single flush attempt's outcome and invokes
+// Config.OnFlushResult, if configured. Callers must hold s.mu.
+func (s *Store) recordFlushResultLocked(err error) {
+	now := time.Now()
+	s.lastFlushAttempt = now
+	s.lastFlushErr = err
+	if err == nil {
+		s.lastFlushSuccess = now
+	}
 }
 
 // var _ storage.Store = (*Store)(nil) is a compile-time assertion that *Store implements
