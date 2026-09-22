@@ -27,8 +27,14 @@
       <code>GET /api/nodes</code>'s existing privacy contract; this page
       exposes no address beyond what that endpoint already publishes for
       these same nodes, just projected as an approximate city-level
-      lat/lon instead of a raw IP). This is a feasibility spike: no
-      marker clustering, no filtering UI, no historical view.
+      lat/lon instead of a raw IP) — plus a second, hollow-circle-marker
+      population of approximate, unverified anonymous node clusters,
+      aggregated by city, from <code>GET /api/nodes/map/extended</code>.
+      Anonymous markers show only a rough city location, an approximate
+      node count, and the most recent observation time — never a
+      per-node address, and never shown for a city that already has a
+      registered node. This is a feasibility spike: no marker
+      clustering beyond that, no filtering UI, no historical view.
     </p>
 
     <div id="map-status" class="empty-note"></div>
@@ -46,12 +52,13 @@
 
       var statusEl = document.getElementById('map-status');
 
-      // popupHTML builds a marker's popup content from one GET
-      // /api/nodes/map entry: label (if set) / node id fallback, city,
-      // country, and an onion-capable badge if has_onion. Built with
-      // plain string concatenation + a minimal escape helper rather
-      // than any templating dependency, matching this codebase's
-      // "vanilla JS, no framework" convention (see topology.html.tmpl).
+      // popupHTML builds an attributed marker's popup content from one
+      // GET /api/nodes/map/extended `attributed` entry: label (if set)
+      // or node id fallback, city, country, and an onion-capable badge
+      // if has_onion. Built with plain string concatenation + a
+      // minimal escape helper rather than any templating dependency,
+      // matching this codebase's "vanilla JS, no framework" convention
+      // (see topology.html.tmpl).
       function escapeHTML(s) {
         var div = document.createElement('div');
         div.appendChild(document.createTextNode(s));
@@ -71,27 +78,54 @@
         return html;
       }
 
+      // anonymousPopupHTML builds an anonymous cluster marker's popup
+      // content -- deliberately AGGREGATE-ONLY (no per-node link, no
+      // "verified"/"wallet" language at all, matching BRIEF.md's ask):
+      // "~N unregistered nodes near {city}, {country} — last observed
+      // {last_observed_at}".
+      function anonymousPopupHTML(c) {
+        var location = [c.city, c.country].filter(Boolean).map(escapeHTML).join(', ');
+        var lastObserved = escapeHTML(new Date(c.last_observed_at).toLocaleString());
+        return '~' + c.approx_node_count + ' unregistered nodes near ' + location + ' — last observed ' + lastObserved;
+      }
+
       statusEl.textContent = 'Loading nodes\u2026';
 
-      fetch('/api/nodes/map')
+      fetch('/api/nodes/map/extended')
         .then(function (resp) {
           if (!resp.ok) {
-            throw new Error('GET /api/nodes/map: ' + resp.status);
+            throw new Error('GET /api/nodes/map/extended: ' + resp.status);
           }
           return resp.json();
         })
-        .then(function (nodes) {
-          nodes = nodes || [];
+        .then(function (data) {
+          var attributed = (data && data.attributed) || [];
+          var anonymous = (data && data.anonymous) || [];
 
-          if (nodes.length === 0) {
-            statusEl.textContent = 'No owner-tagged, IPv4-capable nodes with a resolved location yet.';
+          if (attributed.length === 0 && anonymous.length === 0) {
+            statusEl.textContent = 'No mapped nodes yet.';
             return;
           }
 
-          nodes.forEach(function (n) {
+          attributed.forEach(function (n) {
             L.marker([n.latitude, n.longitude])
               .addTo(map)
               .bindPopup(popupHTML(n));
+          });
+
+          // Anonymous clusters: a visually distinct marker (a muted,
+          // hollow circle) rather than the default pin -- no new
+          // external icon dependency, per BRIEF.md.
+          anonymous.forEach(function (c) {
+            L.circleMarker([c.latitude, c.longitude], {
+              radius: 8,
+              color: '#93a0b3',
+              weight: 2,
+              fillColor: '#93a0b3',
+              fillOpacity: 0.25,
+            })
+              .addTo(map)
+              .bindPopup(anonymousPopupHTML(c));
           });
 
           statusEl.textContent = '';
@@ -99,6 +133,7 @@
         .catch(function (err) {
           statusEl.textContent = 'Failed to load map nodes: ' + err;
         });
+
     })();
   </script>
 </body>

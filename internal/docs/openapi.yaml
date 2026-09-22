@@ -424,6 +424,39 @@ paths:
               schema:
                 $ref: "#/components/schemas/ApiError"
 
+  /api/nodes/map/extended:
+    get:
+      operationId: getNodesMapExtended
+      tags: [nodes]
+      summary: GET /nodes/map, extended with aggregate, city-level anonymous markers
+      description: >-
+        Additive extension of `GET /api/nodes/map` (that route is unchanged). Returns
+        the exact same `attributed` population/shape as `GET /api/nodes/map`, plus a
+        second `anonymous` array: city-level clusters of the non-owner-tagged node
+        population that has a resolvable IPv4 and a cached geoip lookup, excluding any
+        node tagged `role=collector`. A cluster is dropped entirely if its exact
+        (city, country) already has an attributed marker. Each `AnonymousCluster` is
+        STRICTLY aggregate-only — no node ID, label, address, or wallet-availability
+        signal is ever included, only city/country/a representative lat/lon/an
+        approximate node count/the most recent observation time. Not treated as
+        verified or reliably online — no reachability/uptime gate is applied beyond
+        "has a resolvable IPv4 + geoip entry". Does not affect `GET /v1/stats` or `GET
+        /v1/directory`'s counts. The full response is cached in-process (default TTL
+        20s, no query params to key on).
+      responses:
+        "200":
+          description: The extended map response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExtendedMapResponse"
+        "500":
+          description: Store failure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
   /api/v1/stats:
     get:
       operationId: getStats
@@ -1599,6 +1632,47 @@ components:
           type: string
         has_onion:
           type: boolean
+
+    ExtendedMapResponse:
+      type: object
+      required: [attributed, anonymous]
+      properties:
+        attributed:
+          type: array
+          description: Identical population/shape to GET /api/nodes/map's own response.
+          items:
+            $ref: "#/components/schemas/MapNode"
+        anonymous:
+          type: array
+          description: >-
+            Aggregate, city-level clusters for the non-owner-tagged population — see
+            AnonymousCluster.
+          items:
+            $ref: "#/components/schemas/AnonymousCluster"
+
+    AnonymousCluster:
+      type: object
+      description: >-
+        Aggregate-ONLY — never a node ID, label, address, or wallet-availability
+        signal. A representative point for one (city, country) grouping of the
+        anonymous (non-owner-tagged) node population, dropped entirely if that exact
+        (city, country) already has an attributed marker.
+      required: [city, country, latitude, longitude, approx_node_count, last_observed_at]
+      properties:
+        city:
+          type: string
+        country:
+          type: string
+        latitude:
+          type: number
+          description: A representative point for this city, not any specific node's exact address.
+        longitude:
+          type: number
+        approx_node_count:
+          type: integer
+        last_observed_at:
+          type: string
+          format: date-time
 
     StatsResponse:
       type: object
