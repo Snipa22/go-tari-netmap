@@ -1,0 +1,1933 @@
+openapi: 3.0.3
+info:
+  title: go-tari-netmap API
+  description: >-
+    Tari network peer-topology + node-health mapping API. Polls Tari nodes, walks the
+    peer graph via seed-node discovery, and surfaces topology + node-health data for
+    mining-pool operators picking peers. Every route documented here is served by
+    `internal/api.NewRouter`, mounted at `/api` (via `http.StripPrefix("/api", ...)`
+    in `cmd/netmap/main.go`) on the same listener as the HTML dashboard
+    (`internal/web`).
+  version: "1.0.0"
+  contact:
+    name: go-tari-netmap
+    url: https://github.com/Snipa22/go-tari-netmap
+servers:
+  - url: https://netmap.supportxtm.com
+    description: Production deployment (Caddy-proxied)
+  - url: http://localhost:8080
+    description: Local development (cmd/netmap's default -addr)
+
+tags:
+  - name: nodes
+    description: Node registry — submission, listing, per-node health history and edges.
+  - name: topology
+    description: The peer-graph topology (full graph and top-peered summaries).
+  - name: stats
+    description: Whole-population node counts and network-height snapshot.
+  - name: directory
+    description: Classification + coarse-geo feed for third-party directory consumers.
+  - name: seeds
+    description: Suggested Tari seed nodes and generated config.toml peer_seeds text.
+  - name: wallet-nodes
+    description: >-
+      Separate, mainnet-only wallet-sync-HTTP-port registration flow (gated by
+      -wallet-http-enabled).
+  - name: admin
+    description: HTTP-Basic-Auth-gated submission review queue and admin tooling.
+  - name: collectors
+    description: Trusted remote-collector-satellite ingestion channel (API-key gated).
+  - name: docs
+    description: This OpenAPI spec and its rendered Swagger UI page.
+
+paths:
+  /api/healthz:
+    get:
+      operationId: getHealthz
+      tags: [nodes]
+      summary: Liveness probe for the HTTP process itself
+      description: >-
+        Always returns HTTP 200 with an empty body — a plain "the process is up"
+        check, with no database/dependency verification of any kind
+        (`internal/api/api.go`'s inline handler).
+      responses:
+        "200":
+          description: The process is up.
+
+  /api/nodes:
+    get:
+      operationId: listNodes
+      tags: [nodes]
+      summary: Paginated list of known nodes (privacy-scrubbed)
+      description: >-
+        Returns a page of `PublicNode`s plus pagination metadata. Every node passes
+        through `ScrubNode` — real addresses are only included for nodes whose owner
+        opted in via the public submission flow (`discovery_source` `registry_submitted`
+        or `both`); a purely `p2p_discovered` node never exposes its real address.
+      parameters:
+        - name: discovery_source
+          in: query
+          required: false
+          description: Restrict to nodes with this exact discovery_source value.
+          schema:
+            type: string
+            enum: [p2p_discovered, registry_submitted, both]
+        - name: owner
+          in: query
+          required: false
+          description: Restrict to nodes where tags.owner exactly equals this value.
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          description: >-
+            Page size. Defaults to 100 when omitted or non-positive; capped at 500
+            regardless of what's requested.
+          schema:
+            type: integer
+            minimum: 1
+            default: 100
+            maximum: 500
+        - name: offset
+          in: query
+          required: false
+          description: Rows to skip. Defaults to 0.
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        "200":
+          description: A page of nodes.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListNodesResponse"
+        "400":
+          description: Malformed `offset` query parameter.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "500":
+          description: Store failure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+    post:
+      operationId: createNode
+      tags: [nodes]
+      summary: Publicly submit a node for registration (queued for human review)
+      description: >-
+        Queues a `PendingSubmission` for admin review (see `POST
+        /admin/submissions/{id}/approve`) rather than writing directly to the node
+        registry. Rate-limited per source IP (`Retry-After` header on 429), with an
+        escalating lockout for sources with repeated invalid submissions. Rejects
+        private/reserved-IP hosts (basic SSRF hardening) and addresses that are
+        already publicly opted-in (409 — contact the operator instead of resubmitting
+        someone else's node). A best-effort, non-blocking connectivity probe is kicked
+        off for the reviewer's benefit; it never delays this response.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateNodeRequest"
+      responses:
+        "202":
+          description: Submission accepted and queued for review.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PendingSubmission"
+        "400":
+          description: >-
+            Invalid JSON body, missing host, out-of-range port, or a host that fails
+            SSRF validation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "409":
+          description: This address is already publicly registered.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "429":
+          description: Rate-limited or temporarily locked out after repeated invalid submissions.
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "503":
+          description: The pending-submission review queue is full (capped at 100 unreviewed rows).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "500":
+          description: Store failure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /api/nodes/{id}:
+    get:
+      operationId: getNode
+      tags: [nodes]
+      summary: Get one node by id (privacy-scrubbed)
+      parameters:
+        - $ref: "#/components/parameters/NodeID"
+      responses:
+        "200":
+          description: The node.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublicNode"
+        "400":
+          description: Invalid node id (not a UUID).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "404":
+          description: No node with this id.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "500":
+          description: Store failure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /api/nodes/{id}/history:
+    get:
+      operationId: getNodeHistory
+      tags: [nodes]
+      summary: Recent health-check history for one node
+      parameters:
+        - $ref: "#/components/parameters/NodeID"
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of history rows to return. Defaults to 20.
+          schema:
+            type: integer
+            minimum: 1
+            default: 20
+      responses:
+        "200":
+          description: >-
+            Health-check rows for this node (raw `storage.HealthCheck` — not
+            privacy-scrubbed, since this endpoint carries no address data).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/HealthCheck"
+        "400":
+          description: Invalid node id, or a non-positive `limit`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "500":
+          description: Store failure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /api/nodes/{id}/edges:
+    get:
+      operationId: getNodeEdges
+      tags: [nodes]
+      summary: A node's known peer edges plus its confirmed neighbor nodes
+      description: >-
+        Powers the topology page's click-to-expand interaction. Returns every known
+        peer edge touching this node, plus a privacy-scrubbed view of each distinct
+        neighbor those edges reference. Restricted to CONFIRMED neighbors only (a
+        non-empty `public_key`) — unconfirmed peers are excluded, along with any edge
+        whose non-center endpoint got excluded. Does NOT 404 on a node with zero edges
+        or an unrecognized id — both return an empty result.
+      parameters:
+        - $ref: "#/components/parameters/NodeID"
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of edges to return. Defaults to 50.
+          schema:
+            type: integer
+            minimum: 1
+            default: 50
+      responses:
+        "200":
+          description: This node's confirmed neighbors and the edges connecting them.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NodeEdgesResponse"
+        "400":
+          description: Invalid node id, or a non-positive `limit`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "500":
+          description: Store failure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /api/topology:
+    get:
+      operationId: getTopology
+      tags: [topology]
+      summary: The peer-graph topology (nodes + edges), capped by default
+      description: >-
+        An unbounded response can run into multiple megabytes on a large network, so
+        by default this is capped to the top 300 best-connected nodes (by peer-degree)
+        and 2500 edges. Pass `?all=true` for the genuinely unbounded response, or
+        `?limit=`/`?max_edges=` for an explicit cap. `role=collector`-tagged nodes (a
+        remote collector satellite's own advertised identity) are always excluded,
+        along with any edge that would then dangle.
+      parameters:
+        - name: all
+          in: query
+          required: false
+          description: When `true`, disables both the node and edge caps entirely.
+          schema:
+            type: boolean
+        - name: limit
+          in: query
+          required: false
+          description: Caps the returned node set to this many top-peered nodes. Defaults to 300.
+          schema:
+            type: integer
+            minimum: 1
+            default: 300
+        - name: max_edges
+          in: query
+          required: false
+          description: Caps the returned edge count independently of `limit`. Defaults to 2500.
+          schema:
+            type: integer
+            minimum: 1
+            default: 2500
+      responses:
+        "200":
+          description: The (possibly capped) topology graph.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TopologyResponse"
+        "400":
+          description: Invalid `all`, `limit`, or `max_edges` query parameter.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "500":
+          description: Store failure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /api/topology/top-peered:
+    get:
+      operationId: getTopPeeredNodes
+      tags: [topology]
+      summary: The best-connected nodes within a recent time window
+      parameters:
+        - name: since
+          in: query
+          required: false
+          description: >-
+            A Go `time.ParseDuration` string (e.g. `1h`, `30m`) bounding how far back
+            to look for peer-edge activity. Defaults to `1h`.
+          schema:
+            type: string
+            default: 1h
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of nodes to return. Defaults to 20.
+          schema:
+            type: integer
+            minimum: 1
+            default: 20
+      responses:
+        "200":
+          description: >-
+            The top-peered nodes, most-connected first. `role=collector`-tagged nodes
+            are always excluded.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/PublicNodeDegree"
+        "400":
+          description: Invalid `since` or `limit` query parameter.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "500":
+          description: Store failure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /api/nodes/map:
+    get:
+      operationId: getNodesMap
+      tags: [nodes]
+      summary: Owner-tagged, geo-resolved node population for the dashboard's map
+      description: >-
+        Every node with a non-empty `tags.owner` AND at least one known IPv4 address,
+        resolved to an approximate lat/lon via the server-side `geoip_cache` table
+        (never a live outbound geoip lookup from this handler). NOT a new privacy
+        exposure: this is exactly the already-consented, already-address-visible
+        population `GET /api/nodes` already exposes for, merely projected as lat/lon
+        instead of a raw IP. A node with no cache entry yet (or a persistently-failed
+        lookup) is simply omitted.
+      responses:
+        "200":
+          description: Geo-resolved map nodes.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/MapNode"
+        "500":
+          description: Store failure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /api/v1/stats:
+    get:
+      operationId: getStats
+      tags: [stats]
+      summary: Whole-population node counts and network-height snapshot
+      description: >-
+        The same headline numbers shown on the HTML dashboard's summary cards.
+        No pagination/filtering — a single whole-population snapshot. The full
+        response is cached in-process (default TTL 20s) — a cache hit costs zero DB
+        queries. Public, unauthenticated, versioned (`/v1/`) since this is the API's
+        first versioned route.
+      responses:
+        "200":
+          description: The stats snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatsResponse"
+        "500":
+          description: Store failure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /api/v1/directory:
+    get:
+      operationId: getDirectory
+      tags: [directory]
+      summary: Classification + coarse-geo feed for third-party directory consumers
+      description: >-
+        Splits the whole node population into `attributed` (tags.owner set — keyed off
+        the owner tag, never off discovery_source) and `anonymous` (everyone else).
+        Real address strings are NEVER included here for any node, attributed or
+        anonymous — `GET /api/nodes` remains the only route returning real addresses.
+        An `attributed` entry with a resolvable IPv4 gets full-precision `geo_precise`
+        (lat/lon/city/country — the same already-consented projection `GET
+        /api/nodes/map` exposes); an `anonymous` entry with a resolvable IPv4 gets ONLY
+        `geo_coarse` (city/country, never lat/lon) — a hard, deliberate privacy
+        boundary. The full response is cached in-process per unique
+        (owner, class, limit, offset) combination (default TTL 8s).
+      parameters:
+        - name: owner
+          in: query
+          required: false
+          description: >-
+            Exact-match narrows the attributed set to one owner, excluding everything
+            else (including the whole anonymous population).
+          schema:
+            type: string
+        - name: class
+          in: query
+          required: false
+          description: Restrict to one population. Omitted returns both.
+          schema:
+            type: string
+            enum: [attributed, anonymous]
+        - name: limit
+          in: query
+          required: false
+          description: Page size. Defaults to 100; capped at 500.
+          schema:
+            type: integer
+            minimum: 1
+            default: 100
+            maximum: 500
+        - name: offset
+          in: query
+          required: false
+          description: Rows to skip. Defaults to 0.
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        "200":
+          description: A page of classified nodes.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DirectoryResponse"
+        "400":
+          description: Invalid `class` or `offset` query parameter.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "500":
+          description: Store failure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /api/nodes/seeds:
+    get:
+      operationId: listSeedCandidates
+      tags: [seeds]
+      summary: Suggested Tari seed nodes (opted-in AND recently reachable)
+      description: >-
+        Candidates are opted into public disclosure (`registry_submitted`/`both`) AND
+        observed reachable within the `since` window. Deliberately NOT run through
+        `ScrubNode`'s privacy redaction — showing the real address IS the point of
+        this endpoint. `role=collector`-tagged candidates are always excluded.
+        `public_key` is hex-encoded (not base64), matching Tari's own config.toml
+        format.
+      parameters:
+        - $ref: "#/components/parameters/SeedSince"
+      responses:
+        "200":
+          description: Seed candidates.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListSeedCandidatesResponse"
+        "400":
+          description: Invalid `since` query parameter.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "500":
+          description: Store failure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /api/nodes/seed_list:
+    get:
+      operationId: listSeedCandidatesAlias
+      tags: [seeds]
+      summary: Alias of GET /api/nodes/seeds
+      description: >-
+        Plain alias under the route name remote collector satellites poll every ~60s
+        to refresh their own local peer cache (see `internal/remotestore`). Same
+        handler, same query, same response shape, same collector-role filtering as
+        `GET /api/nodes/seeds` — there is no separate logic here at all.
+      parameters:
+        - $ref: "#/components/parameters/SeedSince"
+      responses:
+        "200":
+          description: Seed candidates.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListSeedCandidatesResponse"
+        "400":
+          description: Invalid `since` query parameter.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "500":
+          description: Store failure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /api/config/peer-seeds:
+    get:
+      operationId: getConfigPeerSeeds
+      tags: [seeds]
+      summary: Ready-to-paste Tari config.toml peer_seeds text
+      description: >-
+        Built from the SAME opted-in + recently-reachable candidate set as `GET
+        /api/nodes/seeds` (same `?since=` override/default window). `?network=`
+        controls only the emitted TOML section header text (e.g.
+        `[esmeralda.p2p.seeds]`); it has no other effect. Only `peer_seeds` is
+        emitted (no `dns_seeds`). Content-Type is `text/plain`, chosen so the
+        response previews directly in a browser rather than prompting a download.
+      parameters:
+        - $ref: "#/components/parameters/SeedSince"
+        - name: network
+          in: query
+          required: false
+          description: Controls the emitted TOML section header, e.g. `[esmeralda.p2p.seeds]`.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Ready-to-paste TOML text.
+          content:
+            text/plain:
+              schema:
+                type: string
+        "400":
+          description: Invalid `since` query parameter.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "500":
+          description: Store failure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /api/nodes/seed_list_tari:
+    get:
+      operationId: getConfigPeerSeedsAlias
+      tags: [seeds]
+      summary: Alias of GET /api/config/peer-seeds
+      description: >-
+        Plain alias under the route name remote collector satellites poll to refresh
+        their own local peer cache — same handler, same query, same response as `GET
+        /api/config/peer-seeds`.
+      parameters:
+        - $ref: "#/components/parameters/SeedSince"
+        - name: network
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Ready-to-paste TOML text.
+          content:
+            text/plain:
+              schema:
+                type: string
+        "400":
+          description: Invalid `since` query parameter.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "500":
+          description: Store failure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /api/wallet-nodes:
+    post:
+      operationId: createWalletNodeSubmission
+      tags: [wallet-nodes]
+      summary: Publicly submit a node's wallet-sync HTTP port for registration
+      description: >-
+        Only reachable when the deployment has `-wallet-http-enabled=true` (mainnet
+        only) — this route is not registered on the mux at all otherwise (a real 404,
+        not a registered-but-failing route). A SEPARATE resource from `POST
+        /api/nodes`: `wallet_http_port` is always required, and this endpoint NEVER
+        creates a new node — `host` must already match an existing node's own known
+        address (404 if not; register the base node first). Reuses the same
+        rate-limiter/lockout instances as `POST /api/nodes`. A best-effort,
+        non-blocking, informational-only sanity probe is kicked off for the reviewer's
+        benefit — it is NOT the enforcement gate (see `POST
+        /api/admin/wallet-submissions/{id}/approve` for that).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateWalletNodeSubmissionRequest"
+      responses:
+        "202":
+          description: Submission accepted and queued for review.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PendingWalletSubmission"
+        "400":
+          description: Invalid JSON body, missing/invalid host, or an out-of-range wallet_http_port.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "404":
+          description: >-
+            `host` doesn't match any node already known to netmap — register the base
+            node first via `POST /api/nodes`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "429":
+          description: Rate-limited or temporarily locked out after repeated invalid submissions.
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "500":
+          description: Store failure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /api/admin/submissions:
+    get:
+      operationId: listSubmissions
+      tags: [admin]
+      summary: List the public node-submission review queue
+      security:
+        - basicAuth: []
+      parameters:
+        - name: status
+          in: query
+          required: false
+          description: Restrict to submissions with this exact status.
+          schema:
+            type: string
+            enum: [pending, approved, rejected]
+      responses:
+        "200":
+          description: Submissions matching the filter.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/PendingSubmission"
+        "401":
+          description: Missing/invalid HTTP Basic Auth credentials.
+        "500":
+          description: Store failure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "503":
+          description: Admin area disabled — NETMAP_ADMIN_USER/NETMAP_ADMIN_PASSWORD not configured.
+
+  /api/admin/submissions/{id}/approve:
+    post:
+      operationId: approveSubmission
+      tags: [admin]
+      summary: Approve a pending node submission, promoting it into a real node
+      security:
+        - basicAuth: []
+      description: >-
+        Re-checks opt-in status at approval time (in case another submission for the
+        same address was approved in the meantime) — if it has since become
+        publicly opted-in, this 409s without mutating the submission, leaving it
+        pending for a human to explicitly reject. On success, kicks off an async
+        health check.
+      parameters:
+        - $ref: "#/components/parameters/SubmissionID"
+      responses:
+        "200":
+          description: The promoted node and the now-approved submission.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApproveSubmissionResponse"
+        "400":
+          description: Invalid submission id.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "401":
+          description: Missing/invalid HTTP Basic Auth credentials.
+        "404":
+          description: Submission not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "409":
+          description: >-
+            Already reviewed, or the address has since become publicly opted-in
+            elsewhere.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "500":
+          description: Store failure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "503":
+          description: Admin area disabled — NETMAP_ADMIN_USER/NETMAP_ADMIN_PASSWORD not configured.
+
+  /api/admin/submissions/{id}/reject:
+    post:
+      operationId: rejectSubmission
+      tags: [admin]
+      summary: Reject a pending node submission
+      security:
+        - basicAuth: []
+      parameters:
+        - $ref: "#/components/parameters/SubmissionID"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RejectSubmissionRequest"
+      responses:
+        "200":
+          description: The now-rejected submission.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PendingSubmission"
+        "400":
+          description: Invalid submission id or malformed JSON body.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "401":
+          description: Missing/invalid HTTP Basic Auth credentials.
+        "404":
+          description: Submission not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "409":
+          description: Submission already reviewed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "500":
+          description: Store failure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "503":
+          description: Admin area disabled — NETMAP_ADMIN_USER/NETMAP_ADMIN_PASSWORD not configured.
+
+  /api/admin/nodes/poll-now:
+    post:
+      operationId: pollNow
+      tags: [admin]
+      summary: Force a synchronous health-check probe of an address
+      security:
+        - basicAuth: []
+      description: >-
+        Bypasses the discovery/registry pipeline's usual async kickoff and review
+        queue entirely. Only syntax-validated (valid IP or plausible .onion) — the
+        private/reserved-IP SSRF check `POST /api/nodes` applies is deliberately
+        skipped here, since this is an internal admin tool that must be able to
+        force-poll local/private-network addresses for testing. Returns the FULL,
+        unscrubbed node (real address, real pubkey if confirmed) — this is an
+        internal debugging tool, not part of the public read API's privacy contract.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PollNowRequest"
+      responses:
+        "200":
+          description: The resulting node state, and any probe error encountered.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PollNowResponse"
+        "400":
+          description: Invalid JSON body, missing host, or a syntactically invalid host/port.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "401":
+          description: Missing/invalid HTTP Basic Auth credentials.
+        "500":
+          description: Store failure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "503":
+          description: Admin area disabled — NETMAP_ADMIN_USER/NETMAP_ADMIN_PASSWORD not configured.
+
+  /api/admin/wallet-submissions:
+    get:
+      operationId: listWalletSubmissions
+      tags: [admin, wallet-nodes]
+      summary: List the wallet-node registration review queue
+      security:
+        - basicAuth: []
+      description: >-
+        Only registered on the mux when the deployment has
+        `-wallet-http-enabled=true` (mainnet only) — a real 404 otherwise.
+      parameters:
+        - name: status
+          in: query
+          required: false
+          description: Restrict to submissions with this exact status.
+          schema:
+            type: string
+            enum: [pending, approved, rejected]
+      responses:
+        "200":
+          description: Wallet submissions matching the filter.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/PendingWalletSubmission"
+        "401":
+          description: Missing/invalid HTTP Basic Auth credentials.
+        "500":
+          description: Store failure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "503":
+          description: Admin area disabled — NETMAP_ADMIN_USER/NETMAP_ADMIN_PASSWORD not configured.
+
+  /api/admin/wallet-submissions/{id}/approve:
+    post:
+      operationId: approveWalletSubmission
+      tags: [admin, wallet-nodes]
+      summary: Approve a pending wallet-node submission (gated by a synchronous sanity probe)
+      security:
+        - basicAuth: []
+      description: >-
+        Only registered on the mux when `-wallet-http-enabled=true`. Re-resolves the
+        target node by host (never trusts a cached node id from submission time — the
+        node set may have changed since, e.g. via a later pubkey-confirmation merge);
+        409s if the host no longer resolves to any node. SYNCHRONOUSLY calls the
+        node's wallet-sync HTTP `/get_tip_info` endpoint — a dial error, non-200, bad
+        decode, or a `Reachable: false` response is ALL treated as probe failure and
+        the approval is REJECTED (409); nothing is written to the submission or the
+        node on that path. Only on a successful probe is `wallet_http_port` written
+        onto the node and the submission marked approved.
+      parameters:
+        - $ref: "#/components/parameters/SubmissionID"
+      responses:
+        "200":
+          description: The node (with its now-set wallet_http_port) and the now-approved submission.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApproveWalletSubmissionResponse"
+        "400":
+          description: Invalid submission id.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "401":
+          description: Missing/invalid HTTP Basic Auth credentials.
+        "404":
+          description: Wallet submission not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "409":
+          description: >-
+            Already reviewed, the host no longer resolves to any known node, or the
+            synchronous sanity probe did not succeed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "500":
+          description: Store failure, or the wallet-http probe client is not configured.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "503":
+          description: Admin area disabled — NETMAP_ADMIN_USER/NETMAP_ADMIN_PASSWORD not configured.
+
+  /api/admin/wallet-submissions/{id}/reject:
+    post:
+      operationId: rejectWalletSubmission
+      tags: [admin, wallet-nodes]
+      summary: Reject a pending wallet-node submission
+      security:
+        - basicAuth: []
+      description: >-
+        Only registered on the mux when `-wallet-http-enabled=true`.
+      parameters:
+        - $ref: "#/components/parameters/SubmissionID"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RejectSubmissionRequest"
+      responses:
+        "200":
+          description: The now-rejected wallet submission.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PendingWalletSubmission"
+        "400":
+          description: Invalid submission id or malformed JSON body.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "401":
+          description: Missing/invalid HTTP Basic Auth credentials.
+        "404":
+          description: Wallet submission not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "409":
+          description: Wallet submission already reviewed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "500":
+          description: Store failure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "503":
+          description: Admin area disabled — NETMAP_ADMIN_USER/NETMAP_ADMIN_PASSWORD not configured.
+
+  /api/internal/collectors/report:
+    post:
+      operationId: postCollectorReport
+      tags: [collectors]
+      summary: Ingest a trusted remote-collector-satellite's batched observations
+      security:
+        - collectorKeyAuth: []
+      description: >-
+        NOT a public endpoint — this is an operator-only, API-key-gated (`X-Collector-Key`)
+        trusted ingestion channel for a remote collector satellite (see
+        `cmd/netmap-p2p-responder`) to batch-report confirmed/discovered nodes, health
+        checks, and peer edges it observed since its last flush, all keyed by address
+        rather than an internal node UUID. Applied via the SAME storage methods the
+        local collector uses — writes are applied immediately, with no human review
+        queue (a fundamentally different trust model than `POST /api/nodes`).
+        Documented here for completeness/internal-team reference only. Every address
+        field is validated to reject a private/reserved IP (SSRF hardening). Every
+        `confirmed_nodes` entry is always applied with `discovery_source` forced to
+        `p2p_discovered` regardless of what the report claims, to prevent a satellite
+        from minting a fully opted-in seed candidate on its own claim. Idempotent per
+        exact request-body bytes (a byte-identical retry is recognized and skipped,
+        not duplicated).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CollectorReportRequest"
+      responses:
+        "200":
+          description: Per-category counts of how many batch items were applied.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CollectorReportResponse"
+        "400":
+          description: Malformed JSON body, or an item failed validation (well-formedness checked for the WHOLE batch before anything is applied).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "401":
+          description: Missing/invalid X-Collector-Key header.
+        "500":
+          description: Store failure partway through applying the batch.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "503":
+          description: Collector ingestion disabled — NETMAP_COLLECTOR_KEYS not configured.
+
+  /api/spec:
+    get:
+      operationId: getOpenApiSpec
+      tags: [docs]
+      summary: Serve this OpenAPI spec
+      description: >-
+        Serves the contents of `internal/docs/openapi.yaml` (embedded into the binary
+        via `//go:embed`) directly. Pass `?format=json` to receive the same spec
+        transcoded to JSON instead of YAML.
+      parameters:
+        - name: format
+          in: query
+          required: false
+          description: When set to `json`, transcodes the embedded YAML spec to JSON.
+          schema:
+            type: string
+            enum: [json]
+      responses:
+        "200":
+          description: The raw OpenAPI spec, as YAML (default) or JSON (`?format=json`).
+          content:
+            application/yaml:
+              schema:
+                type: string
+            application/json:
+              schema:
+                type: object
+
+  /api/docs:
+    get:
+      operationId: getSwaggerUi
+      tags: [docs]
+      summary: Swagger UI page for this spec
+      description: >-
+        A minimal static HTML page embedding Swagger UI via a CDN script tag
+        (`swagger-ui-dist@5` from unpkg.com — no vendored JS/CSS, no build step),
+        pointed at `/api/spec?format=json` as its spec URL.
+      responses:
+        "200":
+          description: The Swagger UI HTML page.
+          content:
+            text/html:
+              schema:
+                type: string
+
+components:
+  securitySchemes:
+    basicAuth:
+      type: http
+      scheme: basic
+      description: >-
+        HTTP Basic Auth against NETMAP_ADMIN_USER/NETMAP_ADMIN_PASSWORD (see
+        internal/adminauth.Wrap). Every /admin/* route fails closed with 503 if these
+        env vars aren't both configured — a request never reaches the 401 check at
+        all in that case.
+    collectorKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Collector-Key
+      description: >-
+        A per-collector API key checked against an operator-configured map of
+        collector name -> key (NETMAP_COLLECTOR_KEYS). Fails closed with 503 if no
+        collectors are configured at all.
+
+  parameters:
+    NodeID:
+      name: id
+      in: path
+      required: true
+      description: A node's UUID.
+      schema:
+        type: string
+        format: uuid
+    SubmissionID:
+      name: id
+      in: path
+      required: true
+      description: A pending submission's UUID.
+      schema:
+        type: string
+        format: uuid
+    SeedSince:
+      name: since
+      in: query
+      required: false
+      description: >-
+        A Go `time.ParseDuration` string bounding the reachability window. Defaults
+        to `storage.DefaultSeedHealthWindow`.
+      schema:
+        type: string
+
+  schemas:
+    ApiError:
+      type: object
+      description: >-
+        Shared error-response shape for every route's 400/404/409/429/500/503
+        responses — this API returns valid JSON even on error, never a plain-text
+        body (except for adminauth/collector-auth's 401/503 gate responses, which are
+        plain text via http.Error, upstream of any handler in this file).
+      required: [error]
+      properties:
+        error:
+          type: string
+          example: node not found
+
+    PublicNode:
+      type: object
+      description: >-
+        The privacy-scrubbed view of a node (see internal/api/privacy.go's ScrubNode).
+        Real address strings are NEVER included for a node discovered purely by
+        walking the peer graph (discovery_source p2p_discovered) — addresses is
+        omitted in that case. Node identity is public_key, not addresses — a
+        nil/empty public_key means the node is an unconfirmed placeholder, not an
+        error.
+      required: [id, discovery_source, tags, first_seen, last_seen, has_ipv4, has_ipv6, has_onion]
+      properties:
+        id:
+          type: string
+          format: uuid
+        public_key:
+          type: string
+          format: byte
+          description: Base64 of the raw pubkey bytes (Go's default []byte JSON marshaling). Omitted for an unconfirmed node.
+        discovery_source:
+          $ref: "#/components/schemas/DiscoverySource"
+        tags:
+          type: object
+          additionalProperties: true
+        label:
+          type: string
+          nullable: true
+        first_seen:
+          type: string
+          format: date-time
+        last_seen:
+          type: string
+          format: date-time
+        has_ipv4:
+          type: boolean
+        has_ipv6:
+          type: boolean
+        has_onion:
+          type: boolean
+        addresses:
+          type: array
+          items:
+            type: string
+          description: Only present when discovery_source is registry_submitted or both.
+        wallet_http_port:
+          type: integer
+          nullable: true
+          description: >-
+            Only ever present under the exact same opt-in gate as addresses above —
+            never populated for a node that hasn't opted into public address listing.
+
+    PublicNodeDegree:
+      type: object
+      description: >-
+        The privacy-scrubbed view of a storage.NodeDegree row, returned by GET
+        /api/topology/top-peered. Live* fields count only CONFIRMED peers (non-null
+        public_key) — Tari's gossip protocol propagates stale/dead peer addresses, so
+        the raw totals alone can grossly overstate actual live connectivity.
+      required:
+        - node_id
+        - has_ipv4
+        - has_ipv6
+        - has_onion
+        - degree
+        - in_degree
+        - out_degree
+        - onion_peer_count
+        - clearnet_peer_count
+        - live_degree
+        - live_in_degree
+        - live_out_degree
+        - live_onion_peer_count
+        - live_clearnet_peer_count
+      properties:
+        node_id:
+          type: string
+          format: uuid
+        public_key:
+          type: string
+          format: byte
+        has_ipv4:
+          type: boolean
+        has_ipv6:
+          type: boolean
+        has_onion:
+          type: boolean
+        addresses:
+          type: array
+          items:
+            type: string
+        degree:
+          type: integer
+        in_degree:
+          type: integer
+        out_degree:
+          type: integer
+        onion_peer_count:
+          type: integer
+        clearnet_peer_count:
+          type: integer
+        live_degree:
+          type: integer
+        live_in_degree:
+          type: integer
+        live_out_degree:
+          type: integer
+        live_onion_peer_count:
+          type: integer
+        live_clearnet_peer_count:
+          type: integer
+
+    DiscoverySource:
+      type: string
+      enum: [p2p_discovered, registry_submitted, both]
+      description: >-
+        How a node entered the topology: discovered by walking the peer graph,
+        submitted via the public registry API, or both.
+
+    ListNodesResponse:
+      type: object
+      required: [nodes, total, limit, offset, has_more]
+      properties:
+        nodes:
+          type: array
+          items:
+            $ref: "#/components/schemas/PublicNode"
+        total:
+          type: integer
+        limit:
+          type: integer
+        offset:
+          type: integer
+        has_more:
+          type: boolean
+
+    CreateNodeRequest:
+      type: object
+      description: >-
+        `port` accepts either a JSON number or a numeric JSON string (the dashboard's
+        htmx form submits all fields, including `<input type="number">`, as JSON
+        strings via the json-enc extension).
+      required: [host, port]
+      properties:
+        host:
+          type: string
+          description: A public IP or .onion address. Private/reserved IPs are rejected.
+        port:
+          oneOf:
+            - type: integer
+            - type: string
+          minimum: 1
+          maximum: 65535
+        label:
+          type: string
+        owner_tag:
+          type: string
+
+    PendingSubmission:
+      type: object
+      description: One row of the public node-submission review queue.
+      required: [id, address, status, submitted_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        address:
+          type: string
+        label:
+          type: string
+          nullable: true
+        owner_tag:
+          type: string
+          nullable: true
+        status:
+          $ref: "#/components/schemas/SubmissionStatus"
+        submitted_at:
+          type: string
+          format: date-time
+        reviewed_at:
+          type: string
+          format: date-time
+          nullable: true
+        rejection_reason:
+          type: string
+          nullable: true
+        promoted_node_id:
+          type: string
+          format: uuid
+          nullable: true
+        probe_attempted_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Nil until the best-effort, informational, async connectivity probe finishes.
+        probe_reachable:
+          type: boolean
+          nullable: true
+
+    SubmissionStatus:
+      type: string
+      enum: [pending, approved, rejected]
+
+    ApproveSubmissionResponse:
+      type: object
+      required: [node, submission]
+      properties:
+        node:
+          $ref: "#/components/schemas/Node"
+        submission:
+          $ref: "#/components/schemas/PendingSubmission"
+
+    RejectSubmissionRequest:
+      type: object
+      properties:
+        reason:
+          type: string
+
+    PollNowRequest:
+      type: object
+      required: [host, port]
+      properties:
+        host:
+          type: string
+          description: >-
+            Only syntax-validated (valid IP or plausible .onion) — the
+            private/reserved-IP SSRF check POST /api/nodes applies is deliberately
+            skipped for this internal admin tool.
+        port:
+          oneOf:
+            - type: integer
+            - type: string
+          minimum: 1
+          maximum: 65535
+
+    PollNowResponse:
+      type: object
+      required: [node]
+      properties:
+        node:
+          $ref: "#/components/schemas/Node"
+        error:
+          type: string
+          description: Present only when the forced probe itself failed (e.g. unreachable).
+
+    Node:
+      type: object
+      description: >-
+        The FULL, unscrubbed node record (real address, real pubkey if confirmed) —
+        only ever returned by admin-only routes (poll-now, submission/wallet-
+        submission approval), never by the public read routes (see PublicNode for
+        those).
+      required: [id, address, discovery_source, tags, first_seen, last_seen]
+      properties:
+        id:
+          type: string
+          format: uuid
+        address:
+          type: string
+        public_key:
+          type: string
+          format: byte
+        discovery_source:
+          $ref: "#/components/schemas/DiscoverySource"
+        tags:
+          type: object
+          additionalProperties: true
+        label:
+          type: string
+          nullable: true
+        first_seen:
+          type: string
+          format: date-time
+        last_seen:
+          type: string
+          format: date-time
+        wallet_http_port:
+          type: integer
+          nullable: true
+
+    HealthCheck:
+      type: object
+      required: [id, node_id, timestamp, reachable, probe_source]
+      properties:
+        id:
+          type: string
+          format: uuid
+        node_id:
+          type: string
+          format: uuid
+        timestamp:
+          type: string
+          format: date-time
+        reachable:
+          type: boolean
+        probe_source:
+          type: string
+          enum: [grpc, p2p, wallet_http]
+        height:
+          type: integer
+          format: int64
+          nullable: true
+        chain_tip_height:
+          type: integer
+          format: int64
+          nullable: true
+        version:
+          type: string
+          nullable: true
+        latency_ms:
+          type: integer
+          nullable: true
+        rxt_hashrate:
+          type: number
+          nullable: true
+        c29_hashrate:
+          type: number
+          nullable: true
+        sha3x_hashrate:
+          type: number
+          nullable: true
+        peer_identity_updated_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: The peer's own self-reported identity-signature timestamp, not when this check ran.
+
+    PeerEdge:
+      type: object
+      required: [id, from_node_id, to_node_id, first_seen, last_seen]
+      properties:
+        id:
+          type: string
+          format: uuid
+        from_node_id:
+          type: string
+          format: uuid
+        to_node_id:
+          type: string
+          format: uuid
+        first_seen:
+          type: string
+          format: date-time
+        last_seen:
+          type: string
+          format: date-time
+
+    NodeEdgesResponse:
+      type: object
+      required: [nodes, edges]
+      properties:
+        nodes:
+          type: array
+          items:
+            $ref: "#/components/schemas/PublicNode"
+        edges:
+          type: array
+          items:
+            $ref: "#/components/schemas/PeerEdge"
+
+    TopologyResponse:
+      type: object
+      required: [nodes, edges]
+      properties:
+        nodes:
+          type: array
+          items:
+            $ref: "#/components/schemas/PublicNode"
+        edges:
+          type: array
+          items:
+            $ref: "#/components/schemas/PeerEdge"
+
+    MapNode:
+      type: object
+      required: [node_id, label, latitude, longitude, city, country, has_onion]
+      properties:
+        node_id:
+          type: string
+          format: uuid
+        label:
+          type: string
+        latitude:
+          type: number
+        longitude:
+          type: number
+        city:
+          type: string
+        country:
+          type: string
+        has_onion:
+          type: boolean
+
+    StatsResponse:
+      type: object
+      required:
+        - total_nodes
+        - confirmed_nodes
+        - unconfirmed_nodes
+        - p2p_discovered
+        - registry_discovered
+        - both_discovered
+        - onion_capable
+        - clearnet_capable
+        - clearnet_only
+        - confirmed_nodes_24h
+        - network_height
+        - network_height_node_count
+      properties:
+        total_nodes:
+          type: integer
+        confirmed_nodes:
+          type: integer
+        unconfirmed_nodes:
+          type: integer
+        p2p_discovered:
+          type: integer
+        registry_discovered:
+          type: integer
+        both_discovered:
+          type: integer
+        onion_capable:
+          type: integer
+        clearnet_capable:
+          type: integer
+        clearnet_only:
+          type: integer
+        confirmed_nodes_24h:
+          type: integer
+          description: Confirmed AND reachable at least once in the last 24 hours. Always <= confirmed_nodes.
+        network_height:
+          type: integer
+          format: int64
+          nullable: true
+          description: Null until at least one health check with a height has been recorded.
+        network_height_node_count:
+          type: integer
+
+    GeoPrecise:
+      type: object
+      required: [latitude, longitude, city, country]
+      properties:
+        latitude:
+          type: number
+        longitude:
+          type: number
+        city:
+          type: string
+        country:
+          type: string
+
+    GeoCoarse:
+      type: object
+      description: City/country ONLY — deliberately has no latitude/longitude fields at all.
+      required: [city, country]
+      properties:
+        city:
+          type: string
+        country:
+          type: string
+
+    DirectoryNode:
+      type: object
+      required: [node_id, label, class, has_onion, confirmed]
+      properties:
+        node_id:
+          type: string
+          format: uuid
+        label:
+          type: string
+        class:
+          type: string
+          enum: [attributed, anonymous]
+        owner:
+          type: string
+          description: Present only when class is attributed.
+        has_onion:
+          type: boolean
+        confirmed:
+          type: boolean
+        geo_precise:
+          allOf:
+            - $ref: "#/components/schemas/GeoPrecise"
+          nullable: true
+          description: Present only for an attributed entry with a resolvable IPv4 and a cached geoip lookup.
+        geo_coarse:
+          allOf:
+            - $ref: "#/components/schemas/GeoCoarse"
+          nullable: true
+          description: Present only for an anonymous entry with a resolvable IPv4 and a cached geoip lookup.
+
+    DirectoryResponse:
+      type: object
+      required: [nodes, total, limit, offset, has_more]
+      properties:
+        nodes:
+          type: array
+          items:
+            $ref: "#/components/schemas/DirectoryNode"
+        total:
+          type: integer
+        limit:
+          type: integer
+        offset:
+          type: integer
+        has_more:
+          type: boolean
+
+    PublicSeedCandidate:
+      type: object
+      required: [node_id, public_key, addresses]
+      properties:
+        node_id:
+          type: string
+          format: uuid
+        public_key:
+          type: string
+          description: Hex-encoded (not base64) — matches Tari's own config.toml peer_seeds format.
+        label:
+          type: string
+        addresses:
+          type: array
+          items:
+            type: string
+
+    ListSeedCandidatesResponse:
+      type: object
+      required: [candidates, since]
+      properties:
+        candidates:
+          type: array
+          items:
+            $ref: "#/components/schemas/PublicSeedCandidate"
+        since:
+          type: string
+          description: The actual `since` window applied (Go duration string), useful when the caller omitted an explicit value.
+
+    CreateWalletNodeSubmissionRequest:
+      type: object
+      required: [host, wallet_http_port]
+      properties:
+        host:
+          type: string
+          description: >-
+            The public IP being registered — just the host, NOT "host:port". Must
+            already match an existing node's own known address.
+        wallet_http_port:
+          oneOf:
+            - type: integer
+            - type: string
+          minimum: 1
+          maximum: 65535
+          description: Always required — this endpoint's entire purpose is registering this port.
+
+    PendingWalletSubmission:
+      type: object
+      description: One row of the SEPARATE wallet-node registration review queue.
+      required: [id, host, wallet_http_port, status, submitted_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        host:
+          type: string
+        wallet_http_port:
+          type: integer
+        status:
+          $ref: "#/components/schemas/SubmissionStatus"
+        submitted_at:
+          type: string
+          format: date-time
+        reviewed_at:
+          type: string
+          format: date-time
+          nullable: true
+        rejection_reason:
+          type: string
+          nullable: true
+        promoted_node_id:
+          type: string
+          format: uuid
+          nullable: true
+        probe_attempted_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: The best-effort, informational, async submission-time probe — NOT the approval-gating one.
+        probe_reachable:
+          type: boolean
+          nullable: true
+        probe_succeeded:
+          type: boolean
+          nullable: true
+          description: Set only at successful-approval time, from the SYNCHRONOUS sanity probe.
+        probe_checked_at:
+          type: string
+          format: date-time
+          nullable: true
+        probe_is_synced:
+          type: boolean
+          nullable: true
+        probe_height:
+          type: integer
+          format: int64
+          nullable: true
+
+    ApproveWalletSubmissionResponse:
+      type: object
+      required: [node, submission]
+      properties:
+        node:
+          $ref: "#/components/schemas/Node"
+        submission:
+          $ref: "#/components/schemas/PendingWalletSubmission"
+
+    CollectorReportRequest:
+      type: object
+      properties:
+        self_identity:
+          type: array
+          items:
+            type: string
+          description: This collector's own advertised P2P address(es) — used ONLY to tag that node role=collector.
+        confirmed_nodes:
+          type: array
+          items:
+            $ref: "#/components/schemas/CollectorReportConfirmedNode"
+        discovered_nodes:
+          type: array
+          items:
+            $ref: "#/components/schemas/CollectorReportDiscoveredNode"
+        health_checks:
+          type: array
+          items:
+            $ref: "#/components/schemas/CollectorReportHealthCheck"
+        peer_edges:
+          type: array
+          items:
+            $ref: "#/components/schemas/CollectorReportPeerEdge"
+
+    CollectorReportConfirmedNode:
+      type: object
+      required: [address, public_key, discovery_source]
+      properties:
+        address:
+          type: string
+        public_key:
+          type: string
+          description: Hex-encoded.
+        discovery_source:
+          type: string
+          enum: [p2p_discovered, registry_submitted, both]
+          description: >-
+            Validated for wire well-formedness only — the server ALWAYS applies this
+            entry with discovery_source forced to p2p_discovered regardless of this
+            value, to prevent a satellite minting a fully opted-in seed candidate on
+            its own say-so.
+
+    CollectorReportDiscoveredNode:
+      type: object
+      required: [address]
+      properties:
+        address:
+          type: string
+
+    CollectorReportHealthCheck:
+      type: object
+      required: [address, reachable, probe_source]
+      properties:
+        address:
+          type: string
+        reachable:
+          type: boolean
+        probe_source:
+          type: string
+          enum: [grpc, p2p]
+        height:
+          type: integer
+          format: int64
+        chain_tip_height:
+          type: integer
+          format: int64
+        version:
+          type: string
+        latency_ms:
+          type: integer
+        rxt_hashrate:
+          type: number
+        c29_hashrate:
+          type: number
+        sha3x_hashrate:
+          type: number
+        peer_identity_updated_at:
+          type: string
+          format: date-time
+
+    CollectorReportPeerEdge:
+      type: object
+      required: [from_address, to_address]
+      properties:
+        from_address:
+          type: string
+        to_address:
+          type: string
+
+    CollectorReportResponse:
+      type: object
+      required:
+        - confirmed_nodes_applied
+        - discovered_nodes_applied
+        - health_checks_applied
+        - peer_edges_applied
+        - self_identity_tagged
+      properties:
+        confirmed_nodes_applied:
+          type: integer
+        discovered_nodes_applied:
+          type: integer
+        health_checks_applied:
+          type: integer
+        peer_edges_applied:
+          type: integer
+        self_identity_tagged:
+          type: integer
