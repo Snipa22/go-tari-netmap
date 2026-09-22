@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"net"
 	"net/http"
 	"strconv"
 	"sync"
@@ -703,8 +704,13 @@ func truncateAddress(addr string, maxLen int) string {
 // configures GET /'s and GET /network's shared in-process
 // whole-population counts cache (see dashboardCountsCache/
 // buildNodeTableData/DefaultDashboardCountsCacheTTL) — callers that
-// don't care can pass DefaultDashboardCountsCacheTTL.
-func NewHandler(store storage.Store, adminCreds adminauth.Credentials, dashboardCountsCacheTTL time.Duration) (http.Handler, error) {
+// don't care can pass DefaultDashboardCountsCacheTTL. walletHTTPEnabled
+// mirrors internal/api.NewRouter's identically-named parameter (sourced from the same
+// cmd/netmap/main.go -wallet-http-enabled flag) — when false, GET /wallet-nodes still
+// renders (200, not 404 -- this is a read-only dashboard page, not a write endpoint, so
+// there's no abuse-surface reason to hide its existence) but always shows the empty/
+// disabled state (see handleWalletNodes), never querying storage.Store.ListNodes at all.
+func NewHandler(store storage.Store, adminCreds adminauth.Credentials, dashboardCountsCacheTTL time.Duration, walletHTTPEnabled bool) (http.Handler, error) {
 	// derefBool is registered as a template func because Go's
 	// text/template `{{if}}` truth test on a pointer only checks
 	// non-nil-ness, not the pointed-to value — a *bool pointing at
@@ -714,6 +720,16 @@ func NewHandler(store storage.Store, adminCreds adminauth.Credentials, dashboard
 	tmpl, err := template.New("web").Funcs(template.FuncMap{
 		"derefBool":       func(b *bool) bool { return b != nil && *b },
 		"truncateAddress": truncateAddress,
+		// formatUptime renders a walletNodeRow.UptimePercent (*float64, 0-100, nil if
+		// no samples yet) as "NN.N%" -- needed because a raw {{printf "%.1f%%" .}} on a
+		// *float64 would print the pointer, not the pointed-to value (text/template
+		// does not auto-dereference for Printf-style verbs).
+		"formatUptime": func(pct *float64) string {
+			if pct == nil {
+				return "—"
+			}
+			return fmt.Sprintf("%.1f%%", *pct)
+		},
 	}).ParseFS(templatesFS, "templates/*.tmpl")
 	if err != nil {
 		return nil, err
@@ -730,6 +746,7 @@ func NewHandler(store storage.Store, adminCreds adminauth.Credentials, dashboard
 	mux.HandleFunc("GET /topology", handleTopologyGraph(tmpl))
 	mux.HandleFunc("GET /network", handleFullNetwork(tmpl, store, countsCache))
 	mux.HandleFunc("GET /map", handleMapPage(tmpl))
+	mux.HandleFunc("GET /wallet-nodes", handleWalletNodes(tmpl, store, walletHTTPEnabled))
 	mux.HandleFunc("GET /static/style.css", handleStaticCSS)
 
 	// The submission review page moved under /admin/* (see this
@@ -914,6 +931,156 @@ func handleTopologyGraph(tmpl *template.Template) http.HandlerFunc {
 func handleMapPage(tmpl *template.Template) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if err := tmpl.ExecuteTemplate(w, "map.html.tmpl", nil); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	}
+}
+
+// walletHTTPUptimeWindow is the lookback window handleWalletNodes uses for its uptime%
+// column (see Store.WalletHTTPUptime's doc comment on the Store interface for why this
+// mirrors NetworkHeight's existing 24h window rather than a purpose-built one -- there is no
+// pre-existing "uptime%" concept anywhere else in this codebase to instead reuse verbatim).
+const walletHTTPUptimeWindow = 24 * time.Hour
+
+// walletNodeRow is one row of the /wallet-nodes dashboard page (see handleWalletNodes): a
+// node that BOTH has a non-nil WalletHTTPPort AND has opted into public address exposure
+// (discovery_source registry_submitted or both) -- see ScrubNode's doc comment for why both
+// conditions are required, not just the first.
+type walletNodeRow struct {
+	NodeID uuid.UUID
+
+	Identity identity
+
+	// Address is "host:wallet_http_port" -- the SAME host as the node's own
+	// privacy-scrub-permitted public address (see storage.Node.WalletHTTPPort's doc
+	// comment: this port always pairs with that node's own address, never a different
+	// host), just with the wallet-sync HTTP service's port substituted in.
+	Address string
+
+	// Height/LastChecked/Reachable come from the most recent
+	// storage.ProbeSourceWalletHTTP node_health row for this node (see
+	// Store.GetLatestHealthCheck), NOT from GetNodeHistory -- the same node may also be
+	// polled over gRPC/P2P, and this page must show THIS transport's own latest result,
+	// not whichever transport happened to be probed most recently.
+	Height      *int64
+	LastChecked *time.Time
+	Reachable   bool
+	HasHistory  bool
+
+	// UptimePercent is 0-100 (already multiplied for direct template display), nil if
+	// this node has zero storage.ProbeSourceWalletHTTP rows within
+	// walletHTTPUptimeWindow yet.
+	UptimePercent *float64
+	SampleCount   int
+}
+
+// walletNodesData is the template data for wallet_nodes.html.tmpl. Enabled mirrors
+// handleWalletNodes' walletHTTPEnabled parameter -- when false, Nodes is always empty and
+// the template renders the standard empty-state row (see handleWalletNodes' doc comment),
+// distinct from WindowLabel simply being ""/zero.
+type walletNodesData struct {
+	Nodes       []walletNodeRow
+	WindowLabel string
+	Enabled     bool
+}
+
+// handleWalletNodes serves the /wallet-nodes dashboard page: a monero.fail-style public list
+// of nodes known to ALSO offer the Tari wallet-sync HTTP service (see
+// Netmap-Wallet-HTTP-Port-Design-2026-09-19.md for the full feature background), so
+// third-party wallets can pick one to sync against. Columns: IP:port, current height,
+// uptime% (see walletNodeRow's doc comment).
+//
+// walletHTTPEnabled mirrors the SAME mainnet-only -wallet-http-enabled flag
+// internal/api.NewRouter's identically-named parameter is sourced from (see
+// cmd/netmap/main.go) -- when false, this handler returns the empty/disabled state
+// WITHOUT ever querying store.ListNodes at all (this feature must not be
+// reachable/active on a testnet deployment, per this feature's dispatch brief's operator
+// directive #1 -- that applies to this dashboard page too, not just the write endpoints).
+//
+// Visibility (when enabled) is gated identically to every other address-revealing view in
+// this codebase: store.ListNodes(HasWalletHTTPPort: true) only narrows by "has a
+// wallet_http_port set" -- it does NOT itself decide visibility. Each candidate node is
+// still run through api.ScrubNode (the SAME single source of truth every other route/page
+// in this codebase uses), and only included in the page at all if BOTH pn.Addresses and
+// pn.WalletHTTPPort came back non-nil/non-empty (i.e. this node's discovery_source permits
+// address exposure). There is no separate, ungated path to this data -- see api.ScrubNode's
+// doc comment and this feature's hard safety rule #4.
+func handleWalletNodes(tmpl *template.Template, store storage.Store, walletHTTPEnabled bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !walletHTTPEnabled {
+			data := walletNodesData{Nodes: []walletNodeRow{}, WindowLabel: windowLabel(walletHTTPUptimeWindow), Enabled: false}
+			if err := tmpl.ExecuteTemplate(w, "wallet_nodes.html.tmpl", data); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			}
+			return
+		}
+
+		ctx := r.Context()
+
+		hasWalletHTTPPort := true
+		nodes, err := store.ListNodes(ctx, storage.NodeFilter{HasWalletHTTPPort: &hasWalletHTTPPort})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		rows := make([]walletNodeRow, 0, len(nodes))
+		for _, n := range nodes {
+			addrs, err := store.ListNodeAddresses(ctx, n.ID)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			// The scrub gate -- see this function's doc comment. A node whose
+			// WalletHTTPPort is set but whose discovery_source doesn't (or no longer
+			// does) permit address exposure is excluded entirely, not shown with a
+			// blank address.
+			pn := api.ScrubNode(n, addrs)
+			if pn.WalletHTTPPort == nil || len(pn.Addresses) == 0 {
+				continue
+			}
+
+			host, _, err := net.SplitHostPort(pn.Addresses[0])
+			if err != nil || host == "" {
+				continue
+			}
+
+			row := walletNodeRow{
+				NodeID:   n.ID,
+				Identity: buildIdentity(pn.PublicKey),
+				Address:  net.JoinHostPort(host, strconv.Itoa(*pn.WalletHTTPPort)),
+			}
+
+			latest, err := store.GetLatestHealthCheck(ctx, n.ID, storage.ProbeSourceWalletHTTP)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if latest != nil {
+				row.HasHistory = true
+				row.Reachable = latest.Reachable
+				row.Height = latest.Height
+				t := latest.Timestamp
+				row.LastChecked = &t
+			}
+
+			uptime, sampleCount, err := store.WalletHTTPUptime(ctx, n.ID, walletHTTPUptimeWindow)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if uptime != nil {
+				pct := *uptime * 100
+				row.UptimePercent = &pct
+				row.SampleCount = sampleCount
+			}
+
+			rows = append(rows, row)
+		}
+
+		data := walletNodesData{Nodes: rows, WindowLabel: windowLabel(walletHTTPUptimeWindow), Enabled: true}
+		if err := tmpl.ExecuteTemplate(w, "wallet_nodes.html.tmpl", data); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 	}

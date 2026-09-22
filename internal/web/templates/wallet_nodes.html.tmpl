@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>go-tari-netmap — wallet-sync nodes</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-title"><a href="/">go-tari-netmap</a></div>
+    <nav>
+      <a href="/">Dashboard</a>
+      <a href="/topology">Topology</a>
+      <a href="/network">Full Network</a>
+      <a href="/map">Map</a>
+      <a href="/wallet-nodes">Wallet Nodes</a>
+    </nav>
+  </header>
+
+  <main>
+    <p class="tagline">
+      Public nodes that ALSO offer Tari's wallet-sync HTTP service (minotari_node's
+      wallet query service), for third-party wallets picking a public node to sync
+      against. Listed here only if the node's operator explicitly opted in — this list
+      is never populated by inference/discovery of any kind.
+    </p>
+
+    <section>
+      {{if not .Enabled}}
+      <p class="empty-note">Wallet-sync HTTP tracking is not enabled on this deployment.</p>
+      {{else}}
+      <h2>Nodes</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Identity</th>
+            <th>Address</th>
+            <th>Height</th>
+            <th>Last checked</th>
+            <th>Uptime ({{.WindowLabel}})</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{range .Nodes}}
+          <tr>
+            <td>
+              <a href="/nodes/{{.NodeID}}">
+                {{if .Identity.Confirmed}}
+                <span class="pubkey" title="{{.Identity.FullHex}}">{{.Identity.ShortHex}}</span>
+                {{else}}
+                <span class="badge badge-unconfirmed">unconfirmed</span>
+                {{end}}
+              </a>
+            </td>
+            <td><span class="public-address">{{.Address}}</span></td>
+            <td>{{if .Height}}{{.Height}}{{else}}—{{end}}</td>
+            <td>
+              {{if .HasHistory}}
+              {{.LastChecked}}
+              {{if .Reachable}}
+              <span class="badge badge-reachable">reachable</span>
+              {{else}}
+              <span class="badge badge-unreachable">unreachable</span>
+              {{end}}
+              {{else}}
+              never checked
+              {{end}}
+            </td>
+            <td>
+              {{if .UptimePercent}}
+              {{formatUptime .UptimePercent}} <span class="panel-note">({{.SampleCount}} checks)</span>
+              {{else}}
+              —
+              {{end}}
+            </td>
+          </tr>
+          {{else}}
+          <tr><td colspan="5" class="empty-note">No nodes have opted into wallet-sync HTTP listing yet.</td></tr>
+          {{end}}
+        </tbody>
+      </table>
+      {{end}}
+    </section>
+  </main>
+</body>
+</html>

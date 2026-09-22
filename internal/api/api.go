@@ -49,7 +49,22 @@ var MaxPendingSubmissions = 100
 // and health data; grpcClient and p2pClient are used to kick off an async,
 // non-blocking health check via each configured transport when a new node
 // is registered via POST /nodes. Either may be nil — collector.PollOnce
-// skips a nil client's probe entirely rather than erroring. adminCreds
+// skips a nil client's probe entirely rather than erroring. walletHTTPClient
+// is the analogous wallet-sync-HTTP transport (see internal/collector's
+// wallet_http_client.go) — also optional/nilable, and, unlike
+// grpcClient/p2pClient, only ever actually dialed for a node whose
+// storage.Node.WalletHTTPPort is non-nil (see collector.PollOnce's doc
+// comment). walletHTTPEnabled gates the ENTIRE separate wallet-node
+// registration flow (POST /wallet-nodes and every /admin/wallet-submissions/*
+// route, registered further down in this function's body) mainnet-only, per
+// this feature's operator directive that it must not be reachable/active on a
+// testnet deployment at all — sourced from cmd/netmap/main.go's
+// -wallet-http-enabled flag (default false). When false, those routes are
+// simply never registered on the mux at all (a real 404, not a
+// registered-but-failing route — see this function's body, at those routes'
+// registration sites, for why that convention was chosen over the
+// adminCreds/collectors "route registered but fails closed 503" convention
+// used elsewhere in this function). adminCreds
 // configures the HTTP Basic Auth gate in front of every /admin/* route
 // (the submission review queue and the poll-now admin tool) — see
 // internal/adminauth.Wrap's doc comment for the fail-closed-503 behavior
@@ -69,7 +84,7 @@ var MaxPendingSubmissions = 100
 // cache (see directory.go's directoryCache/handleDirectory/
 // DefaultDirectoryCacheTTL) — callers that don't care can pass
 // DefaultDirectoryCacheTTL.
-func NewRouter(store storage.Store, grpcClient, p2pClient collector.NodeClient, adminCreds adminauth.Credentials, collectors map[string]CollectorConfig, statsCacheTTL, directoryCacheTTL time.Duration) http.Handler {
+func NewRouter(store storage.Store, grpcClient, p2pClient, walletHTTPClient collector.NodeClient, walletHTTPEnabled bool, adminCreds adminauth.Credentials, collectors map[string]CollectorConfig, statsCacheTTL, directoryCacheTTL time.Duration) http.Handler {
 	mux := http.NewServeMux()
 
 	// Created once and shared across every POST /nodes call (NewRouter
@@ -77,6 +92,22 @@ func NewRouter(store storage.Store, grpcClient, p2pClient collector.NodeClient, 
 	// internal/api/ratelimit.go for both types' reasoning.
 	limiter := newIPRateLimiter()
 	lockouts := newInvalidSubmissionTracker()
+
+	// pollWalletHTTPClient is what gets passed into collector.PollOnce at the two
+	// OLD-flow call sites below (handleApproveSubmission's async post-approval poll,
+	// handlePollNow's admin force-poll) -- deliberately nil'd out whenever
+	// walletHTTPEnabled is false, so this mainnet-only feature gate ALSO covers those
+	// two pre-existing call sites, not just the new wallet-node registration routes
+	// registered further down. Without this, a node that already has a non-nil
+	// WalletHTTPPort (e.g. set via NETMAP_OWNED_WALLET_HTTP_ADDRESSES, or a leftover
+	// value from manual DB testing, or from before this flag was turned off on this
+	// deployment) would still get dialed over this transport by an admin poll-now/
+	// approval action even with the feature flag off -- this closes that gap, mirroring
+	// the scheduled collector loop's own c.WalletHTTPEnabled gate (see collector.go).
+	pollWalletHTTPClient := walletHTTPClient
+	if !walletHTTPEnabled {
+		pollWalletHTTPClient = nil
+	}
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -143,6 +174,26 @@ func NewRouter(store storage.Store, grpcClient, p2pClient collector.NodeClient, 
 	mux.HandleFunc("GET /config/peer-seeds", handleConfigPeerSeeds(store))
 	mux.HandleFunc("GET /nodes/seed_list_tari", handleConfigPeerSeeds(store))
 
+	// POST /wallet-nodes: the SEPARATE, mainnet-only wallet-sync-HTTP-port registration
+	// flow (see PendingWalletSubmission's doc comment and this feature's dispatch brief
+	// for the full rationale for why this is NOT a field on POST /nodes above). Reuses
+	// the SAME limiter/lockouts instances as POST /nodes (both are similar-risk-profile
+	// public write routes -- spinning up a second independent rate limiter here would be
+	// a double-standard with no real justification).
+	//
+	// Registered on the mux at all ONLY when walletHTTPEnabled -- i.e. an unregistered
+	// pattern 404s when this feature is off, rather than a registered-but-503 route. This
+	// (route-not-registered, not fail-closed-503) is a DIFFERENT convention than
+	// adminCreds/collectors' "always registered, fails closed 503 if unconfigured" below
+	// -- deliberately so: adminCreds/collectors represent "a required secret happens to be
+	// unset", which this codebase already treats as an operational misconfiguration worth
+	// a 503; walletHTTPEnabled represents "this whole feature is deliberately, permanently
+	// off for this deployment" (testnet), which is better modeled as "this route doesn't
+	// exist here at all" than "exists but always errors".
+	if walletHTTPEnabled {
+		mux.HandleFunc("POST /wallet-nodes", handleCreateWalletNodeSubmission(store, walletHTTPClient, limiter, lockouts))
+	}
+
 	// Every /admin/* route — the submission review queue (list/approve/
 	// reject) and the poll-now admin tool — is registered on its own
 	// sub-mux and gated behind adminauth.Wrap as a single unit, so the
@@ -155,9 +206,18 @@ func NewRouter(store storage.Store, grpcClient, p2pClient collector.NodeClient, 
 	// than introducing a second protected prefix for one route.
 	adminMux := http.NewServeMux()
 	adminMux.HandleFunc("GET /admin/submissions", handleListSubmissions(store))
-	adminMux.HandleFunc("POST /admin/submissions/{id}/approve", handleApproveSubmission(store, grpcClient, p2pClient))
+	adminMux.HandleFunc("POST /admin/submissions/{id}/approve", handleApproveSubmission(store, grpcClient, p2pClient, pollWalletHTTPClient))
 	adminMux.HandleFunc("POST /admin/submissions/{id}/reject", handleRejectSubmission(store))
-	adminMux.HandleFunc("POST /admin/nodes/poll-now", handlePollNow(store, grpcClient, p2pClient))
+	adminMux.HandleFunc("POST /admin/nodes/poll-now", handlePollNow(store, grpcClient, p2pClient, pollWalletHTTPClient))
+	// /admin/wallet-submissions/* — the wallet-node registration review queue — is added
+	// to this SAME adminMux/adminauth.Wrap unit (per this feature's dispatch brief: "don't
+	// create a second admin-auth wrapper"), gated by the identical walletHTTPEnabled
+	// route-registration convention as POST /wallet-nodes above.
+	if walletHTTPEnabled {
+		adminMux.HandleFunc("GET /admin/wallet-submissions", handleListWalletSubmissions(store))
+		adminMux.HandleFunc("POST /admin/wallet-submissions/{id}/approve", handleApproveWalletSubmission(store, walletHTTPClient))
+		adminMux.HandleFunc("POST /admin/wallet-submissions/{id}/reject", handleRejectWalletSubmission(store))
+	}
 	mux.Handle("/admin/", adminauth.Wrap(adminCreds, adminMux))
 
 	// The trusted remote-collector-satellite ingestion channel (see
@@ -450,7 +510,7 @@ type pollNowResponse struct {
 // handleCreateNode's SSRF check above: that check exists because
 // POST /nodes is reachable by untrusted public submitters, which is not
 // the threat model here.
-func handlePollNow(store storage.Store, grpcClient, p2pClient collector.NodeClient) http.HandlerFunc {
+func handlePollNow(store storage.Store, grpcClient, p2pClient, walletHTTPClient collector.NodeClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req pollNowRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -501,7 +561,7 @@ func handlePollNow(store storage.Store, grpcClient, p2pClient collector.NodeClie
 		// rows, not via this returned error (see its doc comment), so
 		// we don't abort on it; we still want to show the resulting
 		// node state either way.
-		pollErr := collector.PollOnce(ctx, grpcClient, p2pClient, store, node)
+		pollErr := collector.PollOnce(ctx, grpcClient, p2pClient, walletHTTPClient, store, node)
 
 		updated, err := store.GetNode(ctx, node.ID)
 		if err != nil {
@@ -538,7 +598,7 @@ type approveSubmissionResponse struct {
 	Submission storage.PendingSubmission `json:"submission"`
 }
 
-func handleApproveSubmission(store storage.Store, grpcClient, p2pClient collector.NodeClient) http.HandlerFunc {
+func handleApproveSubmission(store storage.Store, grpcClient, p2pClient, walletHTTPClient collector.NodeClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id, err := uuid.Parse(r.PathValue("id"))
 		if err != nil {
@@ -603,7 +663,7 @@ func handleApproveSubmission(store storage.Store, grpcClient, p2pClient collecto
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), asyncCheckTimeout)
 			defer cancel()
-			_ = collector.PollOnce(ctx, grpcClient, p2pClient, store, node)
+			_ = collector.PollOnce(ctx, grpcClient, p2pClient, walletHTTPClient, store, node)
 		}()
 
 		writeJSON(w, http.StatusOK, approveSubmissionResponse{Node: node, Submission: submission})

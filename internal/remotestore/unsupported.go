@@ -64,6 +64,12 @@ func (s *Store) IsAddressPubliclyOptedIn(ctx context.Context, address string) (b
 	return false, errNotSupported
 }
 
+// FindNodeByHost is not supported: the wallet-node registration flow (POST /wallet-nodes)
+// is a central-API-only concern, same reasoning as IsAddressPubliclyOptedIn.
+func (s *Store) FindNodeByHost(ctx context.Context, host string) (storage.Node, bool, error) {
+	return storage.Node{}, false, errNotSupported
+}
+
 // CreatePendingSubmission is not supported: the public-submission review queue is a
 // central-API-only concern.
 func (s *Store) CreatePendingSubmission(ctx context.Context, address string, label, ownerTag *string) (storage.PendingSubmission, error) {
@@ -142,4 +148,63 @@ func (s *Store) GetNodeHistoryForNodes(ctx context.Context, nodeIDs []uuid.UUID,
 // GetRecentSuccessfulHealthChecks is a trivial no-op, same reasoning as GetNodeHistory.
 func (s *Store) GetRecentSuccessfulHealthChecks(ctx context.Context, nodeID uuid.UUID, limit int) ([]storage.HealthCheck, error) {
 	return []storage.HealthCheck{}, nil
+}
+
+// GetLatestHealthCheck is a trivial no-op, same reasoning as GetNodeHistory -- this store
+// keeps no node_health timeline of its own.
+func (s *Store) GetLatestHealthCheck(ctx context.Context, nodeID uuid.UUID, probeSource storage.ProbeSource) (*storage.HealthCheck, error) {
+	return nil, nil
+}
+
+// SetNodeWalletHTTPPort is not supported: a satellite never has occasion to set this --
+// only the central API's own handleApproveSubmission does (see storage.Store's doc
+// comment on this method for the hard safety rule around who may ever call it).
+func (s *Store) SetNodeWalletHTTPPort(ctx context.Context, id uuid.UUID, port *int) error {
+	return errNotSupported
+}
+
+// SetNodeWalletHTTPPortByAddress is not supported, same reasoning as
+// SetNodeWalletHTTPPort -- internal/collector's syncOwnedWalletHTTPPorts is only ever wired
+// up with a non-nil Collector.OwnedWalletHTTPPorts by cmd/netmap/main.go (the central
+// process), never by cmd/netmap-p2p-responder (the satellite this Store backs), so this is
+// never actually reached in practice.
+func (s *Store) SetNodeWalletHTTPPortByAddress(ctx context.Context, address string, port int) (bool, error) {
+	return false, errNotSupported
+}
+
+// WalletHTTPUptime is not supported: the /wallet-nodes dashboard page is a central-API-only
+// concern, same as every other dashboard aggregate in this file.
+func (s *Store) WalletHTTPUptime(ctx context.Context, nodeID uuid.UUID, since time.Duration) (*float64, int, error) {
+	return nil, 0, errNotSupported
+}
+
+// CreatePendingWalletSubmission is not supported: the wallet-node registration review
+// queue is a central-API-only concern, same reasoning as CreatePendingSubmission.
+func (s *Store) CreatePendingWalletSubmission(ctx context.Context, host string, walletHTTPPort int) (storage.PendingWalletSubmission, error) {
+	return storage.PendingWalletSubmission{}, errNotSupported
+}
+
+// ListPendingWalletSubmissions is not supported: see CreatePendingWalletSubmission.
+func (s *Store) ListPendingWalletSubmissions(ctx context.Context, status string) ([]storage.PendingWalletSubmission, error) {
+	return nil, errNotSupported
+}
+
+// GetPendingWalletSubmission is not supported: see CreatePendingWalletSubmission.
+func (s *Store) GetPendingWalletSubmission(ctx context.Context, id uuid.UUID) (storage.PendingWalletSubmission, error) {
+	return storage.PendingWalletSubmission{}, errNotSupported
+}
+
+// RecordWalletSubmissionProbeResult is not supported: see CreatePendingWalletSubmission.
+func (s *Store) RecordWalletSubmissionProbeResult(ctx context.Context, id uuid.UUID, reachable bool) error {
+	return errNotSupported
+}
+
+// ApprovePendingWalletSubmission is not supported: see CreatePendingWalletSubmission.
+func (s *Store) ApprovePendingWalletSubmission(ctx context.Context, id uuid.UUID, promotedNodeID uuid.UUID, outcome storage.WalletProbeOutcome) error {
+	return errNotSupported
+}
+
+// RejectPendingWalletSubmission is not supported: see CreatePendingWalletSubmission.
+func (s *Store) RejectPendingWalletSubmission(ctx context.Context, id uuid.UUID, reason *string) error {
+	return errNotSupported
 }

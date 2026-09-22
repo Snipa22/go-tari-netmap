@@ -82,7 +82,7 @@ func newTestCentralStore(t *testing.T) storage.Store {
 	if err != nil {
 		t.Fatalf("connect for truncate: %v", err)
 	}
-	if _, err := pool.Exec(ctx, "TRUNCATE TABLE node_health, peer_edge_observations, node_addresses, pending_submissions, nodes, geoip_cache CASCADE"); err != nil {
+	if _, err := pool.Exec(ctx, "TRUNCATE TABLE node_health, peer_edge_observations, node_addresses, pending_submissions, pending_wallet_submissions, nodes, geoip_cache CASCADE"); err != nil {
 		pool.Close()
 		t.Fatalf("truncate test tables: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestEndToEndReportFlowAgainstRealCentralAPI(t *testing.T) {
 
 	const collectorKey = "sat1-test-key"
 	const selfAddr = "203.0.113.200:18189"
-	srv := httptest.NewServer(api.NewRouter(central, nil, nil, adminauth.Credentials{}, map[string]api.CollectorConfig{"sat1": {APIKey: collectorKey, SelfAddresses: []string{selfAddr}}}, api.DefaultStatsCacheTTL, api.DefaultDirectoryCacheTTL))
+	srv := httptest.NewServer(api.NewRouter(central, nil, nil, nil, true, adminauth.Credentials{}, map[string]api.CollectorConfig{"sat1": {APIKey: collectorKey, SelfAddresses: []string{selfAddr}}}, api.DefaultStatsCacheTTL, api.DefaultDirectoryCacheTTL))
 	defer srv.Close()
 
 	const (
@@ -198,7 +198,7 @@ func TestEndToEndSeedListCacheAgainstRealCentralAPI(t *testing.T) {
 	central := newTestCentralStore(t)
 	ctx := context.Background()
 
-	srv := httptest.NewServer(api.NewRouter(central, nil, nil, adminauth.Credentials{}, map[string]api.CollectorConfig{"sat1": {APIKey: "unused"}}, api.DefaultStatsCacheTTL, api.DefaultDirectoryCacheTTL))
+	srv := httptest.NewServer(api.NewRouter(central, nil, nil, nil, true, adminauth.Credentials{}, map[string]api.CollectorConfig{"sat1": {APIKey: "unused"}}, api.DefaultStatsCacheTTL, api.DefaultDirectoryCacheTTL))
 	defer srv.Close()
 
 	const seedAddr = "192.0.2.77:18189"

@@ -27,6 +27,12 @@ type ProbeSource string
 const (
 	ProbeSourceGRPC ProbeSource = "grpc"
 	ProbeSourceP2P  ProbeSource = "p2p"
+
+	// ProbeSourceWalletHTTP identifies a health check collected by calling a node's
+	// wallet-sync HTTP service (minotari_node's [base_node.http_wallet_query_service]) --
+	// specifically, and ONLY, its /get_tip_info endpoint. See storage.Node.WalletHTTPPort's
+	// doc comment for the full feature/safety-rule context.
+	ProbeSourceWalletHTTP ProbeSource = "wallet_http"
 )
 
 // Node is a Tari node known to netmap. Address is the node's first-known
@@ -45,6 +51,45 @@ type Node struct {
 	Label           *string         `json:"label,omitempty"`
 	FirstSeen       time.Time       `json:"first_seen"`
 	LastSeen        time.Time       `json:"last_seen"`
+
+	// WalletHTTPPort, if non-nil, is the port this node's wallet-sync HTTP service
+	// (minotari_node's [base_node.http_wallet_query_service], see
+	// 0013_wallet_http_port.sql's migration comment and
+	// Netmap-Wallet-HTTP-Port-Design-2026-09-19.md for the full feature background)
+	// listens on, at the SAME host as Address -- never a different one.
+	//
+	// HARD SAFETY RULE, non-negotiable: this field must NEVER be populated by inference
+	// from any other data source -- not a P2P handshake, not peer-gossiped info, not an
+	// RPC call to the node, not port-scanning, and not a guessed per-network default port
+	// (mainnet 9000/stagenet 9001/nextnet 9002/localnet 9003/igor 9004/esmeralda 9005 --
+	// knowing these defaults is exactly why this rule exists: it would be trivial, and
+	// wrong, to "helpfully" fill this in). There are exactly two legitimate write paths in
+	// the entire codebase:
+	//   - an operator's own explicit NETMAP_OWNED_WALLET_HTTP_ADDRESSES env var entry (see
+	//     internal/collector/collector.go's Collector.OwnedWalletHTTPPorts/
+	//     syncOwnedWalletHTTPPorts), for nodes the operator runs themselves; or
+	//   - a SEPARATE, dedicated public submission (POST /wallet-nodes -- deliberately NOT
+	//     a field on POST /nodes' createNodeRequest, see PendingWalletSubmission's doc
+	//     comment) linked to an already-known node purely by public-IP host match, gated
+	//     by a SYNCHRONOUS sanity probe (walletHTTPClient.GetInfo against the submitted
+	//     host:wallet_http_port) that must succeed before admin approval is even permitted
+	//     to write this column (see internal/api/api.go's handleApproveWalletSubmission).
+	// Both paths funnel through Store.SetNodeWalletHTTPPort/SetNodeWalletHTTPPortByAddress
+	// -- no other Store method may ever set this column, and neither of those two methods
+	// may ever be called with a value derived any other way.
+	//
+	// Additionally, this whole feature (both write paths' effective reachability, and
+	// every read of this column by the collector's poll loop) is gated mainnet-only by the
+	// -wallet-http-enabled flag (default false, see cmd/netmap/main.go) -- when false, the
+	// POST /wallet-nodes submission/approval routes are unreachable AND the poll loop never
+	// dials a populated wallet_http_port for any node, even a leftover value from manual DB
+	// testing.
+	//
+	// Visibility is gated identically to Address: see internal/api/privacy.go's ScrubNode,
+	// which only ever includes WalletHTTPPort in a PublicNode for a node whose
+	// DiscoverySource already permits address exposure (registry_submitted or both) --
+	// there is deliberately no separate, ungated way to learn this value.
+	WalletHTTPPort *int `json:"wallet_http_port,omitempty"`
 }
 
 // NodeAddress is one address a node has ever been seen at. A node can have
@@ -153,6 +198,16 @@ type NodeFilter struct {
 	// unfiltered ListNodes scan over the entire node table on every
 	// tick.
 	Owned *bool
+
+	// HasWalletHTTPPort, if non-nil, restricts results by whether a node has a non-null
+	// wallet_http_port (see storage.Node.WalletHTTPPort's doc comment for the full
+	// feature/safety-rule context): true means "wallet_http_port IS NOT NULL", false means
+	// "wallet_http_port IS NULL". A nil HasWalletHTTPPort (the zero value) means "no
+	// filtering", following the same nil-pointer / "unset means no filtering" convention as
+	// Confirmed/HasHealthChecks/Owned above. This backs both the /wallet-nodes dashboard
+	// page (internal/web) and internal/collector's wallet-sync-HTTP poll dispatch, which
+	// both need exactly this population.
+	HasWalletHTTPPort *bool
 
 	// Owner, if non-empty, restricts results to nodes where
 	// tags->>'owner' exactly equals this value (parameterized exact
@@ -379,6 +434,97 @@ type PendingSubmission struct {
 	// comment for why).
 	ProbeAttemptedAt *time.Time `json:"probe_attempted_at,omitempty"`
 	ProbeReachable   *bool      `json:"probe_reachable,omitempty"`
+}
+
+// PendingWalletSubmission is one row of the SEPARATE public wallet-node registration review
+// queue (see 0014_wallet_node_submissions.sql), mirroring PendingSubmission's SHAPE
+// (public submit -> queued 'pending' -> admin approve/reject) but as its own, independent
+// resource -- NOT a field bolted onto PendingSubmission/nodes' base-node submission flow.
+// See Netmap-Wallet-HTTP-Port-Design-2026-09-19.md and this feature's dispatch brief for the
+// full rationale: this flow exists specifically to (a) require wallet_http_port explicitly
+// and unconditionally (never optional, unlike the old bundled draft), (b) link to an
+// ALREADY-KNOWN node purely by public-IP host match (never create a new node), and (c) gate
+// admin approval behind a SYNCHRONOUS active-verification probe of the submitted port -- see
+// handleApproveWalletSubmission's doc comment in internal/api/api.go.
+//
+// This entire flow (submission, admin review, and any effect on a node's own
+// storage.Node.WalletHTTPPort) is reachable only when the mainnet-only -wallet-http-enabled
+// flag is true (see cmd/netmap/main.go) -- it must not exist at all, functionally, on a
+// testnet (esmeralda) deployment.
+type PendingWalletSubmission struct {
+	ID uuid.UUID `json:"id"`
+
+	// Host is the public IP (or otherwise-syntactically-valid host, see
+	// internal/api's validateSubmittedHost) being registered -- deliberately just the
+	// host, NOT "host:port" -- since this flow's whole point (directive #2 in the
+	// dispatch brief: "link via public IP's only") is linking to an existing node by its
+	// host alone; the submitter is not required to know/reference that node's internal
+	// ID or its base P2P port at all.
+	Host string `json:"host"`
+
+	// WalletHTTPPort is REQUIRED here (unlike the old bundled draft's optional field on
+	// POST /nodes) -- this endpoint's entire purpose is registering this port, so a
+	// missing/zero value is rejected at submission time (see
+	// handleCreateWalletNodeSubmission), never persisted as a zero/nil placeholder.
+	WalletHTTPPort int `json:"wallet_http_port"`
+
+	Status          string     `json:"status"`
+	SubmittedAt     time.Time  `json:"submitted_at"`
+	ReviewedAt      *time.Time `json:"reviewed_at,omitempty"`
+	RejectionReason *string    `json:"rejection_reason,omitempty"`
+
+	// PromotedNodeID, once approved, is the id of the already-existing node this
+	// submission's wallet_http_port was written onto -- "promoted" is a slight misnomer
+	// carried over from PendingSubmission's naming convention for consistency (unlike
+	// that flow, this one never creates a new node; it only ever links to one that
+	// already existed at approval time). See mergeNodeInto's FK-repoint handling for this
+	// column -- mirrors pending_submissions.promoted_node_id's own repoint, since the
+	// linked node's id can itself be retired into another node's id via a later
+	// pubkey-confirmation merge.
+	PromotedNodeID *uuid.UUID `json:"promoted_node_id,omitempty"`
+
+	// ProbeAttemptedAt/ProbeReachable record the outcome of a best-effort, non-blocking,
+	// INFORMATIONAL-ONLY connectivity probe kicked off at submission time (see
+	// probeWalletSubmission in internal/api/probe.go) -- for the admin reviewer's
+	// benefit only, mirroring PendingSubmission's own ProbeAttemptedAt/ProbeReachable
+	// fields exactly. This is NOT the enforcement gate -- see the ProbeSucceeded/
+	// ProbeCheckedAt/ProbeIsSynced/ProbeHeight "matrix" fields below for that.
+	ProbeAttemptedAt *time.Time `json:"probe_attempted_at,omitempty"`
+	ProbeReachable   *bool      `json:"probe_reachable,omitempty"`
+
+	// ProbeSucceeded/ProbeCheckedAt/ProbeIsSynced/ProbeHeight are the "permissions
+	// matrix" (directive #3 in the dispatch brief) -- a small, honest record of exactly
+	// what the SYNCHRONOUS, approval-gating sanity probe (walletHTTPClient.GetInfo
+	// against ONLY GET /get_tip_info, see that client's hard safety-rule doc comment)
+	// confirmed, recorded ONLY at successful-approval time (see
+	// handleApproveWalletSubmission) -- never at submission time, and never for a
+	// failed/rejected approval attempt (a failed approval attempt writes nothing here;
+	// the submission stays 'pending' so a human can retry or reject it). This is
+	// deliberately more than a bare "verified: true" boolean: it records precisely which
+	// safe capability was checked (tip-info reachability + sync state + height) and
+	// when, not a vague trust assertion.
+	ProbeSucceeded *bool      `json:"probe_succeeded,omitempty"`
+	ProbeCheckedAt *time.Time `json:"probe_checked_at,omitempty"`
+	ProbeIsSynced  *bool      `json:"probe_is_synced,omitempty"`
+	ProbeHeight    *int64     `json:"probe_height,omitempty"`
+}
+
+// WalletProbeOutcome is the outcome of the synchronous, approval-gating sanity probe --
+// passed to Store.ApprovePendingWalletSubmission so it can populate the "permissions
+// matrix" fields on PendingWalletSubmission (see that type's doc comment) as part of the
+// SAME approval write, rather than a separate follow-up call. Only ever constructed by
+// handleApproveWalletSubmission AFTER walletHTTPClient.GetInfo has already succeeded --
+// there is no legitimate way to construct one representing a failed probe, since a failed
+// probe never reaches the point of calling ApprovePendingWalletSubmission at all.
+type WalletProbeOutcome struct {
+	// IsSynced mirrors walletTipInfoResponse.IsSynced (internal/collector/
+	// wallet_http_client.go) -- decoded by that client but, until now, discarded
+	// everywhere else; this is the first place it's actually persisted.
+	IsSynced bool
+
+	// Height mirrors NodeInfo.Height (metadata.best_block_height from the same
+	// /get_tip_info response) -- nil if the response carried no metadata block at all.
+	Height *int64
 }
 
 // GeoIPEntry is one cached geoip_cache row: the resolved (or

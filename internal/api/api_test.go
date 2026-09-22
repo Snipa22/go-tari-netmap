@@ -96,7 +96,7 @@ func newTestStore(t *testing.T) storage.Store {
 	if err != nil {
 		t.Fatalf("connect for truncate: %v", err)
 	}
-	if _, err := pool.Exec(ctx, "TRUNCATE TABLE node_health, peer_edge_observations, node_addresses, pending_submissions, nodes, geoip_cache CASCADE"); err != nil {
+	if _, err := pool.Exec(ctx, "TRUNCATE TABLE node_health, peer_edge_observations, node_addresses, pending_submissions, pending_wallet_submissions, nodes, geoip_cache CASCADE"); err != nil {
 		pool.Close()
 		t.Fatalf("truncate test tables: %v", err)
 	}
@@ -193,7 +193,7 @@ func newTestServerWithCreds(t *testing.T, client collector.NodeClient, creds adm
 	// p2pClient is nil here: these tests only exercise the gRPC-labeled
 	// async health-check kickoff path; dual-probe behavior is covered by
 	// internal/collector's own tests.
-	srv := httptest.NewServer(api.NewRouter(store, client, nil, creds, testCollectorKeys(), api.DefaultStatsCacheTTL, api.DefaultDirectoryCacheTTL))
+	srv := httptest.NewServer(api.NewRouter(store, client, nil, nil, true, creds, testCollectorKeys(), api.DefaultStatsCacheTTL, api.DefaultDirectoryCacheTTL))
 	t.Cleanup(srv.Close)
 	return srv, store
 }
@@ -3037,7 +3037,7 @@ func (c *countingStatsStore) NetworkHeight(ctx context.Context) (*int64, int, er
 // specifically exercise the cache's own timing behavior.
 func newTestServerWithStatsCacheTTL(t *testing.T, store storage.Store, ttl time.Duration) *httptest.Server {
 	t.Helper()
-	srv := httptest.NewServer(api.NewRouter(store, collector.NewStubClient(), nil, adminauth.Credentials{Username: testAdminUser, Password: testAdminPassword}, testCollectorKeys(), ttl, api.DefaultDirectoryCacheTTL))
+	srv := httptest.NewServer(api.NewRouter(store, collector.NewStubClient(), nil, nil, true, adminauth.Credentials{Username: testAdminUser, Password: testAdminPassword}, testCollectorKeys(), ttl, api.DefaultDirectoryCacheTTL))
 	t.Cleanup(srv.Close)
 	return srv
 }

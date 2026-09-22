@@ -95,7 +95,7 @@ func newTestStore(t *testing.T) storage.Store {
 	if err != nil {
 		t.Fatalf("connect for truncate: %v", err)
 	}
-	if _, err := pool.Exec(ctx, "TRUNCATE TABLE node_health, peer_edge_observations, node_addresses, pending_submissions, nodes, geoip_cache CASCADE"); err != nil {
+	if _, err := pool.Exec(ctx, "TRUNCATE TABLE node_health, peer_edge_observations, node_addresses, pending_submissions, pending_wallet_submissions, nodes, geoip_cache CASCADE"); err != nil {
 		pool.Close()
 		t.Fatalf("truncate test tables: %v", err)
 	}
@@ -129,9 +129,27 @@ func newTestServer(t *testing.T, store storage.Store) *httptest.Server {
 // request per fresh server/store, so the cache's TTL has no observable
 // effect here; see newTestServerWithCountsCacheTTL below for tests that
 // specifically exercise the cache's own timing/sharing behavior.
+//
+// walletHTTPEnabled is always true here -- every EXISTING test built via this helper
+// predates (and exercises) the /wallet-nodes page's enabled-state behavior; see
+// newTestServerWithWalletHTTPEnabled below for the dedicated disabled-state test.
 func newTestServerWithCreds(t *testing.T, store storage.Store, creds adminauth.Credentials) *httptest.Server {
 	t.Helper()
-	handler, err := web.NewHandler(store, creds, web.DefaultDashboardCountsCacheTTL)
+	handler, err := web.NewHandler(store, creds, web.DefaultDashboardCountsCacheTTL, true)
+	if err != nil {
+		t.Fatalf("build web handler: %v", err)
+	}
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// newTestServerWithWalletHTTPEnabled is like newTestServer but lets the caller control the
+// walletHTTPEnabled flag directly -- used only by the /wallet-nodes disabled-state test
+// (every other test wants the true default newTestServer already provides).
+func newTestServerWithWalletHTTPEnabled(t *testing.T, store storage.Store, walletHTTPEnabled bool) *httptest.Server {
+	t.Helper()
+	handler, err := web.NewHandler(store, adminauth.Credentials{Username: testAdminUser, Password: testAdminPassword}, web.DefaultDashboardCountsCacheTTL, walletHTTPEnabled)
 	if err != nil {
 		t.Fatalf("build web handler: %v", err)
 	}
@@ -147,7 +165,7 @@ func newTestServerWithCreds(t *testing.T, store storage.Store, creds adminauth.C
 // specifically exercise the cache's own timing/sharing behavior.
 func newTestServerWithCountsCacheTTL(t *testing.T, store storage.Store, ttl time.Duration) *httptest.Server {
 	t.Helper()
-	handler, err := web.NewHandler(store, adminauth.Credentials{Username: testAdminUser, Password: testAdminPassword}, ttl)
+	handler, err := web.NewHandler(store, adminauth.Credentials{Username: testAdminUser, Password: testAdminPassword}, ttl, true)
 	if err != nil {
 		t.Fatalf("build web handler: %v", err)
 	}
@@ -169,6 +187,10 @@ func getBody(t *testing.T, url string) (int, string) {
 	}
 	return resp.StatusCode, string(body)
 }
+
+// intPtr is a small helper for building *int literals inline in test fixtures (e.g.
+// storage.Node.WalletHTTPPort).
+func intPtr(n int) *int { return &n }
 
 // getBodyWithAuth is like getBody but sets an Authorization: Basic
 // header (via req.SetBasicAuth) using the given user/pass before
@@ -1233,6 +1255,99 @@ func TestP2PNodeWithMultipleAddressesHidesAllAddresses(t *testing.T) {
 	}
 	if strings.Contains(detailBody, onionAddr) {
 		t.Errorf("GET /nodes/%s body contains its own onion address %q", node.ID, onionAddr)
+	}
+}
+
+// TestWalletNodesPageHidesP2PDiscoveredNode is this feature's scrub-gating test at the web
+// layer (see internal/api/privacy_test.go's TestScrubNodeP2PHidesWalletHTTPPort for the
+// underlying ScrubNode-level guarantee this builds on): a node with
+// discovery_source = p2p_discovered and a wallet_http_port set must NOT appear on
+// /wallet-nodes at all -- not with a blank address, not at all -- since /wallet-nodes has no
+// separate, ungated route to this data (see handleWalletNodes' doc comment).
+func TestWalletNodesPageHidesP2PDiscoveredNode(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	const p2pAddr = "1.2.3.4:18142"
+	n, err := store.UpsertDiscoveredNode(ctx, p2pAddr, storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert p2p node: %v", err)
+	}
+	if err := store.SetNodeWalletHTTPPort(ctx, n.ID, intPtr(9000)); err != nil {
+		t.Fatalf("set wallet_http_port: %v", err)
+	}
+
+	srv := newTestServer(t, store)
+	status, body := getBody(t, srv.URL+"/wallet-nodes")
+	if status != http.StatusOK {
+		t.Fatalf("GET /wallet-nodes status = %d, want %d", status, http.StatusOK)
+	}
+	if strings.Contains(body, p2pAddr) {
+		t.Errorf("GET /wallet-nodes body contains p2p_discovered node's address %q -- must never be exposed", p2pAddr)
+	}
+	if strings.Contains(body, "9000") {
+		t.Errorf("GET /wallet-nodes body contains p2p_discovered node's wallet_http_port %q -- must never be exposed", "9000")
+	}
+	if !strings.Contains(body, "No nodes have opted into wallet-sync HTTP listing yet.") {
+		t.Errorf("GET /wallet-nodes body = %q, want the empty-state message (this node must be excluded, not shown blank)", body)
+	}
+}
+
+// TestWalletNodesPageShowsOptedInNode verifies the positive case: a node with
+// discovery_source = registry_submitted and a wallet_http_port set DOES appear, with the
+// SAME host as its own address (see storage.Node.WalletHTTPPort's "never a different host"
+// doc comment) paired with the wallet_http_port.
+func TestWalletNodesPageShowsOptedInNode(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	const addr = "5.6.7.8:18142"
+	n, err := store.UpsertDiscoveredNode(ctx, addr, storage.DiscoverySourceRegistry, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert registry node: %v", err)
+	}
+	if err := store.SetNodeWalletHTTPPort(ctx, n.ID, intPtr(9000)); err != nil {
+		t.Fatalf("set wallet_http_port: %v", err)
+	}
+	height := int64(777)
+	if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{
+		NodeID: n.ID, Reachable: true, ProbeSource: storage.ProbeSourceWalletHTTP, Height: &height,
+	}); err != nil {
+		t.Fatalf("record wallet_http health check: %v", err)
+	}
+
+	srv := newTestServer(t, store)
+	status, body := getBody(t, srv.URL+"/wallet-nodes")
+	if status != http.StatusOK {
+		t.Fatalf("GET /wallet-nodes status = %d, want %d", status, http.StatusOK)
+	}
+	if !strings.Contains(body, "5.6.7.8:9000") {
+		t.Errorf("GET /wallet-nodes body = %q, want it to contain the node's host paired with its wallet_http_port (%q)", body, "5.6.7.8:9000")
+	}
+	if !strings.Contains(body, "777") {
+		t.Errorf("GET /wallet-nodes body missing the latest wallet_http height (777)")
+	}
+}
+
+// TestWalletNodesPageExcludesNodeWithoutWalletHTTPPort verifies a regular opted-in node with
+// no wallet_http_port set at all (the overwhelming common case) is excluded from this page
+// -- this page is specifically the wallet-sync-capable subset, not every opted-in node.
+func TestWalletNodesPageExcludesNodeWithoutWalletHTTPPort(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	const addr = "9.9.9.9:18142"
+	if _, err := store.UpsertDiscoveredNode(ctx, addr, storage.DiscoverySourceRegistry, nil, nil); err != nil {
+		t.Fatalf("upsert registry node: %v", err)
+	}
+
+	srv := newTestServer(t, store)
+	status, body := getBody(t, srv.URL+"/wallet-nodes")
+	if status != http.StatusOK {
+		t.Fatalf("GET /wallet-nodes status = %d, want %d", status, http.StatusOK)
+	}
+	if strings.Contains(body, addr) {
+		t.Errorf("GET /wallet-nodes body contains a node with no wallet_http_port set: %q", addr)
 	}
 }
 
