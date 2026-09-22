@@ -289,8 +289,17 @@ func TestRefreshGeoIPNilClientNoop(t *testing.T) {
 }
 
 // TestRefreshGeoIPIgnoresNonOwnerNodes confirms a node with no owner tag
-// at all contributes no candidate IP -- RefreshGeoIP must never spend an
-// ip-api.com request on a node outside the /map population.
+// at all AND no recent (last-24h) reachable health check contributes no
+// candidate IP -- RefreshGeoIP must never spend an ip-api.com request on
+// a node outside BOTH the owner-tagged /map population and the
+// anonymous-but-reachable-in-24h population (see
+// anonymousReachableIPv4Addresses/BRIEF.md's "expand geoip refresh to
+// also cover the anonymous population (bounded)"). This node
+// deliberately has zero node_health rows at all, so it's excluded from
+// the anonymous population purely on the ReachableSince bound --
+// TestAnonymousReachableIPv4AddressesPredicate below covers that
+// exclusion directly/unit-style; this test confirms RefreshGeoIP's own
+// end-to-end wiring honors it too.
 func TestRefreshGeoIPIgnoresNonOwnerNodes(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -315,6 +324,147 @@ func TestRefreshGeoIPIgnoresNonOwnerNodes(t *testing.T) {
 		t.Fatalf("RefreshGeoIP: %v", err)
 	}
 	if fake.requests != 0 {
-		t.Errorf("expected zero HTTP calls for a non-owner-tagged node, got %d", fake.requests)
+		t.Errorf("expected zero HTTP calls for a non-owner-tagged, never-reachable node, got %d", fake.requests)
+	}
+}
+
+// TestAnonymousReachableIPv4AddressesPredicate exercises
+// anonymousReachableIPv4Addresses' full candidate predicate directly
+// (see BRIEF.md's Testing section): a reachable-in-24h, non-owner-tagged
+// node's IPv4 is included; an owner-tagged node is excluded even though
+// reachable; a non-owner-tagged node with NO recent health check is
+// excluded; a role=collector-tagged node is excluded even if otherwise
+// eligible (reachable, non-owner-tagged).
+func TestAnonymousReachableIPv4AddressesPredicate(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	// Eligible: non-owner-tagged, reachable within 24h.
+	eligible, err := store.UpsertDiscoveredNode(ctx, "203.0.113.10:18189", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("seed eligible node: %v", err)
+	}
+	if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{
+		NodeID: eligible.ID, Reachable: true, ProbeSource: storage.ProbeSourceGRPC,
+	}); err != nil {
+		t.Fatalf("record health check for eligible node: %v", err)
+	}
+
+	// Excluded: owner-tagged, even though reachable within 24h.
+	owned, err := store.UpsertDiscoveredNode(ctx, "203.0.113.11:18189", storage.DiscoverySourceP2P,
+		map[string]any{"owner": "Alice"}, nil)
+	if err != nil {
+		t.Fatalf("seed owner-tagged node: %v", err)
+	}
+	if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{
+		NodeID: owned.ID, Reachable: true, ProbeSource: storage.ProbeSourceGRPC,
+	}); err != nil {
+		t.Fatalf("record health check for owner-tagged node: %v", err)
+	}
+
+	// Excluded: non-owner-tagged, but no recent (or any) health check at all.
+	_, err = store.UpsertDiscoveredNode(ctx, "203.0.113.12:18189", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("seed never-reachable node: %v", err)
+	}
+
+	// Excluded: role=collector-tagged, even though reachable within 24h
+	// and not owner-tagged (otherwise fully eligible).
+	collector, err := store.UpsertDiscoveredNode(ctx, "203.0.113.13:18189", storage.DiscoverySourceP2P,
+		map[string]any{"role": "collector"}, nil)
+	if err != nil {
+		t.Fatalf("seed role=collector node: %v", err)
+	}
+	if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{
+		NodeID: collector.ID, Reachable: true, ProbeSource: storage.ProbeSourceGRPC,
+	}); err != nil {
+		t.Fatalf("record health check for role=collector node: %v", err)
+	}
+
+	c := New(Config{})
+	c.Storage = store
+
+	ips, err := c.anonymousReachableIPv4Addresses(ctx)
+	if err != nil {
+		t.Fatalf("anonymousReachableIPv4Addresses: %v", err)
+	}
+
+	got := make(map[string]bool, len(ips))
+	for _, ip := range ips {
+		got[ip] = true
+	}
+
+	if !got["203.0.113.10"] {
+		t.Errorf("expected 203.0.113.10 (eligible: non-owner, reachable-in-24h) to be included, got %v", ips)
+	}
+	if got["203.0.113.11"] {
+		t.Errorf("expected 203.0.113.11 (owner-tagged) to be excluded, got %v", ips)
+	}
+	if got["203.0.113.12"] {
+		t.Errorf("expected 203.0.113.12 (never reachable) to be excluded, got %v", ips)
+	}
+	if got["203.0.113.13"] {
+		t.Errorf("expected 203.0.113.13 (role=collector) to be excluded, got %v", ips)
+	}
+	if len(ips) != 1 {
+		t.Errorf("anonymousReachableIPv4Addresses = %v, want exactly [203.0.113.10]", ips)
+	}
+}
+
+// TestRefreshGeoIPPopulatesAnonymousPopulation is the integration-style
+// counterpart to TestAnonymousReachableIPv4AddressesPredicate above (see
+// BRIEF.md's Testing section): it drives RefreshGeoIP itself, end to
+// end, against a reachable-in-24h anonymous (non-owner-tagged) node and
+// confirms a geoip_cache row gets written for its IP -- the actual bug
+// this whole dispatch exists to fix (GET /nodes/map/extended's
+// `anonymous` array was permanently empty because nothing upstream ever
+// populated geoip_cache for non-owner-tagged nodes at all).
+func TestRefreshGeoIPPopulatesAnonymousPopulation(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	anon, err := store.UpsertDiscoveredNode(ctx, "198.51.100.42:18189", storage.DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("seed anonymous node: %v", err)
+	}
+	if err := store.RecordHealthCheck(ctx, storage.HealthCheckInput{
+		NodeID: anon.ID, Reachable: true, ProbeSource: storage.ProbeSourceGRPC,
+	}); err != nil {
+		t.Fatalf("record health check for anonymous node: %v", err)
+	}
+
+	fake := &fakeGeoIPDoer{byIP: map[string]struct {
+		lat, lon      float64
+		city, country string
+		fail          bool
+	}{
+		"198.51.100.42": {lat: 37.77, lon: -122.42, city: "San Francisco", country: "United States"},
+	}}
+	client := &geoip.Client{HTTPClient: fake, Limiter: rate.NewLimiter(rate.Inf, 10)}
+
+	c := New(Config{})
+	c.Storage = store
+	c.GeoIPClient = client
+
+	if err := c.RefreshGeoIP(ctx); err != nil {
+		t.Fatalf("RefreshGeoIP: %v", err)
+	}
+	if fake.requests != 1 {
+		t.Fatalf("expected exactly 1 HTTP batch call, got %d", fake.requests)
+	}
+
+	cache, err := store.GetGeoIPCache(ctx, []string{"198.51.100.42"})
+	if err != nil {
+		t.Fatalf("GetGeoIPCache: %v", err)
+	}
+	entry, ok := cache["198.51.100.42"]
+	if !ok {
+		t.Fatalf("expected a cached geoip entry for 198.51.100.42 (anonymous, reachable-in-24h node)")
+	}
+	if entry.LookupFailed {
+		t.Errorf("entry.LookupFailed = true, want false")
+	}
+	if entry.City != "San Francisco" || entry.Country != "United States" {
+		t.Errorf("unexpected cached entry: %+v", entry)
 	}
 }
