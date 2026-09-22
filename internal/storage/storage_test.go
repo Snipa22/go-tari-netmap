@@ -453,6 +453,71 @@ func TestListNodesOwnedFilter(t *testing.T) {
 	}
 }
 
+// TestListNodesOwnerFilter covers NodeFilter.Owner: exact-match (not
+// substring/ILIKE) filtering on tags->>'owner', and confirms a nil/empty
+// Owner value applies no filtering at all (zero-value NodeFilter{}
+// invariant, same as every other optional field on this struct).
+func TestListNodesOwnerFilter(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	alice, err := store.UpsertDiscoveredNode(ctx, "owner-alice:1", DiscoverySourceP2P, map[string]any{"owner": "Alice"}, nil)
+	if err != nil {
+		t.Fatalf("upsert owner-alice: %v", err)
+	}
+	// A second node owned by the same "Alice" -- confirms the filter
+	// matches every node sharing an owner value, not just one.
+	aliceToo, err := store.UpsertDiscoveredNode(ctx, "owner-alice-2:1", DiscoverySourceP2P, map[string]any{"owner": "Alice"}, nil)
+	if err != nil {
+		t.Fatalf("upsert owner-alice-2: %v", err)
+	}
+	if _, err := store.UpsertDiscoveredNode(ctx, "owner-bob:1", DiscoverySourceP2P, map[string]any{"owner": "Bob"}, nil); err != nil {
+		t.Fatalf("upsert owner-bob: %v", err)
+	}
+	// A partial/substring match of "Alice" that must NOT be returned by
+	// an exact-match filter -- proves Owner is not ILIKE/substring.
+	if _, err := store.UpsertDiscoveredNode(ctx, "owner-alicex:1", DiscoverySourceP2P, map[string]any{"owner": "Alicex"}, nil); err != nil {
+		t.Fatalf("upsert owner-alicex: %v", err)
+	}
+	if _, err := store.UpsertDiscoveredNode(ctx, "owner-empty:1", DiscoverySourceP2P, map[string]any{"owner": ""}, nil); err != nil {
+		t.Fatalf("upsert owner-empty: %v", err)
+	}
+	if _, err := store.UpsertDiscoveredNode(ctx, "owner-none:1", DiscoverySourceP2P, nil, nil); err != nil {
+		t.Fatalf("upsert owner-none: %v", err)
+	}
+
+	matches, err := store.ListNodes(ctx, NodeFilter{Owner: "Alice"})
+	if err != nil {
+		t.Fatalf("list Owner=Alice: %v", err)
+	}
+	gotMatches := make(map[uuid.UUID]bool, len(matches))
+	for _, n := range matches {
+		gotMatches[n.ID] = true
+	}
+	if len(matches) != 2 || !gotMatches[alice.ID] || !gotMatches[aliceToo.ID] {
+		t.Fatalf("Owner=Alice filter = %+v, want exactly %s and %s", matches, alice.Address, aliceToo.Address)
+	}
+
+	count, err := store.CountNodes(ctx, NodeFilter{Owner: "Alice"})
+	if err != nil {
+		t.Fatalf("count Owner=Alice: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("CountNodes Owner=Alice = %d, want 2 (must agree with ListNodes)", count)
+	}
+
+	// Critical invariant: an empty Owner (the zero value) must return
+	// everything, completely unaffected by the new field's mere
+	// existence.
+	all, err := store.ListNodes(ctx, NodeFilter{})
+	if err != nil {
+		t.Fatalf("list all (zero-value filter): %v", err)
+	}
+	if len(all) != 6 {
+		t.Fatalf("len(all) = %d, want 6 (zero-value NodeFilter{} must be unaffected by Owner)", len(all))
+	}
+}
+
 // TestListNodesPagination verifies that NodeFilter.Limit/Offset apply
 // real SQL-level pagination (a correct page, in the same address-sorted
 // order ListNodes always uses), and that a zero-value filter still

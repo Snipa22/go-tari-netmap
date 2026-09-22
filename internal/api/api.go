@@ -64,8 +64,12 @@ var MaxPendingSubmissions = 100
 // adminCreds' own fail-closed convention. statsCacheTTL
 // configures GET /v1/stats' in-process response cache (see stats.go's
 // statsCache/handleStats/DefaultStatsCacheTTL) — callers that don't care
-// can pass DefaultStatsCacheTTL.
-func NewRouter(store storage.Store, grpcClient, p2pClient collector.NodeClient, adminCreds adminauth.Credentials, collectors map[string]CollectorConfig, statsCacheTTL time.Duration) http.Handler {
+// can pass DefaultStatsCacheTTL. directoryCacheTTL configures GET
+// /v1/directory's own in-process, per-query-param-combination response
+// cache (see directory.go's directoryCache/handleDirectory/
+// DefaultDirectoryCacheTTL) — callers that don't care can pass
+// DefaultDirectoryCacheTTL.
+func NewRouter(store storage.Store, grpcClient, p2pClient collector.NodeClient, adminCreds adminauth.Credentials, collectors map[string]CollectorConfig, statsCacheTTL, directoryCacheTTL time.Duration) http.Handler {
 	mux := http.NewServeMux()
 
 	// Created once and shared across every POST /nodes call (NewRouter
@@ -103,6 +107,15 @@ func NewRouter(store storage.Store, grpcClient, p2pClient collector.NodeClient, 
 	// its response shape get their own /v2/ route instead of breaking
 	// existing callers in place.
 	mux.HandleFunc("GET /v1/stats", handleStats(store, statsCacheTTL))
+
+	// GET /v1/directory backs a third-party directory feed (TariTalk
+	// Nodes, see directory.go's doc comment / BRIEF.md's background)
+	// that splits the whole node population into `attributed`
+	// (owner-tagged) and `anonymous` (city/country-only geo, never
+	// lat/lon, never a real address) populations. Same trust level and
+	// versioning rationale as GET /v1/stats above — public,
+	// unauthenticated, deliberately NOT under /admin.
+	mux.HandleFunc("GET /v1/directory", handleDirectory(store, directoryCacheTTL))
 
 	// Seed-node suggestion + Tari config.toml peer_seeds generator. Same
 	// trust level as the other read routes above (GET /nodes, GET
@@ -211,6 +224,7 @@ func handleListNodes(store storage.Store) http.HandlerFunc {
 
 		filter := storage.NodeFilter{
 			DiscoverySource: storage.DiscoverySource(r.URL.Query().Get("discovery_source")),
+			Owner:           r.URL.Query().Get("owner"),
 			Limit:           limit,
 			Offset:          offset,
 		}
