@@ -32,6 +32,84 @@ func TestScrubNodeP2PHidesAddress(t *testing.T) {
 	}
 }
 
+// TestScrubNodeP2PHidesWalletHTTPPort is the single most safety-critical test in this
+// feature's brief: a p2p_discovered node's wallet_http_port must NEVER be exposed via
+// ScrubNode (the single choke point every address-revealing API/dashboard route in this
+// codebase goes through), even if that field somehow ended up set on the underlying
+// storage.Node -- see storage.Node.WalletHTTPPort's doc comment for the hard safety rule
+// this test proves is actually enforced, not just documented. A p2p_discovered node's
+// address is already hidden (see TestScrubNodeP2PHidesAddress above); this proves
+// WalletHTTPPort is hidden identically, through the exact same gate, not a separate,
+// possibly-forgotten condition.
+func TestScrubNodeP2PHidesWalletHTTPPort(t *testing.T) {
+	port := 9000
+	n := storage.Node{
+		ID:              uuid.New(),
+		Address:         "1.2.3.4:18142",
+		DiscoverySource: storage.DiscoverySourceP2P,
+		Tags:            map[string]any{},
+		FirstSeen:       time.Now(),
+		LastSeen:        time.Now(),
+		WalletHTTPPort:  &port,
+	}
+
+	pn := ScrubNode(n, nil)
+
+	if pn.WalletHTTPPort != nil {
+		t.Errorf("WalletHTTPPort = %v, want nil for p2p_discovered node -- this must never be exposed for a node whose discovery_source doesn't permit address exposure", *pn.WalletHTTPPort)
+	}
+	if len(pn.Addresses) != 0 {
+		t.Errorf("Addresses = %v, want empty for p2p_discovered node", pn.Addresses)
+	}
+}
+
+// TestScrubNodeBothDiscoverySourceExposesWalletHTTPPort verifies the positive case: a node
+// whose discovery_source is "both" (seen via both P2P discovery AND public registry
+// submission) DOES expose WalletHTTPPort, exactly like it exposes Addresses -- both are
+// gated by the identical condition in ScrubNode.
+func TestScrubNodeBothDiscoverySourceExposesWalletHTTPPort(t *testing.T) {
+	port := 9000
+	n := storage.Node{
+		ID:              uuid.New(),
+		Address:         "9.9.9.9:18142",
+		DiscoverySource: storage.DiscoverySourceBoth,
+		Tags:            map[string]any{},
+		FirstSeen:       time.Now(),
+		LastSeen:        time.Now(),
+		WalletHTTPPort:  &port,
+	}
+
+	pn := ScrubNode(n, nil)
+
+	if pn.WalletHTTPPort == nil || *pn.WalletHTTPPort != port {
+		t.Errorf("WalletHTTPPort = %v, want %d", pn.WalletHTTPPort, port)
+	}
+	if len(pn.Addresses) != 1 || pn.Addresses[0] != "9.9.9.9:18142" {
+		t.Errorf("Addresses = %v, want [9.9.9.9:18142]", pn.Addresses)
+	}
+}
+
+// TestScrubNodeRegistrySubmittedNilWalletHTTPPort verifies that an opted-in
+// (registry_submitted) node with NO wallet_http_port set (the overwhelming common case --
+// see storage.Node.WalletHTTPPort's doc comment: this is opt-in, not every registered node
+// has one) simply omits it, rather than exposing some fabricated/zero value.
+func TestScrubNodeRegistrySubmittedNilWalletHTTPPort(t *testing.T) {
+	n := storage.Node{
+		ID:              uuid.New(),
+		Address:         "5.6.7.8:18142",
+		DiscoverySource: storage.DiscoverySourceRegistry,
+		Tags:            map[string]any{},
+		FirstSeen:       time.Now(),
+		LastSeen:        time.Now(),
+	}
+
+	pn := ScrubNode(n, nil)
+
+	if pn.WalletHTTPPort != nil {
+		t.Errorf("WalletHTTPPort = %v, want nil (no port was ever set on this node)", *pn.WalletHTTPPort)
+	}
+}
+
 func TestScrubNodeRegistrySubmittedShowsAddress(t *testing.T) {
 	n := storage.Node{
 		ID:              uuid.New(),

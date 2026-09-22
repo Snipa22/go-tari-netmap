@@ -178,6 +178,15 @@ type Store interface {
 	// probe with every such field nil.
 	GetRecentSuccessfulHealthChecks(ctx context.Context, nodeID uuid.UUID, limit int) ([]HealthCheck, error)
 
+	// GetLatestHealthCheck returns the single most recent node_health row for nodeID with
+	// the given probeSource (regardless of reachable), or (nil, nil) if no such row exists
+	// yet. Unlike GetNodeHistory (which returns the most recent rows across EVERY probe
+	// source mixed together), this is scoped to one specific probeSource -- needed by the
+	// /wallet-nodes dashboard page (internal/web), which must show the latest
+	// storage.ProbeSourceWalletHTTP result specifically, not whatever the most recent
+	// probe of ANY kind happened to be for a node that's also polled over gRPC/P2P.
+	GetLatestHealthCheck(ctx context.Context, nodeID uuid.UUID, probeSource ProbeSource) (*HealthCheck, error)
+
 	// RecordPeerEdgeObservation records a single directed peer-topology
 	// edge observation. Unlike the old UpsertPeerEdge, this is a plain
 	// append-only INSERT — no ON CONFLICT, no dedup, no updating of an
@@ -249,6 +258,31 @@ type Store interface {
 	// meantime, between submission and review).
 	IsAddressPubliclyOptedIn(ctx context.Context, address string) (bool, error)
 
+	// FindNodeByHost looks up an existing node purely by the HOST part of any of its
+	// known addresses (node_addresses, falling back to nodes.address for rows that
+	// predate node_addresses being consistently maintained -- same fallback convention
+	// as UpsertDiscoveredNode/SetNodeWalletHTTPPortByAddress), ignoring port entirely.
+	// This is the "link via public IP only" lookup the wallet-node registration flow
+	// (POST /wallet-nodes) needs (see PendingWalletSubmission's doc comment) -- a
+	// submitter provides only a host, never a full "host:port" address or this node's
+	// internal ID, and this is how that host gets resolved to an already-known node.
+	//
+	// host must be an unbracketed host string (e.g. "1.2.3.4" or "2001:db8::1", NOT
+	// "1.2.3.4:9000" or "[2001:db8::1]") -- matching is done against the host portion of
+	// each stored "host:port"/"[host]:port" address string, split via the same
+	// net.SplitHostPort convention every other address-classifying code path in this
+	// codebase already uses (see internal/api/privacy.go's classifyAddress). If more
+	// than one node happens to have an address with this host (unusual, but not
+	// impossible -- e.g. a NAT/relay reused by two different peers over time), the
+	// most-recently-seen match is returned; this is a reasonable, deterministic
+	// tie-break for a rare edge case, not a case this method is expected to need to
+	// disambiguate further.
+	//
+	// Returns (Node{}, false, nil) if no node has an address with this host at all --
+	// this is NOT an error (the caller, e.g. handleCreateWalletNodeSubmission, treats a
+	// false found as "reject with 404/409", not as an internal error).
+	FindNodeByHost(ctx context.Context, host string) (node Node, found bool, err error)
+
 	// CreatePendingSubmission records a new public node-submission for
 	// review. If a PENDING submission for this exact address already
 	// exists, its label/owner_tag are updated in place and its
@@ -306,6 +340,87 @@ type Store interface {
 	// result (successful or failed) always fully replaces whatever was
 	// cached before for that IP.
 	UpsertGeoIPCache(ctx context.Context, entries []GeoIPEntry) error
+
+	// SetNodeWalletHTTPPort sets (port non-nil) or clears (port nil) the wallet_http_port
+	// column for the node with the given id. See storage.Node.WalletHTTPPort's doc comment
+	// for the hard, non-negotiable safety rule this is one half of enforcing: this is one of
+	// exactly two methods in the whole Store interface permitted to write this column at
+	// all, and it must never be called with a value derived from anything other than an
+	// explicit, operator/submitter-supplied port. The sole caller is
+	// internal/api/api.go's handleApproveSubmission, carrying a public submission's own
+	// explicit wallet_http_port field through onto the newly-promoted node.
+	SetNodeWalletHTTPPort(ctx context.Context, id uuid.UUID, port *int) error
+
+	// SetNodeWalletHTTPPortByAddress is SetNodeWalletHTTPPort's address-keyed sibling --
+	// see that method's doc comment for the shared hard safety rule. It exists because its
+	// sole caller, internal/collector's owned-node reconciliation (see
+	// Collector.OwnedWalletHTTPPorts/syncOwnedWalletHTTPPorts), knows a node only by its
+	// configured P2P address (from NETMAP_OWNED_WALLET_HTTP_ADDRESSES), not yet its
+	// internal id -- the node may not even have been discovered/created yet. Looks the node
+	// up the same way UpsertDiscoveredNode does (node_addresses first, falling back to
+	// nodes.address), and reports found=false with no error if no node exists for that
+	// address yet, rather than creating a placeholder node just to attach a port to it --
+	// the caller is expected to simply retry on a later pass once the node exists.
+	SetNodeWalletHTTPPortByAddress(ctx context.Context, address string, port int) (found bool, err error)
+
+	// WalletHTTPUptime returns the fraction (0.0-1.0) of storage.ProbeSourceWalletHTTP
+	// node_health rows for nodeID within the last `since` duration that were
+	// reachable = true, and the number of such rows that fraction was derived from.
+	// Returns (nil, 0, nil) if zero such rows exist within the window -- there is no
+	// pre-existing "uptime%" computation anywhere else in this codebase to reuse for this
+	// (verified before implementing: this feature introduces the concept from scratch), so
+	// this mirrors NetworkHeight's own "insufficient data -> nil" fallback convention and
+	// its 24h lookback window (the closest existing precedent for "how far back do we look
+	// for a health-derived aggregate") rather than inventing an unrelated one. Used only by
+	// the /wallet-nodes dashboard page (internal/web).
+	WalletHTTPUptime(ctx context.Context, nodeID uuid.UUID, since time.Duration) (*float64, int, error)
+
+	// CreatePendingWalletSubmission records a new public wallet-node registration for
+	// review (see PendingWalletSubmission's doc comment for the full flow/rationale).
+	// host must be non-empty and walletHTTPPort must already be a validated 1-65535 port
+	// -- this method itself does not re-validate either (see
+	// handleCreateWalletNodeSubmission for where that happens); it errors only on an
+	// empty host, as a defensive minimum. If a PENDING submission for this exact host
+	// already exists, its wallet_http_port is updated in place and its submitted_at is
+	// bumped, rather than creating a second row -- mirroring CreatePendingSubmission's
+	// own "update in place" behavior for the exact same reason (a partial unique index
+	// on (host) WHERE status = 'pending' enforces this at the database level too).
+	CreatePendingWalletSubmission(ctx context.Context, host string, walletHTTPPort int) (PendingWalletSubmission, error)
+
+	// ListPendingWalletSubmissions returns wallet-node submissions with the given exact
+	// status, newest-submitted first. An empty status defaults to "pending" (the review
+	// queue) -- mirrors ListPendingSubmissions exactly.
+	ListPendingWalletSubmissions(ctx context.Context, status string) ([]PendingWalletSubmission, error)
+
+	// GetPendingWalletSubmission returns a single wallet-node submission by ID. Returns
+	// ErrNotFound if no such submission exists.
+	GetPendingWalletSubmission(ctx context.Context, id uuid.UUID) (PendingWalletSubmission, error)
+
+	// RecordWalletSubmissionProbeResult records the outcome of a best-effort,
+	// non-blocking, INFORMATIONAL-ONLY connectivity probe run against a still-pending
+	// wallet-node submission at creation time -- mirrors RecordSubmissionProbeResult
+	// exactly (same "no status guard, no error on zero rows affected" race-tolerance,
+	// since the submission may have already been reviewed by the time this finishes).
+	// This is NEVER the approval-gating probe (see ApprovePendingWalletSubmission for
+	// that) and never touches node_health/nodes.
+	RecordWalletSubmissionProbeResult(ctx context.Context, id uuid.UUID, reachable bool) error
+
+	// ApprovePendingWalletSubmission marks wallet-node submission id as approved,
+	// setting reviewed_at, promoted_node_id, and the "permissions matrix" probe outcome
+	// fields (probe_succeeded = true, probe_checked_at = now(), probe_is_synced/
+	// probe_height from outcome) -- see PendingWalletSubmission's doc comment for what
+	// those fields mean. It does NOT itself set nodes.wallet_http_port -- that is a
+	// separate Store.SetNodeWalletHTTPPort call the caller (handleApproveWalletSubmission)
+	// makes alongside this one, inside the same handler, AFTER its own synchronous
+	// sanity probe has already succeeded; by the time this method is ever called, the
+	// probe that outcome describes has already passed. Returns an error if the
+	// submission is not currently "pending", mirroring ApprovePendingSubmission's guard.
+	ApprovePendingWalletSubmission(ctx context.Context, id uuid.UUID, promotedNodeID uuid.UUID, outcome WalletProbeOutcome) error
+
+	// RejectPendingWalletSubmission marks wallet-node submission id as rejected, setting
+	// reviewed_at and rejection_reason (may be nil). Mirrors RejectPendingSubmission's
+	// guard exactly: errors if the submission is not currently "pending".
+	RejectPendingWalletSubmission(ctx context.Context, id uuid.UUID, reason *string) error
 }
 
 // DefaultSeedHealthWindow is the default "currently healthy" recency
@@ -364,7 +479,7 @@ func (s *pgStore) Migrate(ctx context.Context) error {
 }
 
 // nodeColumns is the column list, in order, matching scanNode's Scan calls.
-const nodeColumns = "id, address, public_key, discovery_source, tags, label, first_seen, last_seen"
+const nodeColumns = "id, address, public_key, discovery_source, tags, label, first_seen, last_seen, wallet_http_port"
 
 // rowQuerier is the subset of *pgxpool.Pool's and pgx.Tx's method sets that
 // getNodeByID needs, letting it run against either a plain pool query or a
@@ -377,7 +492,7 @@ type rowQuerier interface {
 func scanNode(row pgx.Row) (Node, error) {
 	var n Node
 	var tagsOut []byte
-	if err := row.Scan(&n.ID, &n.Address, &n.PublicKey, &n.DiscoverySource, &tagsOut, &n.Label, &n.FirstSeen, &n.LastSeen); err != nil {
+	if err := row.Scan(&n.ID, &n.Address, &n.PublicKey, &n.DiscoverySource, &tagsOut, &n.Label, &n.FirstSeen, &n.LastSeen, &n.WalletHTTPPort); err != nil {
 		return Node{}, err
 	}
 	if err := json.Unmarshal(tagsOut, &n.Tags); err != nil {
@@ -452,8 +567,9 @@ func insertConfirmedNode(ctx context.Context, tx pgx.Tx, address string, publicK
 }
 
 // mergeNodeInto retires placeholderID into confirmedID: every
-// node_addresses/peer_edge_observations/node_health/pending_submissions.promoted_node_id
-// row referencing placeholderID is repointed at confirmedID (deleting any
+// node_addresses/peer_edge_observations/node_health/pending_submissions.promoted_node_id/
+// pending_wallet_submissions.promoted_node_id row referencing placeholderID is repointed at
+// confirmedID (deleting any
 // node_addresses row that would otherwise collide with confirmedID's own
 // UNIQUE(node_id, address) constraint, and any peer_edge_observations row
 // that would otherwise collide with confirmedID's own
@@ -529,6 +645,15 @@ func mergeNodeInto(ctx context.Context, tx pgx.Tx, placeholderID, confirmedID uu
 	}
 	if _, err := tx.Exec(ctx, `UPDATE pending_submissions SET promoted_node_id = $2 WHERE promoted_node_id = $1`, placeholderID, confirmedID); err != nil {
 		return fmt.Errorf("storage: merge: repoint pending_submissions.promoted_node_id: %w", err)
+	}
+	// pending_wallet_submissions.promoted_node_id gets the exact same FK-repoint
+	// treatment as pending_submissions.promoted_node_id just above -- this table is
+	// referenced by FK to nodes(id) too (see 0014_wallet_node_submissions.sql), and a
+	// wallet-node submission's linked node can itself later be retired into another
+	// node's id via this exact merge path (e.g. the linked node gets its pubkey
+	// confirmed after the wallet submission was already approved against it).
+	if _, err := tx.Exec(ctx, `UPDATE pending_wallet_submissions SET promoted_node_id = $2 WHERE promoted_node_id = $1`, placeholderID, confirmedID); err != nil {
+		return fmt.Errorf("storage: merge: repoint pending_wallet_submissions.promoted_node_id: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM nodes WHERE id = $1`, placeholderID); err != nil {
 		return fmt.Errorf("storage: merge: delete placeholder node: %w", err)
@@ -988,6 +1113,14 @@ func nodeFilterClauses(filter NodeFilter) (clauses []string, args []any) {
 		}
 	}
 
+	if filter.HasWalletHTTPPort != nil {
+		if *filter.HasWalletHTTPPort {
+			clauses = append(clauses, "wallet_http_port IS NOT NULL")
+		} else {
+			clauses = append(clauses, "wallet_http_port IS NULL")
+		}
+	}
+
 	if filter.Owner != "" {
 		// Exact match, parameterized, on tags->>'owner' -- an
 		// attribution tag, not a search field, so deliberately no
@@ -1154,6 +1287,31 @@ func (s *pgStore) GetNodeHistory(ctx context.Context, nodeID uuid.UUID, limit in
 		return nil, fmt.Errorf("storage: get node history: %w", err)
 	}
 	return checks, nil
+}
+
+// GetLatestHealthCheck implements Store -- see its doc comment on the Store interface for
+// why this is scoped to a single probeSource, unlike GetNodeHistory.
+func (s *pgStore) GetLatestHealthCheck(ctx context.Context, nodeID uuid.UUID, probeSource ProbeSource) (*HealthCheck, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+healthCheckSelectColumns+`
+		FROM node_health
+		WHERE node_id = $1 AND probe_source = $2
+		ORDER BY ts DESC
+		LIMIT 1
+	`, nodeID, string(probeSource))
+	if err != nil {
+		return nil, fmt.Errorf("storage: get latest health check: %w", err)
+	}
+	defer rows.Close()
+
+	checks, err := scanHealthCheckRows(rows)
+	if err != nil {
+		return nil, fmt.Errorf("storage: get latest health check: %w", err)
+	}
+	if len(checks) == 0 {
+		return nil, nil
+	}
+	return &checks[0], nil
 }
 
 // GetNodeHistoryForNodes is the batch form of GetNodeHistory. It
@@ -1811,6 +1969,45 @@ func (s *pgStore) IsAddressPubliclyOptedIn(ctx context.Context, address string) 
 	return optedIn, nil
 }
 
+// FindNodeByHost implements Store -- see its doc comment on the Store interface. Matches
+// against the host portion of node_addresses.address (falling back to nodes.address for
+// rows that predate node_addresses being consistently maintained, same convention as
+// UpsertDiscoveredNode/SetNodeWalletHTTPPortByAddress), using starts_with's exact-literal
+// prefix match rather than a regex -- host is compared against BOTH the plain "host:"
+// prefix (IPv4/onion) and the bracketed "[host]:" prefix (IPv6, matching net.JoinHostPort's
+// textual form -- see classifyAddress's Go-side handling in internal/api/privacy.go for the
+// same convention) -- so no regex-metacharacter escaping of a caller-supplied host is ever
+// needed. ORDER BY last_seen DESC + LIMIT 1 deterministically picks the most-recently-seen
+// match in the (rare) case more than one node has an address with this host.
+func (s *pgStore) FindNodeByHost(ctx context.Context, host string) (Node, bool, error) {
+	if host == "" {
+		return Node{}, false, fmt.Errorf("storage: host is required")
+	}
+
+	plainPrefix := host + ":"
+	bracketedPrefix := "[" + host + "]:"
+
+	row := s.pool.QueryRow(ctx, `
+		SELECT `+nodeColumns+` FROM nodes
+		WHERE id = (
+			SELECT n.id FROM nodes n
+			LEFT JOIN node_addresses na ON na.node_id = n.id
+			WHERE starts_with(COALESCE(na.address, n.address), $1)
+			   OR starts_with(COALESCE(na.address, n.address), $2)
+			ORDER BY n.last_seen DESC
+			LIMIT 1
+		)
+	`, plainPrefix, bracketedPrefix)
+	n, err := scanNode(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Node{}, false, nil
+		}
+		return Node{}, false, fmt.Errorf("storage: find node by host: %w", err)
+	}
+	return n, true, nil
+}
+
 // CreatePendingSubmission records a new public node-submission for
 // review. If a PENDING submission for this exact address already exists,
 // this UPDATEs that row's label/owner_tag and bumps its submitted_at
@@ -2042,6 +2239,211 @@ func (s *pgStore) UpsertGeoIPCache(ctx context.Context, entries []GeoIPEntry) er
 		if err != nil {
 			return fmt.Errorf("storage: upsert geoip cache entry %s: %w", e.IP, err)
 		}
+	}
+	return nil
+}
+
+// SetNodeWalletHTTPPort implements Store -- see its doc comment on the Store interface for
+// the hard safety rule this is one half of enforcing.
+func (s *pgStore) SetNodeWalletHTTPPort(ctx context.Context, id uuid.UUID, port *int) error {
+	if _, err := s.pool.Exec(ctx, `UPDATE nodes SET wallet_http_port = $1 WHERE id = $2`, port, id); err != nil {
+		return fmt.Errorf("storage: set node wallet_http_port: %w", err)
+	}
+	return nil
+}
+
+// SetNodeWalletHTTPPortByAddress implements Store -- see its doc comment on the Store
+// interface. Mirrors UpsertDiscoveredNode's node-by-address lookup (node_addresses first,
+// falling back to nodes.address for rows that predate node_addresses being consistently
+// maintained) so it resolves the same node UpsertDiscoveredNode itself would for the same
+// address.
+func (s *pgStore) SetNodeWalletHTTPPortByAddress(ctx context.Context, address string, port int) (bool, error) {
+	if address == "" {
+		return false, fmt.Errorf("storage: address is required")
+	}
+
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE nodes SET wallet_http_port = $2
+		WHERE id = COALESCE(
+			(SELECT node_id FROM node_addresses WHERE address = $1),
+			(SELECT id FROM nodes WHERE address = $1 LIMIT 1)
+		)
+	`, address, port)
+	if err != nil {
+		return false, fmt.Errorf("storage: set node wallet_http_port by address: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// WalletHTTPUptime implements Store -- see its doc comment on the Store interface for why
+// this is a from-scratch computation (no pre-existing "uptime%" concept anywhere else in
+// this codebase) and why it mirrors NetworkHeight's 24h-window/nil-on-no-data convention.
+// since is converted to an absolute cutoff (time.Now().Add(-since)) and passed as a
+// parameter, mirroring ListSeedCandidates' own since-handling, rather than interpolating a
+// raw SQL interval literal.
+func (s *pgStore) WalletHTTPUptime(ctx context.Context, nodeID uuid.UUID, since time.Duration) (*float64, int, error) {
+	cutoff := time.Now().Add(-since)
+
+	var total int
+	var reachableCount int
+	err := s.pool.QueryRow(ctx, `
+		SELECT count(*), count(*) FILTER (WHERE reachable)
+		FROM node_health
+		WHERE node_id = $1 AND probe_source = 'wallet_http' AND ts >= $2
+	`, nodeID, cutoff).Scan(&total, &reachableCount)
+	if err != nil {
+		return nil, 0, fmt.Errorf("storage: wallet_http uptime: %w", err)
+	}
+	if total == 0 {
+		return nil, 0, nil
+	}
+	uptime := float64(reachableCount) / float64(total)
+	return &uptime, total, nil
+}
+
+// pendingWalletSubmissionColumns is the column list, in order, matching
+// scanPendingWalletSubmission's Scan calls.
+const pendingWalletSubmissionColumns = "id, host, wallet_http_port, status, submitted_at, reviewed_at, rejection_reason, promoted_node_id, probe_attempted_at, probe_reachable, probe_succeeded, probe_checked_at, probe_is_synced, probe_height"
+
+// scanPendingWalletSubmission scans one pendingWalletSubmissionColumns-shaped row into a
+// PendingWalletSubmission.
+func scanPendingWalletSubmission(row pgx.Row) (PendingWalletSubmission, error) {
+	var ps PendingWalletSubmission
+	if err := row.Scan(
+		&ps.ID, &ps.Host, &ps.WalletHTTPPort, &ps.Status,
+		&ps.SubmittedAt, &ps.ReviewedAt, &ps.RejectionReason, &ps.PromotedNodeID,
+		&ps.ProbeAttemptedAt, &ps.ProbeReachable,
+		&ps.ProbeSucceeded, &ps.ProbeCheckedAt, &ps.ProbeIsSynced, &ps.ProbeHeight,
+	); err != nil {
+		return PendingWalletSubmission{}, err
+	}
+	return ps, nil
+}
+
+// CreatePendingWalletSubmission implements Store -- see its doc comment on the Store
+// interface. Mirrors CreatePendingSubmission's "update in place if a pending row for this
+// key already exists" shape exactly, just keyed on host instead of address.
+func (s *pgStore) CreatePendingWalletSubmission(ctx context.Context, host string, walletHTTPPort int) (PendingWalletSubmission, error) {
+	if host == "" {
+		return PendingWalletSubmission{}, fmt.Errorf("storage: host is required")
+	}
+
+	row := s.pool.QueryRow(ctx, `
+		INSERT INTO pending_wallet_submissions (host, wallet_http_port, status, submitted_at)
+		VALUES ($1, $2, 'pending', now())
+		ON CONFLICT (host) WHERE status = 'pending'
+		DO UPDATE SET wallet_http_port = $2, submitted_at = now()
+		RETURNING `+pendingWalletSubmissionColumns, host, walletHTTPPort)
+	ps, err := scanPendingWalletSubmission(row)
+	if err != nil {
+		return PendingWalletSubmission{}, fmt.Errorf("storage: create pending wallet submission: %w", err)
+	}
+	return ps, nil
+}
+
+// ListPendingWalletSubmissions implements Store -- mirrors ListPendingSubmissions exactly.
+func (s *pgStore) ListPendingWalletSubmissions(ctx context.Context, status string) ([]PendingWalletSubmission, error) {
+	if status == "" {
+		status = SubmissionStatusPending
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+pendingWalletSubmissionColumns+`
+		FROM pending_wallet_submissions
+		WHERE status = $1
+		ORDER BY submitted_at DESC
+	`, status)
+	if err != nil {
+		return nil, fmt.Errorf("storage: list pending wallet submissions: %w", err)
+	}
+	defer rows.Close()
+
+	submissions := []PendingWalletSubmission{}
+	for rows.Next() {
+		ps, err := scanPendingWalletSubmission(rows)
+		if err != nil {
+			return nil, fmt.Errorf("storage: scan pending wallet submission: %w", err)
+		}
+		submissions = append(submissions, ps)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage: list pending wallet submissions: %w", err)
+	}
+	return submissions, nil
+}
+
+// GetPendingWalletSubmission implements Store -- mirrors GetPendingSubmission exactly.
+func (s *pgStore) GetPendingWalletSubmission(ctx context.Context, id uuid.UUID) (PendingWalletSubmission, error) {
+	row := s.pool.QueryRow(ctx, `SELECT `+pendingWalletSubmissionColumns+` FROM pending_wallet_submissions WHERE id = $1`, id)
+	ps, err := scanPendingWalletSubmission(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return PendingWalletSubmission{}, ErrNotFound
+		}
+		return PendingWalletSubmission{}, fmt.Errorf("storage: get pending wallet submission: %w", err)
+	}
+	return ps, nil
+}
+
+// RecordWalletSubmissionProbeResult implements Store -- mirrors RecordSubmissionProbeResult
+// exactly (see its doc comment for the "no status guard, harmless race" rationale).
+func (s *pgStore) RecordWalletSubmissionProbeResult(ctx context.Context, id uuid.UUID, reachable bool) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE pending_wallet_submissions SET
+			probe_attempted_at = now(),
+			probe_reachable = $2
+		WHERE id = $1
+	`, id, reachable)
+	if err != nil {
+		return fmt.Errorf("storage: record wallet submission probe result: %w", err)
+	}
+	return nil
+}
+
+// ApprovePendingWalletSubmission implements Store -- see its doc comment on the Store
+// interface. Same "WHERE status = 'pending'" RowsAffected guard as ApprovePendingSubmission.
+func (s *pgStore) ApprovePendingWalletSubmission(ctx context.Context, id uuid.UUID, promotedNodeID uuid.UUID, outcome WalletProbeOutcome) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE pending_wallet_submissions SET
+			status = 'approved',
+			reviewed_at = now(),
+			promoted_node_id = $2,
+			probe_succeeded = true,
+			probe_checked_at = now(),
+			probe_is_synced = $3,
+			probe_height = $4
+		WHERE id = $1 AND status = 'pending'
+	`, id, promotedNodeID, outcome.IsSynced, outcome.Height)
+	if err != nil {
+		return fmt.Errorf("storage: approve pending wallet submission: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		if _, err := s.GetPendingWalletSubmission(ctx, id); err != nil {
+			return err
+		}
+		return fmt.Errorf("storage: wallet submission %s is not pending", id)
+	}
+	return nil
+}
+
+// RejectPendingWalletSubmission implements Store -- mirrors RejectPendingSubmission's guard
+// exactly.
+func (s *pgStore) RejectPendingWalletSubmission(ctx context.Context, id uuid.UUID, reason *string) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE pending_wallet_submissions SET
+			status = 'rejected',
+			reviewed_at = now(),
+			rejection_reason = $2
+		WHERE id = $1 AND status = 'pending'
+	`, id, reason)
+	if err != nil {
+		return fmt.Errorf("storage: reject pending wallet submission: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		if _, err := s.GetPendingWalletSubmission(ctx, id); err != nil {
+			return err
+		}
+		return fmt.Errorf("storage: wallet submission %s is not pending", id)
 	}
 	return nil
 }

@@ -39,6 +39,14 @@ type PublicNode struct {
 	HasIPv6         bool                    `json:"has_ipv6"`
 	HasOnion        bool                    `json:"has_onion"`
 	Addresses       []string                `json:"addresses,omitempty"`
+
+	// WalletHTTPPort mirrors Addresses' exact opt-in gating: it is only ever populated
+	// (from storage.Node.WalletHTTPPort) when DiscoverySource already permits address
+	// exposure (registry_submitted or both) -- see ScrubNode. There is deliberately no
+	// separate, ungated way to learn a node's wallet-sync HTTP port; a node that hasn't
+	// opted into public address listing at all must not leak this port either, even if it
+	// were somehow known.
+	WalletHTTPPort *int `json:"wallet_http_port,omitempty"`
 }
 
 // PublicNodeDegree is the privacy-scrubbed view of a storage.NodeDegree
@@ -150,6 +158,11 @@ func ScrubNode(n storage.Node, addrs []storage.NodeAddress) PublicNode {
 
 	if n.DiscoverySource == storage.DiscoverySourceRegistry || n.DiscoverySource == storage.DiscoverySourceBoth {
 		pn.Addresses = addressStrings(n, addrs)
+		// WalletHTTPPort goes through the EXACT SAME gate as Addresses above -- see this
+		// hard requirement on PublicNode.WalletHTTPPort's doc comment and
+		// storage.Node.WalletHTTPPort's. There is no separate condition or ungated
+		// route for this field; it is only ever set here, inside this same if-block.
+		pn.WalletHTTPPort = n.WalletHTTPPort
 	}
 
 	return pn

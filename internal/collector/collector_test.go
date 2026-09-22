@@ -92,7 +92,7 @@ func newTestStore(t *testing.T) storage.Store {
 	if err != nil {
 		t.Fatalf("connect for truncate: %v", err)
 	}
-	if _, err := pool.Exec(ctx, "TRUNCATE TABLE node_health, peer_edge_observations, node_addresses, pending_submissions, nodes, geoip_cache CASCADE"); err != nil {
+	if _, err := pool.Exec(ctx, "TRUNCATE TABLE node_health, peer_edge_observations, node_addresses, pending_submissions, pending_wallet_submissions, nodes, geoip_cache CASCADE"); err != nil {
 		pool.Close()
 		t.Fatalf("truncate test tables: %v", err)
 	}
@@ -551,7 +551,7 @@ func TestPollOnceSkipsHealthCheckOnGRPCAddressUnknown(t *testing.T) {
 		observedCalls++
 	}
 
-	if err := PollOnce(ctx, client, nil, store, node, observe); err != nil {
+	if err := PollOnce(ctx, client, nil, nil, store, node, observe); err != nil {
 		t.Fatalf("PollOnce: unexpected error: %v", err)
 	}
 	if client.getInfoCalls != 1 {

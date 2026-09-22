@@ -58,6 +58,12 @@ func main() {
 	statsCacheTTL := flag.Duration("stats-cache-ttl", api.DefaultStatsCacheTTL, "TTL for GET /v1/stats' in-process response cache (e.g. \"20s\"). "+
 		"This is a public, unauthenticated, dashboard/monitoring-polled route whose underlying work is several DB aggregate queries -- this bounds how often "+
 		"those queries actually run under repeated polling, at the cost of up to this much staleness. 0 disables caching entirely (every request recomputes).")
+	walletHTTPEnabled := flag.Bool("wallet-http-enabled", false, "Enables the SEPARATE wallet-sync-HTTP-port registration flow (POST /wallet-nodes, "+
+		"/admin/wallet-submissions/*, and the /wallet-nodes dashboard page) and lets the poll loop dial a node's wallet_http_port at all. "+
+		"MAINNET-ONLY per the operator's explicit directive -- default false, and must stay false on every testnet (esmeralda) deployment "+
+		"(NOT set in /etc/netmap/env.testnet). When false: those routes are not registered on the mux at all (404), the dashboard page renders "+
+		"empty/disabled, and the poll loop never dials wallet_http_port for any node even if the column somehow already has a value (e.g. leftover "+
+		"from manual DB testing) -- see storage.Node.WalletHTTPPort's doc comment for the full hard safety rule this flag is one half of enforcing.")
 	directoryCacheTTL := flag.Duration("directory-cache-ttl", api.DefaultDirectoryCacheTTL, "TTL for GET /v1/directory's in-process, per-query-param-combination response cache (e.g. \"8s\"). "+
 		"This is a public, unauthenticated, third-party-directory-feed route explicitly expected to be polled routinely -- this bounds how often "+
 		"its underlying whole-population scan actually runs under repeated polling, at the cost of up to this much staleness. 0 disables caching entirely (every request recomputes).")
@@ -152,6 +158,26 @@ func main() {
 	}
 	p2pClient := collector.NewP2PClientWithShardedProxies(socksProxyAddrs, networkByte)
 
+	// Real HTTP-backed client: talks to a Tari base node's separate, optional wallet-sync
+	// HTTP service (minotari_node's [base_node.http_wallet_query_service]) -- see
+	// internal/collector/wallet_http_client.go's doc comment for the hard "GET
+	// /get_tip_info only" scope restriction. Always constructed (never nil) -- unlike
+	// grpcClient's NETMAP_OWNED_GRPC_ADDRESSES scoping, this transport is gated per-node by
+	// storage.Node.WalletHTTPPort being non-nil (see collector.PollOnce's doc comment), not
+	// by whether the caller passed an address map to the constructor, so there is no
+	// "feature not configured" client-construction case to mirror here.
+	walletHTTPClient := collector.NewWalletHTTPClient()
+
+	// NETMAP_OWNED_WALLET_HTTP_ADDRESSES scopes automatic wallet_http_port assignment to an
+	// explicit allowlist of "P2P address -> wallet-sync HTTP address" pairs for nodes we
+	// own -- see parseOwnedWalletHTTPAddresses' doc comment for the exact format/example
+	// and storage.Node.WalletHTTPPort's doc comment for the hard safety rule this is one of
+	// exactly two legitimate ways to populate (the other is an explicit field on a public
+	// POST /nodes submission, carried through at admin approval -- see
+	// internal/api/api.go's handleApproveSubmission). Empty/unset (the default) means no
+	// node ever gets its wallet_http_port set this way.
+	ownedWalletHTTPPorts := parseOwnedWalletHTTPAddresses(os.Getenv("NETMAP_OWNED_WALLET_HTTP_ADDRESSES"))
+
 	c := collector.New(collector.Config{
 		SeedNodes: parseSeedNodes(os.Getenv("NETMAP_SEED_NODES")),
 		// 500ms between per-node dials within a single Discover/
@@ -167,6 +193,9 @@ func main() {
 	c.Storage = store
 	c.GRPCClient = grpcClient
 	c.P2PClient = p2pClient
+	c.WalletHTTPClient = walletHTTPClient
+	c.OwnedWalletHTTPPorts = ownedWalletHTTPPorts
+	c.WalletHTTPEnabled = *walletHTTPEnabled
 	// GeoIPClient enables the /map feature's spike (see BRIEF.md): the
 	// background loop that opportunistically resolves lat/lon for the
 	// owner-tagged+has_ipv4 node population into storage's geoip_cache
@@ -204,7 +233,7 @@ func main() {
 		log.Printf("NETMAP_ADMIN_USER/NETMAP_ADMIN_PASSWORD not both set — /admin routes are disabled (503)")
 	}
 
-	webHandler, err := web.NewHandler(store, adminCreds, *dashboardCacheTTL)
+	webHandler, err := web.NewHandler(store, adminCreds, *dashboardCacheTTL, *walletHTTPEnabled)
 	if err != nil {
 		log.Fatalf("failed to build web handler: %v", err)
 	}
@@ -241,7 +270,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.Handle("/", webHandler)
-	mux.Handle("/api/", http.StripPrefix("/api", api.NewRouter(store, grpcClient, p2pClient, adminCreds, collectors, *statsCacheTTL, *directoryCacheTTL)))
+	mux.Handle("/api/", http.StripPrefix("/api", api.NewRouter(store, grpcClient, p2pClient, walletHTTPClient, *walletHTTPEnabled, adminCreds, collectors, *statsCacheTTL, *directoryCacheTTL)))
 
 	// instrumentHTTP wraps the whole dashboard+API mux above with httpRequestsTotal/
 	// httpRequestDuration -- see metrics.go's doc comment. This mux is served on *addr (the
@@ -344,6 +373,60 @@ func parseOwnedGRPCAddresses(raw string) map[string]string {
 			continue
 		}
 		out[p2pAddr] = grpcAddr
+	}
+	return out
+}
+
+// parseOwnedWalletHTTPAddresses parses NETMAP_OWNED_WALLET_HTTP_ADDRESSES's raw value: a
+// comma-separated list of "p2pAddress=walletHTTPAddress" pairs, mirroring
+// parseOwnedGRPCAddresses' exact parsing structure/example/error-logging convention (see
+// that function's doc comment) -- e.g.
+// "23.226.69.178:18189=23.226.69.178:9000,10.0.0.5:18189=10.0.0.5:9000". This is the ONLY
+// automatic (non-public-submission) way a node's storage.Node.WalletHTTPPort ever gets set
+// -- see that field's doc comment for the full "no passive discovery, ever" hard safety rule.
+//
+// Unlike parseOwnedGRPCAddresses, the value kept per entry is NOT the full
+// walletHTTPAddress string -- only its port, extracted via net.SplitHostPort.
+// storage.Node.WalletHTTPPort's doc comment (and this feature's design doc,
+// Netmap-Wallet-HTTP-Port-Design-2026-09-19.md) is explicit that this port must always pair
+// with the node's OWN address/host, never a different one -- so only the port half of the
+// right-hand side is ever actually used going forward (see
+// collector.Collector.OwnedWalletHTTPPorts/syncOwnedWalletHTTPPorts); the host half is
+// accepted here purely for parity with NETMAP_OWNED_GRPC_ADDRESSES' pairing format (which an
+// operator copy-pasting that convention would naturally reach for) and otherwise discarded
+// once the port is extracted. An entry with no "=", an empty p2pAddress, or a
+// walletHTTPAddress that isn't a valid "host:port" with a numeric port in 1-65535, is logged
+// and skipped -- same "one typo shouldn't take down every other correctly-configured owned
+// node" convention as parseOwnedGRPCAddresses. Empty/unset raw returns a nil map, meaning no
+// node ever has WalletHTTPPort set via this path.
+func parseOwnedWalletHTTPAddresses(raw string) map[string]int {
+	if raw == "" {
+		return nil
+	}
+	out := make(map[string]int)
+	for _, pair := range strings.Split(raw, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		p2pAddr, httpAddr, ok := strings.Cut(pair, "=")
+		p2pAddr = strings.TrimSpace(p2pAddr)
+		httpAddr = strings.TrimSpace(httpAddr)
+		if !ok || p2pAddr == "" || httpAddr == "" {
+			log.Printf("netmap: skipping malformed NETMAP_OWNED_WALLET_HTTP_ADDRESSES entry %q (want \"p2pAddress=walletHTTPAddress\")", pair)
+			continue
+		}
+		_, portStr, err := net.SplitHostPort(httpAddr)
+		if err != nil {
+			log.Printf("netmap: skipping NETMAP_OWNED_WALLET_HTTP_ADDRESSES entry %q: walletHTTPAddress %q is not a valid host:port: %v", pair, httpAddr, err)
+			continue
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil || port < 1 || port > 65535 {
+			log.Printf("netmap: skipping NETMAP_OWNED_WALLET_HTTP_ADDRESSES entry %q: port %q is not a valid port number", pair, portStr)
+			continue
+		}
+		out[p2pAddr] = port
 	}
 	return out
 }

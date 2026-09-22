@@ -183,3 +183,48 @@ func TestParseOwnedGRPCAddresses(t *testing.T) {
 		})
 	}
 }
+
+// TestParseOwnedWalletHTTPAddresses mirrors TestParseOwnedGRPCAddresses' table-driven style,
+// but for NETMAP_OWNED_WALLET_HTTP_ADDRESSES -- see parseOwnedWalletHTTPAddresses' doc
+// comment for why the parsed value is a port (int), not the full right-hand-side address
+// string, unlike its gRPC counterpart.
+func TestParseOwnedWalletHTTPAddresses(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want map[string]int
+	}{
+		{name: "empty/unset returns nil (feature not configured)", raw: "", want: nil},
+		{
+			name: "single pair extracts only the port",
+			raw:  "23.226.69.178:18189=23.226.69.178:9000",
+			want: map[string]int{"23.226.69.178:18189": 9000},
+		},
+		{
+			name: "multiple pairs with whitespace",
+			raw:  " 23.226.69.178:18189=23.226.69.178:9000 , 10.0.0.5:18189=10.0.0.5:9001 ",
+			want: map[string]int{
+				"23.226.69.178:18189": 9000,
+				"10.0.0.5:18189":      9001,
+			},
+		},
+		{
+			name: "malformed entries (no '=', empty p2p side, non-host:port http side, invalid port) are skipped, not fatal",
+			raw:  "no-equals-sign,=missing-p2p-side,missing-http-side=,not-a-host-port=bare-string,bad-port=host:999999,good:1=good:9000",
+			want: map[string]int{"good:1": 9000},
+		},
+		{
+			name: "raw non-empty but every entry malformed still returns a non-nil (empty) map",
+			raw:  "totally-malformed",
+			want: map[string]int{},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseOwnedWalletHTTPAddresses(tc.raw)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("parseOwnedWalletHTTPAddresses(%q) = %#v, want %#v", tc.raw, got, tc.want)
+			}
+		})
+	}
+}

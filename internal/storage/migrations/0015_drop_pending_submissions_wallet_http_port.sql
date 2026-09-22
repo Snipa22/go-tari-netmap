@@ -1,0 +1,28 @@
+-- 0015_drop_pending_submissions_wallet_http_port.sql
+--
+-- Un-bundles wallet_http_port from pending_submissions (this feature's FIRST DRAFT bolted
+-- an optional wallet_http_port field directly onto the base-node submission flow -- see
+-- 0013_wallet_http_port.sql's migration comment; that draft is being reworked per the
+-- operator's directives in this feature's dispatch brief: wallet-node registration is now a
+-- SEPARATE flow entirely, POST /wallet-nodes -> pending_wallet_submissions, see
+-- 0014_wallet_node_submissions.sql). POST /nodes (and pending_submissions) goes back to
+-- being exactly what it was on `main` before the first draft -- no wallet-HTTP awareness at
+-- all.
+--
+-- This drops the column outright rather than leaving it as inert dead schema: it was never
+-- populated by any code path in a real deployment (this rework happened before the first
+-- draft ever shipped/was merged to main), so there is no data-loss risk, and a dropped
+-- column is less confusing for a future reader of this schema than a column no Go code
+-- anywhere ever reads or writes again -- see this feature's implementation report for the
+-- explicit "drop, don't leave inert" call.
+--
+-- nodes.wallet_http_port (also added by 0013) is NOT touched here -- it is still very much
+-- live schema, now populated by the new pending_wallet_submissions approval flow (see
+-- internal/api/api.go's handleApproveWalletSubmission) instead of pending_submissions'
+-- old approval path.
+--
+-- This migration must always succeed for the binary to start, same as every other
+-- non-"_optional" migration in this directory -- see internal/storage/migrate.go for how
+-- that distinction is enforced.
+
+ALTER TABLE pending_submissions DROP COLUMN IF EXISTS wallet_http_port;

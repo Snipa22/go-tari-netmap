@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -245,6 +246,14 @@ const maxGRPCPollWorkers = 50
 // many Tor instances are deployed, so there is no operational reason to tune it per-deployment.
 const maxP2PWorkersPerShard = 12
 
+// maxWalletHTTPPollWorkers bounds the number of concurrent in-flight wallet-sync-HTTP
+// PollOnce dials within a single poll() pass, mirroring maxGRPCPollWorkers's shape (a single
+// shared, unsharded pool -- unlike P2P's per-Tor-instance sharding, this transport is
+// clearnet-only, see internal/collector's wallet_http_client.go, so there is no analogous
+// per-proxy saturation concern). Sized the same as maxGRPCPollWorkers since both are ordinary
+// clearnet dials with comparable per-dial cost.
+const maxWalletHTTPPollWorkers = 50
+
 // Sharded is implemented by NodeClient implementations that shard their dials across multiple
 // independent backing resources (see p2pNodeClient's ShardCount/socksProxyAddrs field for the
 // P2P/Tor-SOCKS-proxy case). poll()'s P2P dispatch (see its doc comment) type-asserts
@@ -290,6 +299,18 @@ type NodeInfo struct {
 	// P2P transport (see p2p_client.go's GetInfo); the gRPC path has no
 	// equivalent concept and always leaves this nil.
 	PeerIdentityUpdatedAt *time.Time
+
+	// IsSynced mirrors walletTipInfoResponse.IsSynced (wallet_http_client.go's GetInfo)
+	// -- only ever populated by the wallet-sync-HTTP transport (mirrors
+	// PeerIdentityUpdatedAt's "only ever populated by ONE transport" convention above);
+	// the gRPC/P2P transports have no equivalent concept in this struct and always leave
+	// this nil. Not persisted onto node_health by the collector's regular poll loop
+	// (storage.HealthCheckInput has no is_synced column, and the routine health probe
+	// only needs Height/Reachable) -- its sole consumer is
+	// internal/api's handleApproveWalletSubmission, which wires it into the wallet-node
+	// registration flow's "permissions matrix" (PendingWalletSubmission.ProbeIsSynced)
+	// at approval time.
+	IsSynced *bool
 }
 
 // DiscoveredPeer is one address+pubkey pairing reported by a directly
@@ -385,6 +406,42 @@ type Collector struct {
 	// of GRPCClient/P2PClient set still works correctly, just without
 	// data from the other transport.
 	P2PClient NodeClient
+
+	// WalletHTTPClient talks to a Tari base node's separate, optional wallet-sync HTTP
+	// service (minotari_node's [base_node.http_wallet_query_service]) -- see
+	// wallet_http_client.go's doc comment. Optional/nilable, mirroring GRPCClient/
+	// P2PClient exactly: if nil, this probe is skipped entirely. Unlike GRPCClient/
+	// P2PClient, it is ALSO skipped per-node whenever that node's storage.Node.
+	// WalletHTTPPort is nil (see pollWalletHTTPOnce) -- this transport is only ever
+	// attempted for the small, explicitly opted-in subset of nodes with a non-nil
+	// WalletHTTPPort, never the whole population.
+	WalletHTTPClient NodeClient
+
+	// OwnedWalletHTTPPorts maps a P2P/discovered "host:port" address (the SAME address
+	// convention as GRPCClient's addressMap keys -- see NETMAP_OWNED_WALLET_HTTP_ADDRESSES
+	// in cmd/netmap/main.go) to the wallet_http_port that owned node's wallet-sync HTTP
+	// service listens on. This is the ONLY automatic (non-public-submission) way a node's
+	// storage.Node.WalletHTTPPort ever gets set -- see that field's doc comment for the
+	// full "no passive discovery, ever" safety rule this is one half of. Applied by
+	// DiscoverOwned (see syncOwnedWalletHTTPPorts) on the SAME cadence as the rest of
+	// owned-node reconciliation, rather than introducing a new ticker. Nil/empty (the
+	// default, and the default for every existing test in this package, and for
+	// cmd/netmap-p2p-responder, which never sets this field) means no node ever has its
+	// WalletHTTPPort set this way at all.
+	OwnedWalletHTTPPorts map[string]int
+
+	// WalletHTTPEnabled is the mainnet-only feature gate for the ENTIRE wallet-sync-HTTP
+	// probe transport (see storage.Node.WalletHTTPPort's doc comment and this feature's
+	// dispatch brief's "mainnet-only" operator directive) -- sourced from
+	// cmd/netmap/main.go's -wallet-http-enabled flag, default false. When false (the
+	// zero value, and the default for every existing test in this package),
+	// pollWalletHTTPTransportOnce/pollWalletHTTPOnce are never invoked at all for any
+	// node, regardless of whether WalletHTTPClient is configured or whether a node
+	// somehow already has a non-nil WalletHTTPPort (e.g. a leftover value from manual DB
+	// testing on a host this flag was later turned off on) -- this flag gates the PROBE
+	// itself, not just the public submission/admin-review HTTP routes (see
+	// internal/api/api.go's NewRouter for that separate, route-registration-level gate).
+	WalletHTTPEnabled bool
 
 	// GeoIPClient, if non-nil, enables the periodic geoip-cache top-up
 	// loop (see RefreshGeoIP/runGeoIPRefreshLoop) that opportunistically
@@ -1162,10 +1219,19 @@ func discoveryCooldownKey(transportLabel, addr string) string {
 // GRPCClient and P2PClient (if non-nil) are each walked as a separate,
 // independent pass over the same deduped address set, exactly mirroring
 // Discover's structure.
+//
+// Also runs syncOwnedWalletHTTPPorts on every pass (see that method's doc comment) --
+// piggybacking on this loop's existing cadence rather than introducing a new ticker just
+// for that unrelated bit of owned-node reconciliation, since both are "things that need to
+// happen periodically for the owned-node population" and DiscoverOwned already IS that
+// loop. Unlike the GRPCClient/P2PClient walks above, this runs unconditionally (it needs
+// neither client) -- it is a storage.Store-only operation.
 func (c *Collector) DiscoverOwned(ctx context.Context) error {
 	if c.Storage == nil {
 		return errors.New("collector: Storage is not configured")
 	}
+
+	c.syncOwnedWalletHTTPPorts(ctx)
 
 	if c.GRPCClient != nil {
 		if err := c.discoverOwnedWith(ctx, c.GRPCClient, "grpc"); err != nil {
@@ -1179,6 +1245,25 @@ func (c *Collector) DiscoverOwned(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// syncOwnedWalletHTTPPorts applies c.OwnedWalletHTTPPorts (see that field's doc comment) to
+// any already-known node whose address matches one of its keys, via
+// Storage.SetNodeWalletHTTPPortByAddress -- this implements one of exactly two legitimate
+// write paths for storage.Node.WalletHTTPPort (the other is
+// internal/api/api.go's handleApproveSubmission, for public submissions -- see
+// storage.Node.WalletHTTPPort's doc comment for the full hard safety rule). A node that
+// hasn't been discovered yet (no row exists for that address) is simply skipped this pass --
+// it will be picked up on a later DiscoverOwned pass once discovered, since this runs on
+// every pass, unconditionally, exactly like the rest of DiscoverOwned. A nil/empty
+// c.OwnedWalletHTTPPorts (the default) makes this an immediate no-op with zero Storage
+// calls.
+func (c *Collector) syncOwnedWalletHTTPPorts(ctx context.Context) {
+	for addr, port := range c.OwnedWalletHTTPPorts {
+		if _, err := c.Storage.SetNodeWalletHTTPPortByAddress(ctx, addr, port); err != nil {
+			log.Printf("collector: sync owned wallet_http_port for %s: %v", addr, err)
+		}
+	}
 }
 
 // discoverOwnedWith fans out walkNodePeers calls, bounded to at most
@@ -1490,6 +1575,9 @@ func (c *Collector) poll(ctx context.Context, filter storage.NodeFilter) error {
 	var grpcGroup errgroup.Group
 	grpcGroup.SetLimit(maxGRPCPollWorkers)
 
+	var walletHTTPGroup errgroup.Group
+	walletHTTPGroup.SetLimit(maxWalletHTTPPollWorkers)
+
 	shardCount := p2pShardCount(c.P2PClient)
 	shardGroups := make([]*errgroup.Group, shardCount)
 	for i := range shardGroups {
@@ -1528,9 +1616,32 @@ func (c *Collector) poll(ctx context.Context, filter storage.NodeFilter) error {
 				return nil
 			})
 		}
+		// WalletHTTPClient is additionally gated on n.WalletHTTPPort != nil here (not
+		// just inside pollWalletHTTPOnce) so that the overwhelming majority of nodes
+		// (which never have this field set -- see storage.Node.WalletHTTPPort's doc
+		// comment on the two narrow ways it CAN be set) never even get a goroutine
+		// dispatched for this transport, rather than dispatching one just to have it
+		// immediately skip. c.WalletHTTPEnabled is checked FIRST, ahead of both -- this
+		// is the mainnet-only feature gate (see that field's doc comment): when false,
+		// this transport is skipped for EVERY node, even one that already has a non-nil
+		// WalletHTTPPort (e.g. a leftover value from manual DB testing, or one this
+		// process itself wrote via OwnedWalletHTTPPorts while the flag was previously
+		// on) -- the flag gates the dial itself, not just whether the column can be set.
+		if c.WalletHTTPEnabled && c.WalletHTTPClient != nil && n.WalletHTTPPort != nil {
+			walletHTTPGroup.Go(func() error {
+				if jitter := c.dialJitter(); jitter > 0 {
+					time.Sleep(jitter)
+				}
+				if err := pollWalletHTTPTransportOnce(ctx, c.WalletHTTPClient, c.Storage, n, c.OnPollResult); err != nil {
+					log.Printf("collector: poll %s (wallet_http): %v", n.Address, err)
+				}
+				return nil
+			})
+		}
 	}
 
 	_ = grpcGroup.Wait()
+	_ = walletHTTPGroup.Wait()
 	for _, g := range shardGroups {
 		_ = g.Wait()
 	}
@@ -1567,7 +1678,13 @@ type PollResultFunc func(probeSource storage.ProbeSource, success bool)
 // transport with that transport's probeSource and success (client.GetInfo err == nil). Only
 // the first element is ever consulted; passing more than one is meaningless and never done by
 // this package's own call sites.
-func PollOnce(ctx context.Context, grpcClient, p2pClient NodeClient, store storage.Store, node storage.Node, onResult ...PollResultFunc) error {
+//
+// walletHTTPClient, like grpcClient/p2pClient, is optional (nil skips this transport
+// entirely) -- but even when non-nil, it is ADDITIONALLY skipped for this specific node
+// whenever node.WalletHTTPPort is nil (see pollWalletHTTPOnce), since this transport is only
+// ever meaningful for the small, explicitly opted-in subset of nodes with that field set --
+// see storage.Node.WalletHTTPPort's doc comment for the hard safety rule behind that.
+func PollOnce(ctx context.Context, grpcClient, p2pClient, walletHTTPClient NodeClient, store storage.Store, node storage.Node, onResult ...PollResultFunc) error {
 	var observe PollResultFunc
 	if len(onResult) > 0 {
 		observe = onResult[0]
@@ -1583,6 +1700,11 @@ func PollOnce(ctx context.Context, grpcClient, p2pClient NodeClient, store stora
 	if p2pClient != nil {
 		if err := pollTransportOnce(ctx, p2pClient, store, node, storage.ProbeSourceP2P, observe); err != nil {
 			errs = append(errs, fmt.Errorf("p2p probe %s: %w", node.Address, err))
+		}
+	}
+	if walletHTTPClient != nil {
+		if err := pollWalletHTTPTransportOnce(ctx, walletHTTPClient, store, node, observe); err != nil {
+			errs = append(errs, fmt.Errorf("wallet_http probe %s: %w", node.Address, err))
 		}
 	}
 
@@ -1684,6 +1806,87 @@ func pollOnceWithSource(ctx context.Context, client NodeClient, store storage.St
 		Sha3xHashrate:         info.Sha3xHashrate,
 		PeerIdentityUpdatedAt: info.PeerIdentityUpdatedAt,
 	})
+}
+
+// pollWalletHTTPTransportOnce mirrors pollTransportOnce's shape exactly (skip handling,
+// observe invocation) but dispatches to pollWalletHTTPOnce instead of pollOnceWithSource --
+// see pollWalletHTTPOnce's doc comment for the two differences that make a separate function
+// necessary rather than reusing pollOnceWithSource directly (a different target address than
+// node.Address, and no pubkey-confirmation step).
+func pollWalletHTTPTransportOnce(ctx context.Context, client NodeClient, store storage.Store, node storage.Node, observe PollResultFunc) error {
+	success, skip, err := pollWalletHTTPOnce(ctx, client, store, node)
+	if skip {
+		return nil
+	}
+	if observe != nil {
+		observe(storage.ProbeSourceWalletHTTP, success)
+	}
+	return err
+}
+
+// pollWalletHTTPOnce performs a single health check of node's wallet-sync HTTP service via
+// client (which must call ONLY GET /get_tip_info -- see walletHTTPClient's doc comment in
+// wallet_http_client.go) and records the result via store, tagged
+// storage.ProbeSourceWalletHTTP. Mirrors pollOnceWithSource's overall shape (an unreachable
+// probe still gets a recorded row, not silently dropped), with two differences specific to
+// this transport:
+//
+//   - node.WalletHTTPPort == nil is this transport's own "no attempt to make" skip case,
+//     mirroring ErrGRPCAddressUnknown's skip semantics for the gRPC transport (see
+//     pollOnceWithSource) -- see storage.Node.WalletHTTPPort's doc comment for the hard
+//     safety rule this enforces: this probe must NEVER be attempted for a node that hasn't
+//     had this field explicitly, opt-in populated.
+//   - there is no pubkey-confirmation step: the wallet-sync HTTP service has no identity
+//     concept at all (unlike gRPC/P2P's Identify/handshake), so node.ID is used directly,
+//     always -- there is nothing analogous to pollOnceWithSource's
+//     store.UpsertConfirmedNode call here.
+func pollWalletHTTPOnce(ctx context.Context, client NodeClient, store storage.Store, node storage.Node) (success bool, skip bool, err error) {
+	if node.WalletHTTPPort == nil {
+		return false, true, nil
+	}
+
+	target, ok := walletHTTPTarget(node)
+	if !ok {
+		log.Printf("collector: wallet_http poll %s: cannot derive a host:port to probe, skipping", node.Address)
+		return false, true, nil
+	}
+
+	info, err := client.GetInfo(ctx, target)
+	if err != nil {
+		return false, false, store.RecordHealthCheck(ctx, storage.HealthCheckInput{
+			NodeID:      node.ID,
+			Reachable:   false,
+			ProbeSource: storage.ProbeSourceWalletHTTP,
+		})
+	}
+
+	return true, false, store.RecordHealthCheck(ctx, storage.HealthCheckInput{
+		NodeID:         node.ID,
+		Reachable:      info.Reachable,
+		ProbeSource:    storage.ProbeSourceWalletHTTP,
+		Height:         info.Height,
+		ChainTipHeight: info.ChainTipHeight,
+	})
+}
+
+// walletHTTPTarget derives the "host:port" to probe a node's wallet-sync HTTP service at:
+// ALWAYS the same host as the node's own P2P address (node.Address), paired with its
+// configured WalletHTTPPort -- see storage.Node.WalletHTTPPort's doc comment ("pairs with
+// the node, never a different host" is a hard design requirement, not a simplification of
+// convenience -- it is what lets the /wallet-nodes dashboard page safely reuse the node's
+// own already-scrub-gated address for display). node.Address is expected to already be a
+// "host:port" pair (every address this codebase records is, see parsePeerAddress in
+// grpc_client.go); ok is false if it can't be split as one, or if node.WalletHTTPPort is
+// nil (defensive: every real caller already checks that first).
+func walletHTTPTarget(node storage.Node) (string, bool) {
+	if node.WalletHTTPPort == nil {
+		return "", false
+	}
+	host, _, err := net.SplitHostPort(node.Address)
+	if err != nil || host == "" {
+		return "", false
+	}
+	return net.JoinHostPort(host, strconv.Itoa(*node.WalletHTTPPort)), true
 }
 
 // collectorLikelyDead delegates to storage.IsLikelyDead (see that
