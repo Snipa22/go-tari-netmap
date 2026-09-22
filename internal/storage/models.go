@@ -153,6 +153,18 @@ type NodeFilter struct {
 	// unfiltered ListNodes scan over the entire node table on every
 	// tick.
 	Owned *bool
+
+	// Owner, if non-empty, restricts results to nodes where
+	// tags->>'owner' exactly equals this value (parameterized exact
+	// match, not ILIKE/substring — this is an attribution tag, not a
+	// search field). An empty Owner (the zero value) means "no
+	// filtering", following the same convention as every other
+	// optional field on this struct — a zero-value NodeFilter{} must
+	// remain completely unaffected by this field's mere existence.
+	// Backs GET /nodes' `?owner=` query param (see handleListNodes in
+	// internal/api/api.go) and GET /v1/directory's `?owner=` narrowing
+	// of the attributed population (see internal/api/directory.go).
+	Owner string
 }
 
 // TopologyFilter filters/caps the result of ListTopology. A zero-value

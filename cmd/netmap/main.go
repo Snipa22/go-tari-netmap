@@ -58,6 +58,9 @@ func main() {
 	statsCacheTTL := flag.Duration("stats-cache-ttl", api.DefaultStatsCacheTTL, "TTL for GET /v1/stats' in-process response cache (e.g. \"20s\"). "+
 		"This is a public, unauthenticated, dashboard/monitoring-polled route whose underlying work is several DB aggregate queries -- this bounds how often "+
 		"those queries actually run under repeated polling, at the cost of up to this much staleness. 0 disables caching entirely (every request recomputes).")
+	directoryCacheTTL := flag.Duration("directory-cache-ttl", api.DefaultDirectoryCacheTTL, "TTL for GET /v1/directory's in-process, per-query-param-combination response cache (e.g. \"8s\"). "+
+		"This is a public, unauthenticated, third-party-directory-feed route explicitly expected to be polled routinely -- this bounds how often "+
+		"its underlying whole-population scan actually runs under repeated polling, at the cost of up to this much staleness. 0 disables caching entirely (every request recomputes).")
 	flag.Parse()
 
 	metrics, err := newNetmapMetrics(*network)
@@ -238,7 +241,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.Handle("/", webHandler)
-	mux.Handle("/api/", http.StripPrefix("/api", api.NewRouter(store, grpcClient, p2pClient, adminCreds, collectors, *statsCacheTTL)))
+	mux.Handle("/api/", http.StripPrefix("/api", api.NewRouter(store, grpcClient, p2pClient, adminCreds, collectors, *statsCacheTTL, *directoryCacheTTL)))
 
 	// instrumentHTTP wraps the whole dashboard+API mux above with httpRequestsTotal/
 	// httpRequestDuration -- see metrics.go's doc comment. This mux is served on *addr (the

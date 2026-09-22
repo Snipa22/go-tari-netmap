@@ -193,7 +193,7 @@ func newTestServerWithCreds(t *testing.T, client collector.NodeClient, creds adm
 	// p2pClient is nil here: these tests only exercise the gRPC-labeled
 	// async health-check kickoff path; dual-probe behavior is covered by
 	// internal/collector's own tests.
-	srv := httptest.NewServer(api.NewRouter(store, client, nil, creds, testCollectorKeys(), api.DefaultStatsCacheTTL))
+	srv := httptest.NewServer(api.NewRouter(store, client, nil, creds, testCollectorKeys(), api.DefaultStatsCacheTTL, api.DefaultDirectoryCacheTTL))
 	t.Cleanup(srv.Close)
 	return srv, store
 }
@@ -417,6 +417,41 @@ func TestListNodesFilter(t *testing.T) {
 	}
 	if filtered.Total != 1 {
 		t.Fatalf("filtered.Total = %d, want 1", filtered.Total)
+	}
+}
+
+// TestListNodesOwnerFilterAPI round-trips GET /nodes' `?owner=` query
+// param (see storage.NodeFilter.Owner's doc comment for the exact-match
+// semantics tested at the storage layer already) through the HTTP
+// handler.
+func TestListNodesOwnerFilterAPI(t *testing.T) {
+	srv, store := newTestServer(t, nil)
+	ctx := context.Background()
+
+	if _, err := store.UpsertDiscoveredNode(ctx, "owner-a:1", storage.DiscoverySourceP2P, map[string]any{"owner": "Alice"}, nil); err != nil {
+		t.Fatalf("upsert owner-a: %v", err)
+	}
+	if _, err := store.UpsertDiscoveredNode(ctx, "owner-b:1", storage.DiscoverySourceP2P, map[string]any{"owner": "Bob"}, nil); err != nil {
+		t.Fatalf("upsert owner-b: %v", err)
+	}
+
+	resp, err := http.Get(srv.URL + "/nodes?owner=Alice")
+	if err != nil {
+		t.Fatalf("GET /nodes?owner=Alice: %v", err)
+	}
+	defer resp.Body.Close()
+	var got struct {
+		Nodes []api.PublicNode `json:"nodes"`
+		Total int              `json:"total"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got.Nodes) != 1 || got.Total != 1 {
+		t.Fatalf("got = %+v, want exactly 1 node (owner=Alice)", got)
+	}
+	if owner, _ := got.Nodes[0].Tags["owner"].(string); owner != "Alice" {
+		t.Errorf("got.Nodes[0].Tags[owner] = %q, want %q", owner, "Alice")
 	}
 }
 
@@ -3002,7 +3037,7 @@ func (c *countingStatsStore) NetworkHeight(ctx context.Context) (*int64, int, er
 // specifically exercise the cache's own timing behavior.
 func newTestServerWithStatsCacheTTL(t *testing.T, store storage.Store, ttl time.Duration) *httptest.Server {
 	t.Helper()
-	srv := httptest.NewServer(api.NewRouter(store, collector.NewStubClient(), nil, adminauth.Credentials{Username: testAdminUser, Password: testAdminPassword}, testCollectorKeys(), ttl))
+	srv := httptest.NewServer(api.NewRouter(store, collector.NewStubClient(), nil, adminauth.Credentials{Username: testAdminUser, Password: testAdminPassword}, testCollectorKeys(), ttl, api.DefaultDirectoryCacheTTL))
 	t.Cleanup(srv.Close)
 	return srv
 }
