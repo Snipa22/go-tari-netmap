@@ -199,6 +199,7 @@ func TestOpenAPISpecPathsMatchRouter(t *testing.T) {
 		{"GET", "/topology"},
 		{"GET", "/topology/top-peered"},
 		{"GET", "/nodes/map"},
+		{"GET", "/nodes/map/extended"},
 		{"GET", "/v1/stats"},
 		{"GET", "/v1/directory"},
 		{"GET", "/nodes/seeds"},

@@ -1400,8 +1400,8 @@ func TestTopologyGraphPage(t *testing.T) {
 
 // TestMapPage asserts GET /map renders the Leaflet map page shell
 // (never a node's raw address — all marker data is fetched
-// client-side from the already privacy-aware GET /api/nodes/map JSON
-// endpoint, mirroring TestTopologyGraphPage's assertions for
+// client-side from the already privacy-aware GET /api/nodes/map/extended
+// JSON endpoint, mirroring TestTopologyGraphPage's assertions for
 // /topology's vis-network equivalent).
 func TestMapPage(t *testing.T) {
 	store := newTestStore(t)
@@ -1423,8 +1423,8 @@ func TestMapPage(t *testing.T) {
 	if !strings.Contains(body, `id="map"`) {
 		t.Errorf("GET /map body missing map container element")
 	}
-	if !strings.Contains(body, "/api/nodes/map") {
-		t.Errorf("GET /map body missing client-side fetch of /api/nodes/map")
+	if !strings.Contains(body, "/api/nodes/map/extended") {
+		t.Errorf("GET /map body missing client-side fetch of /api/nodes/map/extended")
 	}
 	if strings.Contains(body, p2pAddr) {
 		t.Errorf("GET /map body contains p2p node's raw address %q", p2pAddr)

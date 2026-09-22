@@ -83,8 +83,12 @@ var MaxPendingSubmissions = 100
 // /v1/directory's own in-process, per-query-param-combination response
 // cache (see directory.go's directoryCache/handleDirectory/
 // DefaultDirectoryCacheTTL) — callers that don't care can pass
-// DefaultDirectoryCacheTTL.
-func NewRouter(store storage.Store, grpcClient, p2pClient, walletHTTPClient collector.NodeClient, walletHTTPEnabled bool, adminCreds adminauth.Credentials, collectors map[string]CollectorConfig, statsCacheTTL, directoryCacheTTL time.Duration) http.Handler {
+// DefaultDirectoryCacheTTL. extendedMapCacheTTL configures GET
+// /nodes/map/extended's own in-process, whole-response cache (see
+// mapextended.go's extendedMapCache/handleNodesMapExtended/
+// DefaultExtendedMapCacheTTL) -- callers that don't care can pass
+// DefaultExtendedMapCacheTTL.
+func NewRouter(store storage.Store, grpcClient, p2pClient, walletHTTPClient collector.NodeClient, walletHTTPEnabled bool, adminCreds adminauth.Credentials, collectors map[string]CollectorConfig, statsCacheTTL, directoryCacheTTL, extendedMapCacheTTL time.Duration) http.Handler {
 	mux := http.NewServeMux()
 
 	// Created once and shared across every POST /nodes call (NewRouter
@@ -136,6 +140,15 @@ func NewRouter(store storage.Store, grpcClient, p2pClient, walletHTTPClient coll
 	// deliberately NOT under /admin. See handleNodesMap's doc comment
 	// for the "not a new privacy exposure" argument in full.
 	mux.HandleFunc("GET /nodes/map", handleNodesMap(store))
+
+	// GET /nodes/map/extended is an ADDITIVE extension of GET
+	// /nodes/map above (see mapextended.go / BRIEF.md): the exact same
+	// `attributed` population, plus a second, aggregate-only
+	// `anonymous` array of city-level clusters for the non-owner-tagged
+	// population. Same public, unauthenticated trust level -- NOT under
+	// /admin. GET /nodes/map itself is completely unchanged by this
+	// route's existence.
+	mux.HandleFunc("GET /nodes/map/extended", handleNodesMapExtended(store, extendedMapCacheTTL))
 
 	// Whole-population node counts + network-height snapshot (see
 	// internal/api/stats.go). Same trust level as the other read
