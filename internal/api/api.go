@@ -113,6 +113,14 @@ func NewRouter(store storage.Store, grpcClient, p2pClient, walletHTTPClient coll
 		w.WriteHeader(http.StatusOK)
 	})
 
+	// OpenAPI spec + served Swagger UI (see internal/api/openapi.go and
+	// internal/docs/openapi.yaml). Registered here (not under /admin or
+	// /internal) so they end up at GET /api/spec / GET /api/docs after
+	// cmd/netmap/main.go's "/api" http.StripPrefix mount — same public,
+	// unauthenticated trust level as GET /v1/stats/GET /v1/directory above.
+	mux.HandleFunc("GET /spec", handleAPISpec)
+	mux.HandleFunc("GET /docs", handleAPIDocs)
+
 	mux.HandleFunc("GET /nodes", handleListNodes(store))
 	mux.HandleFunc("POST /nodes", handleCreateNode(store, grpcClient, p2pClient, limiter, lockouts))
 	mux.HandleFunc("GET /nodes/{id}", handleGetNode(store))

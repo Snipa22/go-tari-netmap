@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en" class="dark-mode">
+<head>
+    <meta charset="UTF-8">
+    <title>go-tari-netmap API docs</title>
+    <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css">
+    <style>
+        body { margin: 0; background: #10141a; }
+        .topbar-link { color: #e4e8ee; font-family: monospace; padding: 0.6rem 1rem; display: block; background: #171c24; border-bottom: 1px solid #2a323f; }
+        .topbar-link a { color: #5aa9ff; }
+
+        /* Swagger UI dark-theme contrast fix.
+         *
+         * swagger-ui-dist@5's swagger-ui.css only ships a real dark palette behind
+         * an opt-in "dark-mode" class on <html> (~174 `html.dark-mode .swagger-ui
+         * ...` rules) -- without it, most text (operation-summary descriptions, the
+         * Schemas/Models section, table cells, inputs) stays on the light theme's
+         * near-black text with no explicit background, which collides with this
+         * page's own `body { background: #10141a }` override above and is
+         * unreadable. The class="dark-mode" attribute on <html> above turns that
+         * built-in dark theme on; the overrides below then retint swagger-ui-dist's
+         * own dark-mode colors to THIS repo's own internal/web/static/style.css
+         * palette (--bg: #10141a, --bg-elevated: #171c24, --bg-card: #1b212b,
+         * --text: #e4e8ee, --text-muted: #93a0b3, --accent: #5aa9ff) so the
+         * embedded docs actually match netmap's own dashboard chrome instead of
+         * just "some other readable dark colors".
+         */
+        .swagger-ui { background: #10141a !important; color: #e4e8ee !important; }
+        .swagger-ui a { color: #5aa9ff !important; }
+        .swagger-ui select,
+        .swagger-ui input,
+        .swagger-ui textarea { background: #1b212b !important; color: #e4e8ee !important; border: 1px solid #2a323f !important; }
+        /* Operation-summary description text (e.g. next to each GET row) -- muted
+         * secondary text, same role as this repo's own table th/.panel h3 labels. */
+        .swagger-ui .opblock-summary-description { color: #93a0b3 !important; }
+        /* The "Servers" dropdown bar -- swagger-ui-dist ships a hardcoded white
+         * background even in dark-mode's light-theme fallback. */
+        .swagger-ui .scheme-container { background: #171c24 !important; box-shadow: none !important; }
+        .swagger-ui .servers-title { color: #93a0b3 !important; }
+        /* Schemas/Models section: the collapsible "Schemas" bar label and each
+         * expanded model's name/background. */
+        .swagger-ui section.models h4 span { color: #93a0b3 !important; }
+        .swagger-ui .model-title { color: #e4e8ee !important; }
+        .swagger-ui .model-container,
+        .swagger-ui .model-box { background: #171c24 !important; border-color: #2a323f !important; }
+    </style>
+</head>
+<body>
+<div class="topbar-link"><a href="/">&laquo; go-tari-netmap</a></div>
+<div id="swagger-ui"></div>
+<script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+<script>
+    window.onload = function () {
+        window.ui = SwaggerUIBundle({
+            url: "/api/spec?format=json",
+            dom_id: "#swagger-ui",
+            presets: [SwaggerUIBundle.presets.apis],
+            layout: "BaseLayout",
+        });
+    };
+</script>
+</body>
+</html>
