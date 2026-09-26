@@ -195,6 +195,27 @@ const ownedDiscoveryWorkers = 16
 // lookups once the cache is warm).
 const defaultGeoIPRefreshTickInterval = 10 * time.Minute
 
+// defaultPeerEdgeObservationRetention is how far back peer_edge_observations rows are kept
+// when Config.PeerEdgeObservationRetention is left unset/<= 0 -- see
+// PruneOldPeerEdgeObservations's doc comment for why 30 days (mirrors
+// 0016_node_health_retention_optional.sql's identical 30-day choice for node_health, this
+// table's already-approved sibling retention window).
+const defaultPeerEdgeObservationRetention = 30 * 24 * time.Hour
+
+// defaultPeerEdgeRetentionTickInterval is how often Run checks peer_edge_observations for rows
+// older than Config.PeerEdgeObservationRetention when Config.PeerEdgeRetentionTickInterval is
+// left unset/<= 0. 6 hours is deliberately far less frequent than the other loops here (unlike
+// e.g. GeoIPRefreshTickInterval's 10-minute default) -- pruning is a maintenance/housekeeping
+// task against a table that is currently ~5.7M rows / 1.5GB, not a latency-sensitive feature,
+// so there's no benefit to running it more often than roughly a few times a day, and running it
+// less often keeps the batched-DELETE overhead (see PruneOldPeerEdgeObservations) infrequent.
+const defaultPeerEdgeRetentionTickInterval = 6 * time.Hour
+
+// peerEdgeRetentionBatchSize bounds how many rows a single DELETE statement inside
+// PruneOldPeerEdgeObservations removes at a time -- see that method's doc comment for why a
+// bounded batch size is used instead of one unbounded DELETE against a multi-million-row table.
+const peerEdgeRetentionBatchSize = 5000
+
 // GeoIPSuccessTTL is how long a successful geoip_cache lookup stays
 // fresh before RefreshGeoIP considers it due for re-lookup — see
 // BRIEF.md's "30 days (successful)" cache policy.
@@ -562,6 +583,41 @@ type Collector struct {
 	// hasn't opted into the /map feature at all.
 	GeoIPRefreshTickInterval time.Duration
 
+	// PeerEdgeRetentionEnabled gates the entire peer_edge_observations retention loop (see
+	// PruneOldPeerEdgeObservations/runPeerEdgeRetentionLoop). false (the zero value, and
+	// the default for every existing caller/test) means runPeerEdgeRetentionLoop's
+	// goroutine still starts (see Run) but PruneOldPeerEdgeObservations no-ops
+	// immediately without ever touching Storage, mirroring how a nil GeoIPClient disables
+	// RefreshGeoIP without erroring. This is deliberately opt-in rather than
+	// on-by-default: retention only makes sense against a real, central
+	// Postgres-backed storage.Store (see cmd/netmap/main.go, the only caller that sets
+	// this true) -- cmd/netmap-p2p-responder's satellite Collector runs against
+	// internal/remotestore.Store instead, which keeps no peer_edge_observations table of
+	// its own to prune (see remotestore/unsupported.go's PruneOldPeerEdgeObservations
+	// stub) and must never have this loop actually invoke that op.
+	PeerEdgeRetentionEnabled bool
+
+	// PeerEdgeObservationRetention governs how far back peer_edge_observations rows are
+	// kept before PruneOldPeerEdgeObservations deletes them (see runPeerEdgeRetentionLoop).
+	// Optional: defaults to defaultPeerEdgeObservationRetention (30 days) when left
+	// unset/<= 0, mirroring node_health's own 30-day TimescaleDB retention policy (see
+	// 0016_node_health_retention_optional.sql) -- peer_edge_observations cannot use a
+	// TimescaleDB retention policy itself (it is deliberately a plain, non-hypertable
+	// table -- see PruneOldPeerEdgeObservations' doc comment for why), so this
+	// application-level equivalent exists to keep its growth bounded the same way. Has no
+	// effect at all unless PeerEdgeRetentionEnabled is also true.
+	PeerEdgeObservationRetention time.Duration
+
+	// PeerEdgeRetentionTickInterval governs how often Run checks peer_edge_observations
+	// for rows older than PeerEdgeObservationRetention, via the independent
+	// runPeerEdgeRetentionLoop (see PruneOldPeerEdgeObservations). Optional: defaults to
+	// defaultPeerEdgeRetentionTickInterval (6 hours) when left unset/<= 0 -- much less
+	// frequent than the other loops here, since this is a maintenance/housekeeping task
+	// against a large table, not a latency-sensitive feature. Set this explicitly only if
+	// the retention loop's cadence needs to differ from the default -- e.g. in tests,
+	// which use a short interval so they don't need to wait hours for anything.
+	PeerEdgeRetentionTickInterval time.Duration
+
 	// OnPollResult is an OPTIONAL observer invoked once per individual probe attempt made by
 	// this Collector's own scheduled poll loops (PollOwnedConfirmed/PollGenericConfirmed/
 	// PollUnconfirmed/PollNeverContacted, via poll()) -- see PollResultFunc's doc comment for exactly what
@@ -656,9 +712,18 @@ func New(cfg Config) *Collector {
 //     /nodes/map's HTTP handler depends on to never need a live
 //     outbound geoip lookup of its own — see RefreshGeoIP's doc
 //     comment.
+//   - the peer_edge_observations retention loop
+//     (PruneOldPeerEdgeObservations) cannot be starved by, or starve,
+//     any of the other loops — it runs on its own goroutine/ticker
+//     (see PeerEdgeRetentionTickInterval/runPeerEdgeRetentionLoop),
+//     entirely independently of the poll/discovery/geoip loops above.
+//     See PruneOldPeerEdgeObservations' doc comment for why this
+//     table has an application-level batched-DELETE retention
+//     mechanism instead of a TimescaleDB retention policy like
+//     node_health's.
 //
-// All seven goroutines share Storage and the NodeClients, and all
-// observe ctx cancellation independently. Run blocks until all seven
+// All eight goroutines share Storage and the NodeClients, and all
+// observe ctx cancellation independently. Run blocks until all eight
 // have exited (via a sync.WaitGroup) and returns nil on clean shutdown.
 //
 // Discover() and DiscoverOwned() only ever touch Storage and the
@@ -710,8 +775,13 @@ func (c *Collector) Run(ctx context.Context) error {
 		geoIPRefreshTick = defaultGeoIPRefreshTickInterval
 	}
 
+	peerEdgeRetentionTick := c.PeerEdgeRetentionTickInterval
+	if peerEdgeRetentionTick <= 0 {
+		peerEdgeRetentionTick = defaultPeerEdgeRetentionTickInterval
+	}
+
 	var wg sync.WaitGroup
-	wg.Add(7)
+	wg.Add(8)
 
 	go func() {
 		defer wg.Done()
@@ -746,6 +816,11 @@ func (c *Collector) Run(ctx context.Context) error {
 	go func() {
 		defer wg.Done()
 		c.runGeoIPRefreshLoop(ctx, geoIPRefreshTick)
+	}()
+
+	go func() {
+		defer wg.Done()
+		c.runPeerEdgeRetentionLoop(ctx, peerEdgeRetentionTick)
 	}()
 
 	wg.Wait()

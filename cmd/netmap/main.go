@@ -208,6 +208,13 @@ func main() {
 	// zero candidate nodes means zero outbound requests, not even a
 	// Storage query beyond the initial ListNodes).
 	c.GeoIPClient = geoip.NewClient()
+	// PeerEdgeRetentionEnabled opts this central process' Collector into the
+	// peer_edge_observations retention loop (see collector.Config.PeerEdgeRetentionEnabled's
+	// doc comment for why this is opt-in and only set true here, never in
+	// cmd/netmap-p2p-responder's satellite Collector). PeerEdgeObservationRetention/
+	// PeerEdgeRetentionTickInterval are both left unset, using their documented defaults
+	// (30 days / 6 hours).
+	c.PeerEdgeRetentionEnabled = true
 	// OnPollResult feeds this process' own scheduled poll loops (PollOwnedConfirmed/
 	// PollGenericConfirmed/PollUnconfirmed/PollNeverContacted) into netmap_<network>_collector_poll_result_total
 	// (see metrics.go's netmapMetrics.onPollResult/PollResultFunc) -- deliberately NOT wired

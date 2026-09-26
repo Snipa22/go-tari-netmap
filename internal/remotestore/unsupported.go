@@ -45,6 +45,16 @@ func (s *Store) ListNodeEdges(ctx context.Context, nodeID uuid.UUID, limit int) 
 	return nil, errNotSupported
 }
 
+// PruneOldPeerEdgeObservations is not supported: the peer_edge_observations retention loop
+// (internal/collector.runPeerEdgeRetentionLoop) is only ever wired up against
+// cmd/netmap/main.go's central Postgres-backed storage.Store, never against a satellite's own
+// remotestore.Store (cmd/netmap-p2p-responder never runs that loop against this Store) -- this
+// store keeps no peer_edge_observations table of its own to prune, only a pending-flush buffer
+// of edges it has observed but not yet reported (same reasoning as ListNodeEdges above).
+func (s *Store) PruneOldPeerEdgeObservations(ctx context.Context, olderThan time.Time, batchSize int) (int64, error) {
+	return 0, errNotSupported
+}
+
 // NetworkHeight is not supported: a network-wide aggregate is a central-API-only concern.
 func (s *Store) NetworkHeight(ctx context.Context) (*int64, int, error) {
 	return nil, 0, errNotSupported

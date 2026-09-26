@@ -1,0 +1,43 @@
+-- 0016_node_health_retention_optional.sql
+--
+-- OPTIONAL migration: adds a TimescaleDB retention policy on node_health that
+-- automatically drops chunks older than 30 days.
+--
+-- This migration is ALLOWED TO FAIL, same as 0002_timescale_hypertable_optional.sql. The
+-- add_retention_policy() function only exists once TimescaleDB is installed AND node_health
+-- has actually been converted into a hypertable (see 0002's own doc comment for why a working
+-- TimescaleDB install can't be assumed on every target Postgres instance) -- this migration has
+-- exactly the same dependency chain as 0002 itself. The migration runner (see
+-- internal/storage/migrate.go) recognizes migrations whose filename contains an "_optional"
+-- marker and, if running them fails, logs the error and continues rather than treating the
+-- whole migration run (and thus binary startup) as failed. Because this file is not recorded
+-- as applied when it fails, it will be retried on every subsequent startup until it succeeds
+-- (e.g. once TimescaleDB is actually installed and 0002 has taken effect on the target
+-- instance).
+--
+-- Why 30 days: node_health is an append-only, high-volume health-check log (one row per probe
+-- attempt, across every poll loop -- owned-confirmed, generic-confirmed, unconfirmed, and
+-- never-contacted). Nothing in this codebase reads a node_health row older than 30 days --
+-- every query against it (GetNodeHistory/GetNodeHistoryForNodes/GetRecentSuccessfulHealthChecks/
+-- GetLatestHealthCheck/NetworkHeight/ReachableSince-style filters) either caps at a small
+-- `limit` of the most recent rows or windows to at most 24h -- so retaining rows indefinitely
+-- only costs storage/vacuum overhead for data nothing ever looks at again. 30 days mirrors this
+-- repo's existing GeoIPSuccessTTL cache-freshness convention (internal/collector/collector.go)
+-- as a familiar, already-approved order of magnitude for "how long is old health-check data
+-- worth keeping around" in this project.
+--
+-- IMPORTANT: this policy was already applied directly in production on 2026-09-26, via psql,
+-- against both the `netmap` and `netmap_testnet` databases (`SELECT add_retention_policy(...)`
+-- run by hand). This migration does not change production's current live behavior at all -- it
+-- exists purely to codify that already-applied policy as code, so:
+--   (a) any OTHER environment (staging, a fresh deploy, a future disaster-recovery restore
+--       onto a fresh instance) picks up the exact same retention policy automatically, instead
+--       of relying on someone remembering to re-run the same psql command by hand; and
+--   (b) schema_migrations reflects what the live schema on `netmap`/`netmap_testnet` actually
+--       is right now, rather than schema_migrations silently lagging behind a change that was
+--       already made directly against production.
+-- if_not_exists => TRUE makes this a safe no-op against those two databases (the policy already
+-- exists there) while still being the real, effective migration on any environment that doesn't
+-- have it yet.
+
+SELECT add_retention_policy('node_health', INTERVAL '30 days', if_not_exists => TRUE);
