@@ -204,6 +204,27 @@ type Store interface {
 	// walk) omits it entirely, recorded as NULL on both columns.
 	RecordPeerEdgeObservation(ctx context.Context, fromNodeID, toNodeID uuid.UUID, meta ...PeerEdgeReportMeta) error
 
+	// PruneOldPeerEdgeObservations deletes peer_edge_observations rows with observed_at
+	// older than olderThan, returning the total number of rows deleted. peer_edge_observations
+	// is deliberately a plain (non-hypertable) table -- see 0012_report_batch_idempotency.sql's
+	// doc comment for why it can't be converted to a TimescaleDB hypertable (the partial unique
+	// index idx_peer_edge_observations_report_batch_id, used for ON CONFLICT DO NOTHING
+	// idempotency by RecordPeerEdgeObservation, would need to include the partitioning column,
+	// which would defeat the dedup it exists for) -- so this application-level batched delete is
+	// this table's retention mechanism instead of a TimescaleDB retention policy like
+	// node_health's (see 0016_node_health_retention_optional.sql).
+	//
+	// batchSize bounds how many rows a single DELETE statement removes at a time (deleting via
+	// a subquery selecting up to batchSize candidate ids), looping until a delete removes fewer
+	// than batchSize rows -- this avoids a single huge lock/transaction against a table that can
+	// be many millions of rows and gigabytes in size. batchSize <= 0 is treated as an error by
+	// the caller's default handling (see collector.Collector.PruneOldPeerEdgeObservations) --
+	// this method itself performs no batchSize <= 0 special-casing beyond what a LIMIT of 0/
+	// negative would naturally do in Postgres (LIMIT 0 returns no rows, so the loop would exit
+	// immediately having deleted nothing, which is why the collector-level default belongs one
+	// layer up rather than here).
+	PruneOldPeerEdgeObservations(ctx context.Context, olderThan time.Time, batchSize int) (int64, error)
+
 	// ListTopology returns nodes and edges for the graph view, with no
 	// time-window filtering (every edge ever observed is treated as
 	// "current" — see the pgStore implementation's doc comment for why).
@@ -1411,6 +1432,28 @@ func (s *pgStore) RecordPeerEdgeObservation(ctx context.Context, fromNodeID, toN
 		return fmt.Errorf("storage: record peer edge observation: %w", err)
 	}
 	return nil
+}
+
+func (s *pgStore) PruneOldPeerEdgeObservations(ctx context.Context, olderThan time.Time, batchSize int) (int64, error) {
+	var total int64
+	for {
+		tag, err := s.pool.Exec(ctx, `
+			DELETE FROM peer_edge_observations
+			WHERE id IN (
+				SELECT id FROM peer_edge_observations
+				WHERE observed_at < $1
+				LIMIT $2
+			)
+		`, olderThan, batchSize)
+		if err != nil {
+			return total, fmt.Errorf("storage: prune old peer edge observations: %w", err)
+		}
+		deleted := tag.RowsAffected()
+		total += deleted
+		if deleted < int64(batchSize) {
+			return total, nil
+		}
+	}
 }
 
 // scanPeerEdgeRows scans a *peer_edges-shaped* rows result into a

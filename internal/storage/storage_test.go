@@ -1441,6 +1441,101 @@ func TestPeerEdgesAndTopology(t *testing.T) {
 	}
 }
 
+// TestPruneOldPeerEdgeObservationsDeletesOnlyOldRows proves the core retention contract:
+// PruneOldPeerEdgeObservations deletes only rows with observed_at strictly before olderThan,
+// leaving rows at/after that cutoff untouched -- and reports the correct total deleted count.
+func TestPruneOldPeerEdgeObservationsDeletesOnlyOldRows(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	a, err := store.UpsertDiscoveredNode(ctx, "prune-a:1", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert a: %v", err)
+	}
+	b, err := store.UpsertDiscoveredNode(ctx, "prune-b:2", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert b: %v", err)
+	}
+
+	// 7 "old" observations (backdated well past the cutoff below) and 3 "recent" ones
+	// (left at their real insert-time observed_at, well after the cutoff).
+	const numOld = 7
+	const numRecent = 3
+	for i := 0; i < numOld+numRecent; i++ {
+		if err := store.RecordPeerEdgeObservation(ctx, a.ID, b.ID); err != nil {
+			t.Fatalf("record edge observation %d: %v", i, err)
+		}
+	}
+
+	ps := store.(*pgStore)
+	backdateTo := time.Now().Add(-60 * 24 * time.Hour)
+	tag, err := ps.pool.Exec(ctx, `
+		UPDATE peer_edge_observations
+		SET observed_at = $1
+		WHERE id IN (
+			SELECT id FROM peer_edge_observations
+			WHERE from_node_id = $2 AND to_node_id = $3
+			ORDER BY observed_at
+			LIMIT $4
+		)
+	`, backdateTo, a.ID, b.ID, numOld)
+	if err != nil {
+		t.Fatalf("backdate old observations: %v", err)
+	}
+	if got := tag.RowsAffected(); got != int64(numOld) {
+		t.Fatalf("backdated %d rows, want %d", got, numOld)
+	}
+
+	cutoff := time.Now().Add(-24 * time.Hour)
+	// batchSize (5) is deliberately smaller than numOld (7) so this also exercises the
+	// multi-batch loop, not just a single DELETE.
+	deleted, err := store.PruneOldPeerEdgeObservations(ctx, cutoff, 5)
+	if err != nil {
+		t.Fatalf("PruneOldPeerEdgeObservations: %v", err)
+	}
+	if deleted != int64(numOld) {
+		t.Errorf("deleted = %d, want %d (only the backdated rows)", deleted, numOld)
+	}
+
+	var remaining int
+	if err := ps.pool.QueryRow(ctx, `
+		SELECT count(*) FROM peer_edge_observations WHERE from_node_id = $1 AND to_node_id = $2
+	`, a.ID, b.ID).Scan(&remaining); err != nil {
+		t.Fatalf("count remaining: %v", err)
+	}
+	if remaining != numRecent {
+		t.Errorf("remaining rows = %d, want %d (the non-backdated rows must survive)", remaining, numRecent)
+	}
+}
+
+// TestPruneOldPeerEdgeObservationsNoMatchingRows confirms a no-op pass (nothing older than the
+// cutoff) reports zero deleted and errors nowhere -- the common case on most production ticks.
+func TestPruneOldPeerEdgeObservationsNoMatchingRows(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	a, err := store.UpsertDiscoveredNode(ctx, "prune-fresh-a:1", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert a: %v", err)
+	}
+	b, err := store.UpsertDiscoveredNode(ctx, "prune-fresh-b:2", DiscoverySourceP2P, nil, nil)
+	if err != nil {
+		t.Fatalf("upsert b: %v", err)
+	}
+	if err := store.RecordPeerEdgeObservation(ctx, a.ID, b.ID); err != nil {
+		t.Fatalf("record edge observation: %v", err)
+	}
+
+	cutoff := time.Now().Add(-24 * time.Hour)
+	deleted, err := store.PruneOldPeerEdgeObservations(ctx, cutoff, 5000)
+	if err != nil {
+		t.Fatalf("PruneOldPeerEdgeObservations: %v", err)
+	}
+	if deleted != 0 {
+		t.Errorf("deleted = %d, want 0 (nothing is older than the cutoff)", deleted)
+	}
+}
+
 // TestPeerEdgeObservationsAccumulateOverTime is the core proof that the
 // old UpsertPeerEdge overwrite behavior is gone: two
 // RecordPeerEdgeObservation calls for the same (from, to) pair, separated
